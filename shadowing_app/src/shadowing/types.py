@@ -33,12 +33,14 @@ class PlayerCommandType(str, Enum):
     RESUME = "resume"
     SEEK = "seek"
     STOP = "stop"
+    SET_GAIN = "set_gain"
 
 
 @dataclass(slots=True)
 class PlayerCommand:
     cmd: PlayerCommandType
     target_time_sec: Optional[float] = None
+    gain: Optional[float] = None
     reason: str = ""
 
 
@@ -116,3 +118,18 @@ class ControlDecision:
     reason: str
     target_time_sec: Optional[float] = None
     lead_sec: Optional[float] = None
+    target_gain: Optional[float] = None
+
+@dataclass(slots=True)
+class ControlFeatures:
+    lead_raw: Optional[float]
+    lead_ema: Optional[float]
+    lead_slope: Optional[float]
+    alignment_conf: float
+    alignment_stable: bool
+    user_speaking: bool
+    recent_partial_rate: float
+    recent_hold_count: int
+    dynamic_target_lead: float
+    suggested_gain: float
+    playback_state: str

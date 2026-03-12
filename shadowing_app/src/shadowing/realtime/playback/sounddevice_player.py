@@ -16,13 +16,6 @@ from shadowing.realtime.playback.command_slot import CommandSlot
 
 
 class SoundDevicePlayer(Player):
-    """
-    关键约束：
-    1. callback 内不拿 threading.Lock
-    2. callback 内不做文件 IO / 网络 IO / 重日志
-    3. 外部线程只 submit_command，不直接改 queue 状态
-    """
-
     def __init__(
         self,
         sample_rate: int,
@@ -50,6 +43,8 @@ class SoundDevicePlayer(Player):
         self._t_host_output_sec = 0.0
         self._t_ref_sched_sec = 0.0
         self._t_ref_heard_sec = 0.0
+
+        self._gain = 1.0
 
     def load_chunks(self, chunks: list[AudioChunk]) -> None:
         self.queue.load(chunks)
@@ -119,20 +114,20 @@ class SoundDevicePlayer(Player):
         elif cmd.cmd == PlayerCommandType.START:
             self._state = PlaybackState.PLAYING
 
+        elif cmd.cmd == PlayerCommandType.SET_GAIN:
+            if cmd.gain is not None:
+                self._gain = min(max(cmd.gain, 0.0), 1.0)
+
     def _audio_callback(self, outdata, frames, time_info, status) -> None:
-        """
-        实时线程：
-        - 先消费命令
-        - 再根据状态填音频或静音
-        - 再更新时间
-        """
         self._apply_command_if_any()
 
         if self._state in (PlaybackState.STOPPED, PlaybackState.HOLDING, PlaybackState.FINISHED):
             outdata.fill(0.0)
         else:
             block = self.queue.read_frames(frames=frames, channels=self.channels)
-            outdata[:] = block
+
+            # 关键补丁：ducking / gain control
+            outdata[:] = block * self._gain
 
             if self.queue.is_finished():
                 self._state = PlaybackState.FINISHED

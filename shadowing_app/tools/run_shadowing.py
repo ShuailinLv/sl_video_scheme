@@ -1,27 +1,127 @@
-
 from __future__ import annotations
 import _bootstrap  # noqa: F401
 
 import argparse
+import json
 import os
 import re
 from pathlib import Path
 
 from shadowing.bootstrap import build_runtime
-from shadowing.realtime.asr.fake_asr_provider import FakeASRProvider, FakeAsrConfig
-from shadowing.realtime.capture.device_utils import pick_working_input_config
+from shadowing.realtime.asr.fake_asr_provider import FakeASRProvider
 
 
-# 你本地改这个默认路径即可
 DEFAULT_TEXT_FILE = r"D:\sl_video_scheme\shadowing_app\assets\raw_texts\演讲稿3.txt"
 
 
 def slugify_filename_stem(stem: str) -> str:
     stem = stem.strip()
-    stem = re.sub(r"[\\/:\*\?\"<>\|]+", "_", stem)
+    stem = re.sub(r'[\\/:\*\?"<>\|]+', "_", stem)
     stem = re.sub(r"\s+", "_", stem)
     stem = stem.strip("._")
     return stem or "lesson"
+
+
+def validate_lesson_assets(lesson_dir: Path) -> None:
+    manifest = lesson_dir / "lesson_manifest.json"
+    ref_map = lesson_dir / "reference_map.json"
+    chunks_dir = lesson_dir / "chunks"
+
+    missing: list[str] = []
+    if not manifest.exists():
+        missing.append(str(manifest))
+    if not ref_map.exists():
+        missing.append(str(ref_map))
+    if not chunks_dir.exists():
+        missing.append(str(chunks_dir))
+
+    if missing:
+        msg = "\n".join(missing)
+        raise FileNotFoundError(
+            "Lesson assets not found. Please run preprocess first.\n"
+            f"Missing:\n{msg}"
+        )
+
+
+def load_manifest(lesson_dir: Path) -> dict:
+    manifest_path = lesson_dir / "lesson_manifest.json"
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def resolve_recording_config(
+    manual_device: int | None,
+    manual_samplerate: int | None,
+) -> dict:
+    """
+    录音设备选择策略：
+    1. 如果用户显式传了 --input-device，则优先使用该设备
+    2. 否则走自动探测 pick_working_input_config()
+    """
+    from shadowing.realtime.capture.device_utils import pick_working_input_config
+
+    if manual_device is not None:
+        return {
+            "device": manual_device,
+            "samplerate": int(manual_samplerate or 48000),
+            "channels": 1,
+            "dtype": "float32",
+        }
+
+    rec_cfg = pick_working_input_config()
+    if rec_cfg is None:
+        raise RuntimeError(
+            "No working input device config found. "
+            "Try specifying --input-device manually, e.g. --input-device 9"
+        )
+
+    if manual_samplerate is not None:
+        rec_cfg["samplerate"] = int(manual_samplerate)
+
+    return rec_cfg
+
+
+def collect_sherpa_paths() -> dict:
+    return {
+        "tokens": os.getenv("SHERPA_TOKENS", ""),
+        "encoder": os.getenv("SHERPA_ENCODER", ""),
+        "decoder": os.getenv("SHERPA_DECODER", ""),
+        "joiner": os.getenv("SHERPA_JOINER", ""),
+    }
+
+
+def validate_sherpa_paths(paths: dict) -> None:
+    missing_keys: list[str] = []
+    missing_files: list[str] = []
+
+    for key in ("tokens", "encoder", "decoder", "joiner"):
+        value = (paths.get(key) or "").strip()
+        if not value:
+            missing_keys.append(key)
+            continue
+        if not Path(value).expanduser().exists():
+            missing_files.append(f"{key}: {value}")
+
+    if missing_keys or missing_files:
+        parts: list[str] = []
+        if missing_keys:
+            parts.append(
+                "Missing sherpa env vars: "
+                + ", ".join(
+                    {
+                        "tokens": "SHERPA_TOKENS",
+                        "encoder": "SHERPA_ENCODER",
+                        "decoder": "SHERPA_DECODER",
+                        "joiner": "SHERPA_JOINER",
+                    }[k]
+                    for k in missing_keys
+                )
+            )
+        if missing_files:
+            parts.append("Non-existent sherpa files:\n" + "\n".join(missing_files))
+
+        raise FileNotFoundError(
+            "Sherpa model configuration is invalid.\n" + "\n".join(parts)
+        )
 
 
 def build_config(
@@ -31,11 +131,17 @@ def build_config(
     asr_mode: str,
     bluetooth_offset_sec: float,
     debug: bool,
+    playback_sample_rate: int,
+    pure_playback: bool,
+    ducking_only: bool,
+    disable_seek: bool,
+    disable_hold: bool,
+    sherpa_paths: dict,
 ) -> dict:
-    config = {
+    return {
         "lesson_base_dir": lesson_base_dir,
         "playback": {
-            "sample_rate": 48000,  # 先保留；后面可改成从 manifest 驱动
+            "sample_rate": playback_sample_rate,
             "device": None,
             "bluetooth_output_offset_sec": bluetooth_offset_sec,
         },
@@ -47,10 +153,10 @@ def build_config(
         "asr": {
             "mode": asr_mode,
             "hotwords": "",
-            "tokens": os.getenv("SHERPA_TOKENS", ""),
-            "encoder": os.getenv("SHERPA_ENCODER", ""),
-            "decoder": os.getenv("SHERPA_DECODER", ""),
-            "joiner": os.getenv("SHERPA_JOINER", ""),
+            "tokens": sherpa_paths["tokens"],
+            "encoder": sherpa_paths["encoder"],
+            "decoder": sherpa_paths["decoder"],
+            "joiner": sherpa_paths["joiner"],
             "num_threads": 2,
             "provider": "cpu",
             "feature_dim": 80,
@@ -67,30 +173,17 @@ def build_config(
             "print_alignment": True,
             "print_decision": True,
             "print_player_status": True,
+            "print_reference_head": True,
+        },
+        "runtime": {
+            "pure_playback": pure_playback,
+        },
+        "control": {
+            "ducking_only": ducking_only,
+            "disable_seek": disable_seek,
+            "disable_hold": disable_hold,
         },
     }
-    return config
-
-
-def validate_lesson_assets(lesson_dir: Path) -> None:
-    manifest = lesson_dir / "lesson_manifest.json"
-    ref_map = lesson_dir / "reference_map.json"
-    chunks_dir = lesson_dir / "chunks"
-
-    missing = []
-    if not manifest.exists():
-        missing.append(str(manifest))
-    if not ref_map.exists():
-        missing.append(str(ref_map))
-    if not chunks_dir.exists():
-        missing.append(str(chunks_dir))
-
-    if missing:
-        msg = "\n".join(missing)
-        raise FileNotFoundError(
-            "Lesson assets not found. Please run preprocess first.\n"
-            f"Missing:\n{msg}"
-        )
 
 
 def main() -> None:
@@ -114,13 +207,7 @@ def main() -> None:
         type=str,
         default="fake",
         choices=["fake", "sherpa"],
-        help="ASR mode. Use fake first to smoke-test the whole pipeline; switch to sherpa later.",
-    )
-    parser.add_argument(
-        "--fake-chars-per-sec",
-        type=float,
-        default=4.5,
-        help="Only used in fake ASR mode.",
+        help="ASR mode.",
     )
     parser.add_argument(
         "--bluetooth-offset-sec",
@@ -129,9 +216,43 @@ def main() -> None:
         help="Estimated Bluetooth playback offset.",
     )
     parser.add_argument(
+        "--input-device",
+        type=int,
+        default=None,
+        help="Manually specify recording input device index. "
+             "Recommended on Windows when auto-picked device fails.",
+    )
+    parser.add_argument(
+        "--input-samplerate",
+        type=int,
+        default=None,
+        help="Override recording input sample rate. "
+             "Useful if a device fails at its default rate.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
-        help="Enable runtime debug logs for ASR/alignment/controller/player heartbeat.",
+        help="Enable runtime debug logs.",
+    )
+    parser.add_argument(
+        "--pure-playback",
+        action="store_true",
+        help="Pure playback debug mode: disable controller intervention and force gain=1.0.",
+    )
+    parser.add_argument(
+        "--ducking-only",
+        action="store_true",
+        help="Only apply ducking/gain control. Disable resume/hold/seek actions.",
+    )
+    parser.add_argument(
+        "--disable-seek",
+        action="store_true",
+        help="Disable SEEK decisions.",
+    )
+    parser.add_argument(
+        "--disable-hold",
+        action="store_true",
+        help="Disable HOLD decisions.",
     )
 
     args = parser.parse_args()
@@ -145,49 +266,63 @@ def main() -> None:
     lesson_dir = lesson_base_dir / lesson_id
 
     validate_lesson_assets(lesson_dir)
+    manifest = load_manifest(lesson_dir)
+    playback_sample_rate = int(manifest["sample_rate_out"])
 
-    rec_cfg = pick_working_input_config()
-    if rec_cfg is None:
-        raise RuntimeError("No working input device config found.")
+    rec_cfg = resolve_recording_config(
+        manual_device=args.input_device,
+        manual_samplerate=args.input_samplerate,
+    )
+
+    sherpa_paths = collect_sherpa_paths()
+
+    # 纯播放模式不需要 recorder / sherpa 真的工作
+    if args.asr == "sherpa" and not args.pure_playback:
+        validate_sherpa_paths(sherpa_paths)
 
     config = build_config(
         lesson_base_dir=str(lesson_base_dir),
         input_device=rec_cfg["device"],
-        input_samplerate=rec_cfg["samplerate"],
+        input_samplerate=int(rec_cfg["samplerate"]),
         asr_mode=args.asr,
         bluetooth_offset_sec=args.bluetooth_offset_sec,
         debug=args.debug,
+        playback_sample_rate=playback_sample_rate,
+        pure_playback=args.pure_playback,
+        ducking_only=args.ducking_only,
+        disable_seek=args.disable_seek,
+        disable_hold=args.disable_hold,
+        sherpa_paths=sherpa_paths,
     )
 
     print("=== Run config ===")
-    print(f"text file     : {text_path}")
-    print(f"lesson id     : {lesson_id}")
-    print(f"lesson dir    : {lesson_dir}")
-    print(f"input device  : {rec_cfg['device']}")
-    print(f"input sr      : {rec_cfg['samplerate']}")
-    print(f"asr mode      : {args.asr}")
-    print(f"bt offset sec : {args.bluetooth_offset_sec}")
-    print(f"debug         : {args.debug}")
+    print(f"text file       : {text_path}")
+    print(f"lesson id       : {lesson_id}")
+    print(f"lesson dir      : {lesson_dir}")
+    print(f"input device    : {rec_cfg['device']}")
+    print(f"input sr        : {rec_cfg['samplerate']}")
+    print(f"playback sr     : {playback_sample_rate}")
+    print(f"asr mode        : {args.asr}")
+    print(f"bt offset sec   : {args.bluetooth_offset_sec}")
+    print(f"debug           : {args.debug}")
+    print(f"pure playback   : {args.pure_playback}")
+    print(f"ducking only    : {args.ducking_only}")
+    print(f"disable seek    : {args.disable_seek}")
+    print(f"disable hold    : {args.disable_hold}")
     print()
 
     runtime = build_runtime(config)
 
-    if args.asr == "fake":
+    if args.asr == "fake" and not args.pure_playback:
         lesson_text = text_path.read_text(encoding="utf-8").strip()
-
         runtime.orchestrator.asr = FakeASRProvider.from_reference_text(
             reference_text=lesson_text,
             chars_per_step=4,
             step_interval_sec=0.25,
             lag_sec=0.4,
             tail_final=True,
-            # 先不要开 pause/jump，先看 committed 能不能稳定前进
-            # pause_at_step=8,
-            # pause_extra_sec=2.0,
-            # jump_at_step=18,
-            # jump_to_char=min(160, len(lesson_text)),
         )
-        
+
     if hasattr(runtime.orchestrator, "configure_debug"):
         runtime.orchestrator.configure_debug(config["debug"])
 

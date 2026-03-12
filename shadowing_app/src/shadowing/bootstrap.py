@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import platform
+
 from shadowing.infrastructure.lesson_repo import FileLessonRepository
 from shadowing.realtime.playback.sounddevice_player import SoundDevicePlayer
 from shadowing.realtime.capture.sounddevice_recorder import SoundDeviceRecorder
+from shadowing.realtime.capture.soundcard_recorder import SoundCardRecorder
 from shadowing.realtime.asr.sherpa_streaming_provider import SherpaStreamingProvider
 from shadowing.realtime.alignment.incremental_aligner import IncrementalAligner
-from shadowing.realtime.control.state_machine_controller import StateMachineController
+from shadowing.realtime.control.state_estimator import ControlStateEstimator
+from shadowing.realtime.control.adaptive_controller import (
+    AdaptiveControlPolicy,
+    AdaptiveStateMachineController,
+)
 from shadowing.realtime.orchestrator import ShadowingOrchestrator
 from shadowing.realtime.runtime import ShadowingRuntime
 
@@ -20,12 +27,25 @@ def build_runtime(config: dict) -> ShadowingRuntime:
         bluetooth_output_offset_sec=config["playback"].get("bluetooth_output_offset_sec", 0.0),
     )
 
-    recorder = SoundDeviceRecorder(
-        sample_rate_in=config["capture"]["device_sample_rate"],
-        target_sample_rate=config["capture"]["target_sample_rate"],
-        channels=1,
-        device=config["capture"].get("device"),
-    )
+    capture_cfg = config["capture"]
+    use_soundcard_on_windows = bool(capture_cfg.get("prefer_soundcard_on_windows", True))
+
+    if platform.system().lower() == "windows" and use_soundcard_on_windows:
+        recorder = SoundCardRecorder(
+            sample_rate_in=capture_cfg["device_sample_rate"],
+            target_sample_rate=capture_cfg["target_sample_rate"],
+            channels=1,
+            device=capture_cfg.get("device"),
+            block_frames=int(capture_cfg.get("block_frames", 1024)),
+            include_loopback=bool(capture_cfg.get("include_loopback", False)),
+        )
+    else:
+        recorder = SoundDeviceRecorder(
+            sample_rate_in=capture_cfg["device_sample_rate"],
+            target_sample_rate=capture_cfg["target_sample_rate"],
+            channels=1,
+            device=capture_cfg.get("device"),
+        )
 
     asr = SherpaStreamingProvider(
         model_config=config["asr"],
@@ -34,7 +54,19 @@ def build_runtime(config: dict) -> ShadowingRuntime:
 
     aligner = IncrementalAligner()
 
-    controller = StateMachineController()
+    estimator = ControlStateEstimator()
+
+    control_cfg = config.get("control", {})
+    policy = AdaptiveControlPolicy(
+        ducking_only=bool(control_cfg.get("ducking_only", False)),
+        disable_seek=bool(control_cfg.get("disable_seek", False)),
+        disable_hold=bool(control_cfg.get("disable_hold", False)),
+    )
+
+    controller = AdaptiveStateMachineController(
+        estimator=estimator,
+        policy=policy,
+    )
 
     orchestrator = ShadowingOrchestrator(
         repo=repo,
@@ -44,4 +76,8 @@ def build_runtime(config: dict) -> ShadowingRuntime:
         aligner=aligner,
         controller=controller,
     )
+
+    if "runtime" in config and hasattr(orchestrator, "configure_runtime"):
+        orchestrator.configure_runtime(config["runtime"])
+
     return ShadowingRuntime(orchestrator)
