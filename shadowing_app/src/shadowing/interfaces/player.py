@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from shadowing.types import AudioChunk, PlaybackStatus
+from shadowing.types import AudioChunk, PlaybackStatus, PlayerCommand
 
 
 class Player(ABC):
@@ -14,15 +14,11 @@ class Player(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def hold(self) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def resume(self) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def seek(self, target_time_sec: float) -> None:
+    def submit_command(self, command: PlayerCommand) -> None:
+        """
+        非实时线程调用。
+        只投递命令，不直接改 callback 内部状态。
+        """
         raise NotImplementedError
 
     @abstractmethod

@@ -27,6 +27,21 @@ class AsrEventType(str, Enum):
     ENDPOINT = "endpoint"
 
 
+class PlayerCommandType(str, Enum):
+    START = "start"
+    HOLD = "hold"
+    RESUME = "resume"
+    SEEK = "seek"
+    STOP = "stop"
+
+
+@dataclass(slots=True)
+class PlayerCommand:
+    cmd: PlayerCommandType
+    target_time_sec: Optional[float] = None
+    reason: str = ""
+
+
 @dataclass(slots=True)
 class AudioChunk:
     chunk_id: int
@@ -34,6 +49,7 @@ class AudioChunk:
     channels: int
     samples: "object"   # numpy.ndarray
     duration_sec: float
+    start_time_sec: float
     path: Optional[str] = None
 
 

@@ -1,56 +1,80 @@
 from __future__ import annotations
 
-import threading
+import sounddevice as sd
+
 from shadowing.interfaces.player import Player
-from shadowing.types import AudioChunk, PlaybackState, PlaybackStatus
+from shadowing.types import (
+    AudioChunk,
+    PlaybackState,
+    PlaybackStatus,
+    PlayerCommand,
+    PlayerCommandType,
+)
 from shadowing.realtime.playback.chunk_queue import ChunkQueue
 from shadowing.realtime.playback.playback_clock import PlaybackClock
+from shadowing.realtime.playback.command_slot import CommandSlot
 
 
 class SoundDevicePlayer(Player):
+    """
+    关键约束：
+    1. callback 内不拿 threading.Lock
+    2. callback 内不做文件 IO / 网络 IO / 重日志
+    3. 外部线程只 submit_command，不直接改 queue 状态
+    """
+
     def __init__(
         self,
         sample_rate: int,
         channels: int,
         device: int | None = None,
         bluetooth_output_offset_sec: float = 0.0,
+        latency: str | float = "low",
+        blocksize: int = 0,
     ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
         self.device = device
+        self.latency = latency
+        self.blocksize = blocksize
+
         self.clock = PlaybackClock(bluetooth_output_offset_sec)
         self.queue = ChunkQueue()
+        self.command_slot = CommandSlot()
 
+        self._stream: sd.OutputStream | None = None
         self._state = PlaybackState.STOPPED
-        self._lock = threading.Lock()
 
-        self._current_chunk_id = 0
+        self._current_chunk_id = -1
         self._frame_index = 0
         self._t_host_output_sec = 0.0
         self._t_ref_sched_sec = 0.0
         self._t_ref_heard_sec = 0.0
 
-        self._pending_seek_sec: float | None = None
-
     def load_chunks(self, chunks: list[AudioChunk]) -> None:
         self.queue.load(chunks)
+        if chunks:
+            self._current_chunk_id = chunks[0].chunk_id
+            self._frame_index = 0
 
     def start(self) -> None:
-        # TODO: 初始化 sounddevice.OutputStream，并 start
+        if self._stream is not None:
+            return
+
+        self._stream = sd.OutputStream(
+            samplerate=self.sample_rate,
+            channels=self.channels,
+            dtype="float32",
+            callback=self._audio_callback,
+            device=self.device,
+            latency=self.latency,
+            blocksize=self.blocksize,
+        )
+        self._stream.start()
         self._state = PlaybackState.PLAYING
 
-    def hold(self) -> None:
-        with self._lock:
-            self._state = PlaybackState.HOLDING
-
-    def resume(self) -> None:
-        with self._lock:
-            self._state = PlaybackState.PLAYING
-
-    def seek(self, target_time_sec: float) -> None:
-        with self._lock:
-            self._pending_seek_sec = target_time_sec
-            self._state = PlaybackState.SEEKING
+    def submit_command(self, command: PlayerCommand) -> None:
+        self.command_slot.put(command)
 
     def get_status(self) -> PlaybackStatus:
         return PlaybackStatus(
@@ -63,18 +87,61 @@ class SoundDevicePlayer(Player):
         )
 
     def stop(self) -> None:
-        self._state = PlaybackState.STOPPED
+        self.submit_command(PlayerCommand(cmd=PlayerCommandType.STOP, reason="external_stop"))
 
     def close(self) -> None:
-        # TODO: 关闭 stream
+        if self._stream is not None:
+            self._stream.abort()
+            self._stream.close()
+            self._stream = None
         self._state = PlaybackState.STOPPED
+
+    def _apply_command_if_any(self) -> None:
+        cmd = self.command_slot.pop()
+        if cmd is None:
+            return
+
+        if cmd.cmd == PlayerCommandType.HOLD:
+            self._state = PlaybackState.HOLDING
+
+        elif cmd.cmd == PlayerCommandType.RESUME:
+            self._state = PlaybackState.PLAYING
+
+        elif cmd.cmd == PlayerCommandType.SEEK:
+            self._state = PlaybackState.SEEKING
+            if cmd.target_time_sec is not None:
+                self.queue.seek(cmd.target_time_sec)
+            self._state = PlaybackState.PLAYING
+
+        elif cmd.cmd == PlayerCommandType.STOP:
+            self._state = PlaybackState.STOPPED
+
+        elif cmd.cmd == PlayerCommandType.START:
+            self._state = PlaybackState.PLAYING
 
     def _audio_callback(self, outdata, frames, time_info, status) -> None:
         """
-        这里只能做：
-        - 取样本
-        - 填 outdata
-        - 更新时钟
-        不做日志/网络/复杂逻辑
+        实时线程：
+        - 先消费命令
+        - 再根据状态填音频或静音
+        - 再更新时间
         """
-        raise NotImplementedError
+        self._apply_command_if_any()
+
+        if self._state in (PlaybackState.STOPPED, PlaybackState.HOLDING):
+            outdata.fill(0.0)
+        else:
+            block = self.queue.read_frames(frames=frames, channels=self.channels)
+            outdata[:] = block
+
+            self._current_chunk_id = self.queue.current_chunk_id
+            self._frame_index = self.queue.current_frame_index
+
+        scheduled_ref_time = self.queue.get_scheduled_time_sec()
+        clock_snapshot = self.clock.compute(
+            output_buffer_dac_time_sec=time_info.outputBufferDacTime,
+            scheduled_ref_time_sec=scheduled_ref_time,
+        )
+        self._t_host_output_sec = clock_snapshot.t_host_output_sec
+        self._t_ref_sched_sec = clock_snapshot.t_ref_sched_sec
+        self._t_ref_heard_sec = clock_snapshot.t_ref_heard_sec

@@ -10,3 +10,4 @@ class ControlPolicy:
     resume_if_lead_sec: float = 0.18
     seek_if_lag_sec: float = -0.90
     min_confidence: float = 0.60
+    seek_cooldown_sec: float = 0.40

@@ -33,6 +33,7 @@ def build_runtime(config: dict) -> ShadowingRuntime:
     )
 
     aligner = IncrementalAligner()
+
     controller = StateMachineController()
 
     orchestrator = ShadowingOrchestrator(
