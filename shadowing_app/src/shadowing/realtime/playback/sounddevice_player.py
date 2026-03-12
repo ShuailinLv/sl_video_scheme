@@ -128,11 +128,14 @@ class SoundDevicePlayer(Player):
         """
         self._apply_command_if_any()
 
-        if self._state in (PlaybackState.STOPPED, PlaybackState.HOLDING):
+        if self._state in (PlaybackState.STOPPED, PlaybackState.HOLDING, PlaybackState.FINISHED):
             outdata.fill(0.0)
         else:
             block = self.queue.read_frames(frames=frames, channels=self.channels)
             outdata[:] = block
+
+            if self.queue.is_finished():
+                self._state = PlaybackState.FINISHED
 
             self._current_chunk_id = self.queue.current_chunk_id
             self._frame_index = self.queue.current_frame_index

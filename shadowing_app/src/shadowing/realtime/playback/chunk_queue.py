@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from typing import Optional
 
 import numpy as np
 
@@ -21,6 +20,7 @@ class ChunkQueue:
         self._current_chunk_idx: int = 0
         self._frame_offset_in_chunk: int = 0
         self._sample_rate: int = 0
+        self._total_duration_sec: float = 0.0
 
     def load(self, chunks: list[AudioChunk]) -> None:
         self._chunks = chunks
@@ -29,10 +29,18 @@ class ChunkQueue:
         self._frame_offset_in_chunk = 0
         self._sample_rate = chunks[0].sample_rate if chunks else 0
 
+        if chunks:
+            last = chunks[-1]
+            self._total_duration_sec = last.start_time_sec + last.duration_sec
+        else:
+            self._total_duration_sec = 0.0
+
     @property
     def current_chunk_id(self) -> int:
         if not self._chunks:
             return -1
+        if self._current_chunk_idx >= len(self._chunks):
+            return self._chunks[-1].chunk_id
         return self._chunks[self._current_chunk_idx].chunk_id
 
     @property
@@ -41,6 +49,9 @@ class ChunkQueue:
 
     def is_empty(self) -> bool:
         return not self._chunks
+
+    def is_finished(self) -> bool:
+        return bool(self._chunks) and self._current_chunk_idx >= len(self._chunks)
 
     def seek(self, target_time_sec: float) -> None:
         if not self._chunks:
@@ -61,6 +72,9 @@ class ChunkQueue:
         if not self._chunks:
             return 0.0
 
+        if self._current_chunk_idx >= len(self._chunks):
+            return self._total_duration_sec
+
         chunk = self._chunks[self._current_chunk_idx]
         return chunk.start_time_sec + (self._frame_offset_in_chunk / chunk.sample_rate)
 
@@ -70,7 +84,7 @@ class ChunkQueue:
         不够则补零
         """
         out = np.zeros((frames, channels), dtype=np.float32)
-        if not self._chunks:
+        if not self._chunks or self.is_finished():
             return out
 
         written = 0

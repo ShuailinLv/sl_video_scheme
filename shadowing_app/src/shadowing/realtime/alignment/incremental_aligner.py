@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from pypinyin import lazy_pinyin
-
 from shadowing.interfaces.aligner import Aligner
 from shadowing.types import AlignResult, AsrEvent, ReferenceMap
-from shadowing.realtime.alignment.scoring import AlignmentScorer
 from shadowing.realtime.alignment.window_selector import WindowSelector
 
 
@@ -13,7 +10,7 @@ class IncrementalAligner(Aligner):
         self,
         stable_needed: int = 2,
         min_confidence: float = 0.45,
-        max_hyp_tokens: int = 8,
+        max_hyp_tokens: int = 12,
     ) -> None:
         self.ref_map: ReferenceMap | None = None
         self.committed_idx: int = 0
@@ -25,7 +22,6 @@ class IncrementalAligner(Aligner):
         self.min_confidence = min_confidence
         self.max_hyp_tokens = max_hyp_tokens
 
-        self.scorer = AlignmentScorer()
         self.window_selector = WindowSelector()
 
     def reset(self, reference_map: ReferenceMap) -> None:
@@ -44,26 +40,58 @@ class IncrementalAligner(Aligner):
         if not hyp_chars or not hyp_pys:
             return None
 
-        hyp_chars = hyp_chars[-self.max_hyp_tokens :]
-        hyp_pys = hyp_pys[-self.max_hyp_tokens :]
+        # 当前 fake 调试阶段：始终使用“前缀增长”视角
+        hyp_chars = hyp_chars[: self.max_hyp_tokens]
+        hyp_pys = hyp_pys[: self.max_hyp_tokens]
 
         window, start, _ = self.window_selector.select(self.ref_map, self.committed_idx)
         if not window:
             return None
 
-        candidate_idx, confidence = self._best_alignment(window, start, hyp_chars, hyp_pys)
+        # 关键补丁：
+        # window 不一定从 0 开始，hyp 也必须裁掉相同数量的前缀，
+        # 否则 window 开头和 hyp 开头会错位。
+        if start > 0:
+            offset = min(start, len(hyp_chars), len(hyp_pys))
+            hyp_chars = hyp_chars[offset:]
+            hyp_pys = hyp_pys[offset:]
 
+        # 如果裁完空了，安全返回当前 committed 状态
+        if not hyp_chars or not hyp_pys:
+            token = self.ref_map.tokens[self.committed_idx]
+            return AlignResult(
+                committed_ref_idx=self.committed_idx,
+                candidate_ref_idx=self.committed_idx,
+                ref_time_sec=token.t_end,
+                confidence=0.0,
+                stable=False,
+                matched_text="",
+                matched_pinyin=[],
+            )
+
+        candidate_idx, confidence = self._best_prefix_alignment(window, start, hyp_chars, hyp_pys)
+
+        # 不允许明显回退
         if candidate_idx < self.committed_idx:
             candidate_idx = self.committed_idx
-            confidence *= 0.7
+            confidence *= 0.8
 
-        if candidate_idx == self.last_candidate_idx:
-            self.stable_count += 1
+        # 关键补丁：
+        # candidate 单调前进也算稳定推进，不必要求“完全相同重复出现”
+        if confidence >= self.min_confidence:
+            if candidate_idx > self.last_candidate_idx:
+                self.stable_count += 1
+            elif candidate_idx == self.last_candidate_idx:
+                self.stable_count += 1
+            else:
+                self.stable_count = 1
         else:
-            self.last_candidate_idx = candidate_idx
-            self.stable_count = 1
+            self.stable_count = 0
+
+        self.last_candidate_idx = candidate_idx
 
         stable = self.stable_count >= self.stable_needed and confidence >= self.min_confidence
+
         if stable and candidate_idx > self.committed_idx:
             self.committed_idx = candidate_idx
 
@@ -78,7 +106,7 @@ class IncrementalAligner(Aligner):
             matched_pinyin=hyp_pys,
         )
 
-    def _best_alignment(
+    def _best_prefix_alignment(
         self,
         window,
         window_start_idx: int,
@@ -86,52 +114,54 @@ class IncrementalAligner(Aligner):
         hyp_pys: list[str],
     ) -> tuple[int, float]:
         """
-        简化版局部 DP：
-        - ref 维度：window
-        - hyp 维度：最近若干 token
-        - 目标：找最佳末端落点
+        用前向扫描做轻量前缀对齐：
+        - 逐个尝试窗口前缀长度 i
+        - 比较 reference[:i] 和 hyp[:k]
+        - 选分数最高的落点
+
+        适合：
+        - 已知文本
+        - fake 前缀增长 partial
+        - 先把 committed 推起来
         """
-        n = len(window)
-        m = min(len(hyp_chars), len(hyp_pys))
+        best_score = -1.0
+        best_i = 1
 
-        if n == 0 or m == 0:
-            return self.committed_idx, 0.0
+        max_ref_len = len(window)
+        hyp_len = min(len(hyp_chars), len(hyp_pys))
 
-        dp = [[0.0 for _ in range(m + 1)] for _ in range(n + 1)]
+        for i in range(1, max_ref_len + 1):
+            ref_slice = window[:i]
 
-        for i in range(1, n + 1):
-            dp[i][0] = dp[i - 1][0] + self.scorer.deletion_penalty()
+            cmp_len = min(i, hyp_len)
+            if cmp_len == 0:
+                continue
 
-        for j in range(1, m + 1):
-            dp[0][j] = dp[0][j - 1] + self.scorer.insertion_penalty()
+            score = 0.0
+            for j in range(cmp_len):
+                ref_tok = ref_slice[j]
+                hyp_char = hyp_chars[j]
+                hyp_py = hyp_pys[j]
 
-        best_score = float("-inf")
-        best_i = 0
+                if ref_tok.char == hyp_char:
+                    score += 1.0
+                elif ref_tok.pinyin == hyp_py:
+                    score += 0.8
+                else:
+                    score += 0.0
 
-        for i in range(1, n + 1):
-            ref_tok = window[i - 1]
-            for j in range(1, m + 1):
-                match_score = self.scorer.score_token_pair(
-                    ref_char=ref_tok.char,
-                    ref_py=ref_tok.pinyin,
-                    hyp_char=hyp_chars[j - 1],
-                    hyp_py=hyp_pys[j - 1],
-                )
+            # 归一化到 0~1
+            score = score / cmp_len
 
-                score_match = dp[i - 1][j - 1] + match_score
-                score_del = dp[i - 1][j] + self.scorer.deletion_penalty()
-                score_ins = dp[i][j - 1] + self.scorer.insertion_penalty()
+            # 略偏好更长但仍高分的匹配
+            score += min(i, hyp_len) * 0.01
 
-                dp[i][j] = max(score_match, score_del, score_ins)
-
-            if dp[i][m] > best_score:
-                best_score = dp[i][m]
+            if score > best_score:
+                best_score = score
                 best_i = i
 
         candidate_idx = window_start_idx + best_i - 1
         candidate_idx = max(0, candidate_idx)
 
-        norm = max(1.0, m * 3.0)
-        confidence = max(0.0, min(1.0, (best_score + norm) / (2.0 * norm)))
-
+        confidence = max(0.0, min(1.0, best_score))
         return candidate_idx, confidence

@@ -22,9 +22,9 @@ class FakeAsrStep:
 @dataclass(slots=True)
 class FakeAsrConfig:
     """
-    两种模式：
-    1. scripted_steps 非空 -> 严格按步骤吐事件
-    2. reference_text 非空 -> 根据喂入音频量逐步“假装识别”更多文本
+    模式优先级：
+    1. scripted_steps 非空 -> scripted timeline 模式
+    2. reference_text 非空 -> progressive 模式
     """
     scripted_steps: list[FakeAsrStep] = field(default_factory=list)
 
@@ -34,19 +34,20 @@ class FakeAsrConfig:
     emit_final_on_endpoint: bool = True
 
     sample_rate: int = 16000
-    bytes_per_sample: int = 2     # int16
+    bytes_per_sample: int = 2
     channels: int = 1
 
 
 class FakeASRProvider(ASRProvider):
     """
-    可运行的假 ASR，用于先联调整个控制闭环。
+    可运行的假 ASR，用于联调整条控制闭环。
 
     模式 A: scripted
-        按预设时间输出 partial/final
+        按预设时间输出 partial/final。适合同步控制调试。
 
     模式 B: progressive
-        根据 feed_pcm16 收到的音频字节数，按 chars_per_sec 推进参考文本
+        根据 feed_pcm16 收到的音频字节数，逐步“假装识别”更多文本。
+        适合测试 recorder -> queue -> asr_worker 链路。
     """
 
     def __init__(self, config: FakeAsrConfig) -> None:
@@ -62,6 +63,77 @@ class FakeASRProvider(ASRProvider):
         self._bytes_received = 0
         self._last_progress_text = ""
         self._last_final_text = ""
+
+    @classmethod
+    def from_reference_text(
+        cls,
+        reference_text: str,
+        chars_per_step: int = 6,
+        step_interval_sec: float = 0.28,
+        lag_sec: float = 0.5,
+        tail_final: bool = True,
+        pause_at_step: int | None = None,
+        pause_extra_sec: float = 0.0,
+        jump_to_char: int | None = None,
+        jump_at_step: int | None = None,
+    ) -> "FakeASRProvider":
+        """
+        生成更适合同步调试的 scripted timeline。
+
+        关键改动：
+        - 使用“前缀增长型 partial”
+        - 每一步给出从开头到当前位置的前缀，而不是滑动窗口切片
+
+        参数说明：
+        - chars_per_step: 每一步前进多少字
+        - step_interval_sec: 每一步间隔
+        - lag_sec: 相对播放器的“假想用户滞后”
+        - pause_at_step/pause_extra_sec: 在某步制造停顿
+        - jump_to_char/jump_at_step: 在某一步制造跳读
+        """
+        clean = reference_text.strip()
+        steps: list[FakeAsrStep] = []
+
+        if not clean:
+            return cls(FakeAsrConfig(scripted_steps=[]))
+
+        t = lag_sec
+        cursor = 0
+        step_idx = 0
+
+        while cursor < len(clean):
+            if jump_at_step is not None and jump_to_char is not None and step_idx == jump_at_step:
+                cursor = max(0, min(jump_to_char, len(clean)))
+
+            cursor = min(cursor + chars_per_step, len(clean))
+            text = clean[:cursor]
+
+            if text:
+                steps.append(
+                    FakeAsrStep(
+                        offset_sec=t,
+                        text=text,
+                        event_type=AsrEventType.PARTIAL,
+                    )
+                )
+
+            t += step_interval_sec
+
+            if pause_at_step is not None and step_idx == pause_at_step:
+                t += pause_extra_sec
+
+            step_idx += 1
+
+        if tail_final:
+            steps.append(
+                FakeAsrStep(
+                    offset_sec=t + 0.1,
+                    text=clean,
+                    event_type=AsrEventType.FINAL,
+                )
+            )
+
+        return cls(FakeAsrConfig(scripted_steps=steps))
 
     def start(self) -> None:
         self._running = True
@@ -95,9 +167,6 @@ class FakeASRProvider(ASRProvider):
     def close(self) -> None:
         self._running = False
 
-    # ----------------------------
-    # internal: scripted mode
-    # ----------------------------
     def _poll_scripted(self) -> list[AsrEvent]:
         now = time.monotonic()
         elapsed = now - self._start_at
@@ -126,9 +195,6 @@ class FakeASRProvider(ASRProvider):
 
         return events
 
-    # ----------------------------
-    # internal: progressive mode
-    # ----------------------------
     def _poll_progressive(self) -> list[AsrEvent]:
         now = time.monotonic()
         events: list[AsrEvent] = []
@@ -140,6 +206,7 @@ class FakeASRProvider(ASRProvider):
         n_chars = int(math.floor(total_audio_sec * self.config.chars_per_sec))
         n_chars = max(0, min(n_chars, len(self.config.reference_text)))
 
+        # progressive 模式也改成前缀增长型
         current_text = self.config.reference_text[:n_chars]
 
         if current_text and current_text != self._last_progress_text:
@@ -164,14 +231,15 @@ class FakeASRProvider(ASRProvider):
             and n_chars >= len(self.config.reference_text)
             and self._last_final_text != self.config.reference_text
         ):
-            normalized = self.normalizer.normalize_text(self.config.reference_text)
-            pinyin_seq = self.normalizer.to_pinyin_seq(self.config.reference_text)
+            final_text = self.config.reference_text
+            normalized = self.normalizer.normalize_text(final_text)
+            pinyin_seq = self.normalizer.to_pinyin_seq(final_text)
 
             if normalized:
                 events.append(
                     AsrEvent(
                         event_type=AsrEventType.FINAL,
-                        text=self.config.reference_text,
+                        text=final_text,
                         normalized_text=normalized,
                         pinyin_seq=pinyin_seq,
                         emitted_at_sec=now,

@@ -1,6 +1,6 @@
-import _bootstrap  # noqa: F401
 
 from __future__ import annotations
+import _bootstrap  # noqa: F401
 
 import argparse
 import os
@@ -29,17 +29,15 @@ def build_config(
     input_device: int | None,
     input_samplerate: int,
     asr_mode: str,
+    bluetooth_offset_sec: float,
+    debug: bool,
 ) -> dict:
-    """
-    这里统一生成 runtime 配置。
-    默认 playback 先用 48k，capture 转 16k。
-    """
     config = {
         "lesson_base_dir": lesson_base_dir,
         "playback": {
-            "sample_rate": 48000,
-            "device": None,  # 输出设备后面你可以再单独做选择器
-            "bluetooth_output_offset_sec": 0.18,
+            "sample_rate": 48000,  # 先保留；后面可改成从 manifest 驱动
+            "device": None,
+            "bluetooth_output_offset_sec": bluetooth_offset_sec,
         },
         "capture": {
             "device_sample_rate": input_samplerate,
@@ -49,7 +47,6 @@ def build_config(
         "asr": {
             "mode": asr_mode,
             "hotwords": "",
-            # sherpa 需要时再补
             "tokens": os.getenv("SHERPA_TOKENS", ""),
             "encoder": os.getenv("SHERPA_ENCODER", ""),
             "decoder": os.getenv("SHERPA_DECODER", ""),
@@ -62,6 +59,14 @@ def build_config(
             "rule1_min_trailing_silence": 10.0,
             "rule2_min_trailing_silence": 10.0,
             "rule3_min_utterance_length": 60.0,
+        },
+        "debug": {
+            "enabled": debug,
+            "heartbeat_sec": 1.0,
+            "print_asr": True,
+            "print_alignment": True,
+            "print_decision": True,
+            "print_player_status": True,
         },
     }
     return config
@@ -123,6 +128,11 @@ def main() -> None:
         default=0.18,
         help="Estimated Bluetooth playback offset.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable runtime debug logs for ASR/alignment/controller/player heartbeat.",
+    )
 
     args = parser.parse_args()
 
@@ -145,8 +155,9 @@ def main() -> None:
         input_device=rec_cfg["device"],
         input_samplerate=rec_cfg["samplerate"],
         asr_mode=args.asr,
+        bluetooth_offset_sec=args.bluetooth_offset_sec,
+        debug=args.debug,
     )
-    config["playback"]["bluetooth_output_offset_sec"] = args.bluetooth_offset_sec
 
     print("=== Run config ===")
     print(f"text file     : {text_path}")
@@ -156,23 +167,30 @@ def main() -> None:
     print(f"input sr      : {rec_cfg['samplerate']}")
     print(f"asr mode      : {args.asr}")
     print(f"bt offset sec : {args.bluetooth_offset_sec}")
+    print(f"debug         : {args.debug}")
     print()
 
     runtime = build_runtime(config)
 
-    # 为了让你现在就能跑，默认用 FakeASR 替换掉 runtime 里的 asr
     if args.asr == "fake":
         lesson_text = text_path.read_text(encoding="utf-8").strip()
-        runtime.orchestrator.asr = FakeASRProvider(
-            FakeAsrConfig(
-                reference_text=lesson_text,
-                chars_per_sec=args.fake_chars_per_sec,
-                emit_partial_interval_sec=0.10,
-                sample_rate=16000,
-            )
-        )
 
-    # 如果你指定 sherpa，但路径没配，会在 provider.start() 那里报更明确的错
+        runtime.orchestrator.asr = FakeASRProvider.from_reference_text(
+            reference_text=lesson_text,
+            chars_per_step=4,
+            step_interval_sec=0.25,
+            lag_sec=0.4,
+            tail_final=True,
+            # 先不要开 pause/jump，先看 committed 能不能稳定前进
+            # pause_at_step=8,
+            # pause_extra_sec=2.0,
+            # jump_at_step=18,
+            # jump_to_char=min(160, len(lesson_text)),
+        )
+        
+    if hasattr(runtime.orchestrator, "configure_debug"):
+        runtime.orchestrator.configure_debug(config["debug"])
+
     print("Starting shadowing runtime...")
     print("Press Ctrl+C to stop.")
     print()
