@@ -149,6 +149,7 @@ def build_config(
             "device_sample_rate": input_samplerate,
             "target_sample_rate": 16000,
             "device": input_device,
+            "prefer_soundcard_on_windows": True,
         },
         "asr": {
             "mode": asr_mode,

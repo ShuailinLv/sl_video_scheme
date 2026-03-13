@@ -190,7 +190,8 @@ def main():
     hard_exclude_dirs = {
         "__pycache__", ".git", ".idea", ".vscode", "logs", "venv", ".venv", "env", 
         ".mypy_cache", ".pytest_cache", "node_modules", "dist", "build", ".ds_store", 
-        "gpt-related-ci", "gpt-related-scheme", "docs", "site-packages"
+        "gpt-related-ci", "gpt-related-scheme", "docs", "site-packages", "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17", 'assets', 'sherpa-onnx-streaming-zipformer-zh-14M',
+        'sherpa-onnx-streaming-zipformer-en-20M-2023-02-17'
     }
     hard_exclude_files = {
         "project_snapshot.md", ".ds_store", "create_snapshot.py", "clean_code.py"
@@ -200,9 +201,9 @@ def main():
         ".xlsx", ".wav", ".webm", ".mp3", ".ogg", ".log",
         ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".bmp", ".tif",
         ".zip", ".rar", ".7z", ".gz", ".tar", ".bz2",
-        ".pdf", ".doc", ".docx", ".xls", ".ppt", ".pptx",
-        ".db", ".sqlite", ".sqlite3", ".exe", ".dll", ".so", ".a", ".lib", ".o",
-        ".ttf", ".woff", ".woff2", ".eot", ".dat", ".cache", ".img", ".iso", ".md"
+        ".pdf", ".doc", ".docx", ".xls", ".ppt", ".pptx", '.sh', '.txt',
+        ".db", ".sqlite", ".sqlite3", ".exe", ".dll", ".so", ".a", ".lib", ".o", 'gitattributes'
+        ".ttf", ".woff", ".woff2", ".eot", ".dat", ".cache", ".img", ".iso", ".md", "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17", "assets", "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17", "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17"
     }
 
     user_ex_dirs = set(s.lstrip("/").strip().lower() for s in normalize_list(args.exclude_dirs))

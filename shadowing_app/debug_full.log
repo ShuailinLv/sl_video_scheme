@@ -1,0 +1,41 @@
+=== Run config ===
+text file       : D:\sl_video_scheme\shadowing_app\assets\raw_texts\演讲稿3.txt
+lesson id       : 演讲稿3
+lesson dir      : D:\sl_video_scheme\shadowing_app\assets\lessons\演讲稿3
+input device    : 14
+input sr        : 48000
+playback sr     : 44100
+asr mode        : sherpa
+bt offset sec   : 0.18
+debug           : True
+pure playback   : False
+ducking only    : False
+disable seek    : True
+disable hold    : False
+
+Starting shadowing runtime...
+Press Ctrl+C to stop.
+
+[REF] total_tokens=918 total_duration=218.268
+[REF] head_chars='大家好我是你们的师兄20届毕业现在在华为'
+[REF] head_pinyin=['da', 'jia', 'hao', 'wo', 'shi', 'ni', 'men', 'de', 'shi', 'xiong']
+[REC] available input devices (ordinal -> raw index):
+  [0] raw=0 name='Microsoft 声音映射器 - Input' max_in=2 default_sr=44100
+  [1] raw=1 name='耳机式麦克风 (HUAWEI USB-C HEADSET)' max_in=2 default_sr=44100
+Traceback (most recent call last):
+  File "D:\sl_video_scheme\shadowing_app\tools\run_shadowing.py", line 340, in <module>
+    main()
+  File "D:\sl_video_scheme\shadowing_app\tools\run_shadowing.py", line 334, in main
+    runtime.run(lesson_id)
+  File "D:\sl_video_scheme\shadowing_app\src\shadowing\realtime\runtime.py", line 12, in run
+    self.orchestrator.start_session(lesson_id)
+  File "D:\sl_video_scheme\shadowing_app\src\shadowing\realtime\orchestrator.py", line 121, in start_session
+    self.recorder.start(self._on_audio_frame)
+  File "D:\sl_video_scheme\shadowing_app\src\shadowing\realtime\capture\sounddevice_recorder.py", line 43, in start
+    input_device_index = self._resolve_input_device(self.device)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\sl_video_scheme\shadowing_app\src\shadowing\realtime\capture\sounddevice_recorder.py", line 152, in _resolve_input_device
+    self._print_input_device_map(input_devices)
+  File "D:\sl_video_scheme\shadowing_app\src\shadowing\realtime\capture\sounddevice_recorder.py", line 205, in _print_input_device_map
+    print(
+UnicodeEncodeError: 'gbk' codec can't encode character '\xae' in position 37: illegal multibyte sequence

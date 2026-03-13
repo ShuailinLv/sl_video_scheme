@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, List
@@ -49,7 +47,7 @@ class AudioChunk:
     chunk_id: int
     sample_rate: int
     channels: int
-    samples: "object"   # numpy.ndarray
+    samples: "object"
     duration_sec: float
     start_time_sec: float
     path: Optional[str] = None
@@ -119,6 +117,8 @@ class ControlDecision:
     target_time_sec: Optional[float] = None
     lead_sec: Optional[float] = None
     target_gain: Optional[float] = None
+    replay_lockin: bool = False
+
 
 @dataclass(slots=True)
 class ControlFeatures:

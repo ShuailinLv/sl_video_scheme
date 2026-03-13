@@ -44,6 +44,7 @@ class ShadowingOrchestrator:
         self.loop_interval_sec = loop_interval_sec
         self._running = False
         self._asr_thread: threading.Thread | None = None
+        self._last_alignment = None
 
         self._debug_enabled = False
         self._debug_heartbeat_sec = 1.0
@@ -196,7 +197,14 @@ class ShadowingOrchestrator:
                         pass
 
     def _control_tick(self) -> None:
-        latest_alignment = None
+        latest_alignment = self._last_alignment
+
+        if self._debug_enabled:
+            print(
+                f"[DBG] tick_start "
+                f"cached_alignment={type(self._last_alignment).__name__} "
+                f"value={self._last_alignment}"
+            )
 
         while not self._pure_playback:
             try:
@@ -215,10 +223,33 @@ class ShadowingOrchestrator:
 
             latest_alignment = self.aligner.update(event)
 
+            if self._debug_enabled:
+                print(
+                    f"[DBG] aligner_return "
+                    f"type={type(latest_alignment).__name__} "
+                    f"value={latest_alignment}"
+                )
+
+            if latest_alignment is not None:
+                self._last_alignment = latest_alignment
+                if self._debug_enabled:
+                    print(
+                        f"[DBG] cache_alignment_updated "
+                        f"type={type(self._last_alignment).__name__} "
+                        f"value={self._last_alignment}"
+                    )
+
             if self._debug_enabled and self._debug_print_alignment and latest_alignment is not None:
                 self._debug_print_alignment_result(latest_alignment)
 
         status = self.player.get_status()
+
+        if self._debug_enabled:
+            print(
+                f"[DBG] before_decide "
+                f"latest_alignment_type={type(latest_alignment).__name__} "
+                f"latest_alignment={latest_alignment}"
+            )
 
         if status.state.value == "finished":
             if self._debug_enabled:
@@ -280,6 +311,7 @@ class ShadowingOrchestrator:
                 PlayerCommand(cmd=PlayerCommandType.STOP, reason=decision.reason)
             )
             self._running = False
+            
 
     def _debug_heartbeat(self) -> None:
         if not self._debug_enabled or not self._debug_print_player_status:
