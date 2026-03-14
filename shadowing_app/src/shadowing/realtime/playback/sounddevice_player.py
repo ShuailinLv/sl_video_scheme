@@ -86,6 +86,9 @@ class SoundDevicePlayer(Player):
             t_ref_heard_content_sec=0.0,
         )
 
+    def set_output_offset_sec(self, offset_sec: float) -> None:
+        self.clock.set_output_offset_sec(offset_sec)
+
     def load_chunks(self, chunks: list[AudioChunk]) -> None:
         if chunks and any(c.sample_rate != self.config.sample_rate for c in chunks):
             raise ValueError("Chunk sample rate does not match player config sample rate.")

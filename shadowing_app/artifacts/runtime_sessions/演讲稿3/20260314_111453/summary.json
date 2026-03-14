@@ -1,0 +1,42 @@
+{
+  "metrics": {
+    "first_signal_active_time_sec": 2.0,
+    "first_asr_partial_time_sec": 2.375,
+    "first_reliable_progress_time_sec": 2.4060000000026776,
+    "startup_false_hold_count": 0,
+    "hold_count": 0,
+    "resume_count": 0,
+    "soft_duck_count": 12,
+    "seek_count": 0,
+    "lost_count": 0,
+    "reacquire_count": 0,
+    "max_tracking_quality": 0.9353577035220618,
+    "mean_tracking_quality": 0.8150405997578232,
+    "total_progress_updates": 16
+  },
+  "latency_calibration": {
+    "estimated_input_latency_ms": 260.0,
+    "estimated_output_latency_ms": 88.79999999999995,
+    "confidence": 0.92,
+    "calibrated": true
+  },
+  "final_policy": {
+    "guide_play_sec": 2.8000000000000003,
+    "no_progress_hold_min_play_sec": 4.8,
+    "progress_stale_sec": 1.38,
+    "hold_trend_sec": 0.7699999999999999,
+    "tracking_quality_hold_min": 0.6,
+    "tracking_quality_seek_min": 0.74,
+    "resume_from_hold_speaking_lead_slack_sec": 0.5700000000000001,
+    "gain_soft_duck": 0.38
+  },
+  "orchestrator_stats": {
+    "audio_enqueued": 484,
+    "audio_dropped": 0,
+    "audio_q_high_watermark": 1,
+    "asr_events_emitted": 16,
+    "asr_events_dropped": 0,
+    "asr_poll_iterations": 484,
+    "use_partial_adapter": true
+  }
+}

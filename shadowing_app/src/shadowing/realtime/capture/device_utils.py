@@ -39,7 +39,8 @@ def list_input_devices() -> list[InputDeviceInfo]:
 def print_input_devices() -> None:
     for d in list_input_devices():
         print(
-            f"[{d.index}] {d.name} | hostapi={d.hostapi_name} | max_in={d.max_input_channels} | default_sr={d.default_samplerate}"
+            f"[{d.index}] {d.name} | hostapi={d.hostapi_name} | "
+            f"max_in={d.max_input_channels} | default_sr={d.default_samplerate}"
         )
 
 
@@ -50,28 +51,45 @@ def get_default_input_device_index() -> int | None:
     return int(default_input)
 
 
-def choose_input_device(preferred_index: int | None = None, preferred_name_substring: str | None = None) -> int | None:
+def choose_input_device(
+    preferred_index: int | None = None,
+    preferred_name_substring: str | None = None,
+) -> int | None:
     devices = list_input_devices()
     if not devices:
         return None
+
     if preferred_index is not None:
         for d in devices:
             if d.index == preferred_index:
                 return d.index
+
     if preferred_name_substring:
-        keyword = preferred_name_substring.lower()
+        keyword = preferred_name_substring.lower().strip()
         for d in devices:
-            if keyword in d.name.lower():
+            if keyword and keyword in d.name.lower():
                 return d.index
+
     default_idx = get_default_input_device_index()
     if default_idx is not None:
         return default_idx
+
     return devices[0].index
 
 
-def check_input_settings(device: int | None, samplerate: int, channels: int = 1, dtype: str = "float32") -> bool:
+def check_input_settings(
+    device: int | None,
+    samplerate: int,
+    channels: int = 1,
+    dtype: str = "float32",
+) -> bool:
     try:
-        sd.check_input_settings(device=device, samplerate=samplerate, channels=channels, dtype=dtype)
+        sd.check_input_settings(
+            device=device,
+            samplerate=samplerate,
+            channels=channels,
+            dtype=dtype,
+        )
         return True
     except Exception:
         return False
@@ -79,15 +97,32 @@ def check_input_settings(device: int | None, samplerate: int, channels: int = 1,
 
 def pick_working_input_config(
     preferred_device: int | None = None,
+    preferred_name_substring: str | None = None,
     preferred_rates: list[int] | None = None,
     channels: int = 1,
     dtype: str = "float32",
 ) -> dict[str, Any] | None:
     preferred_rates = preferred_rates or [48000, 44100, 16000]
-    device = choose_input_device(preferred_index=preferred_device)
+
+    device = choose_input_device(
+        preferred_index=preferred_device,
+        preferred_name_substring=preferred_name_substring,
+    )
     if device is None:
         return None
+
     for sr in preferred_rates:
-        if check_input_settings(device=device, samplerate=sr, channels=channels, dtype=dtype):
-            return {"device": device, "samplerate": sr, "channels": channels, "dtype": dtype}
+        if check_input_settings(
+            device=device,
+            samplerate=sr,
+            channels=channels,
+            dtype=dtype,
+        ):
+            return {
+                "device": device,
+                "samplerate": sr,
+                "channels": channels,
+                "dtype": dtype,
+            }
+
     return None

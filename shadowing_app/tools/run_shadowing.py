@@ -7,6 +7,11 @@ import os
 import re
 from pathlib import Path
 
+from shadowing.audio.bluetooth_preflight import (
+    BluetoothPreflightConfig,
+    run_bluetooth_duplex_preflight,
+    should_run_bluetooth_preflight,
+)
 from shadowing.bootstrap import build_runtime
 from shadowing.realtime.capture.device_utils import pick_working_input_config
 
@@ -164,6 +169,7 @@ def build_config(
             "clause_boundary_bonus": 0.15,
             "cross_clause_backward_extra_penalty": 0.20,
             "debug": False,
+            "max_hyp_tokens": 16,
         },
         "control": {
             "target_lead_sec": 0.15,
@@ -174,10 +180,24 @@ def build_config(
             "seek_cooldown_sec": 1.20,
             "gain_following": 0.55,
             "gain_transition": 0.80,
+            "gain_soft_duck": 0.42,
             "recover_after_seek_sec": 0.60,
             "startup_grace_sec": startup_grace_sec,
             "low_confidence_hold_sec": low_confidence_hold_sec,
             "disable_seek": False,
+            "bootstrapping_sec": 1.80,
+            "guide_play_sec": 2.20,
+            "no_progress_hold_min_play_sec": 4.00,
+            "speaking_recent_sec": 0.90,
+            "progress_stale_sec": 1.10,
+            "hold_trend_sec": 0.75,
+            "hold_extra_lead_sec": 0.18,
+            "low_confidence_continue_sec": 1.40,
+            "tracking_quality_hold_min": 0.60,
+            "tracking_quality_seek_min": 0.72,
+            "resume_from_hold_event_fresh_sec": 0.45,
+            "resume_from_hold_speaking_lead_slack_sec": 0.45,
+            "reacquire_soft_duck_sec": 2.00,
         },
         "runtime": {
             "pure_playback": pure_playback,
@@ -185,11 +205,14 @@ def build_config(
             "audio_queue_maxsize": audio_queue_maxsize,
             "asr_event_queue_maxsize": asr_event_queue_maxsize,
             "loop_interval_sec": 0.03,
+            "telemetry_enabled": True,
+            "session_artifacts_dir": "artifacts/runtime_sessions",
         },
         "debug": {
             "enabled": False,
             "adapter_debug": False,
             "aligner_debug": False,
+            "tracking_debug": False,
         },
     }
 
@@ -203,6 +226,70 @@ def _parse_input_device_arg(raw_value: str | None) -> int | str | None:
     if raw.isdigit():
         return int(raw)
     return raw
+
+
+def _run_bluetooth_preflight_or_fail(
+    *,
+    capture_backend: str,
+    input_device: int | str | None,
+    output_device: int | str | None,
+    input_samplerate: int,
+    playback_sample_rate: int,
+    preflight_duration_sec: float,
+    skip_bluetooth_preflight: bool,
+) -> tuple[int | str | None, int | None]:
+    if skip_bluetooth_preflight:
+        print("[BT-PREFLIGHT] skipped by user.")
+        return input_device, output_device
+
+    should_run = should_run_bluetooth_preflight(
+        input_device=input_device,
+        output_device=output_device,
+    )
+    if not should_run:
+        print("[BT-PREFLIGHT] not a bluetooth-headset session, skip.")
+        return input_device, output_device
+
+    if capture_backend != "sounddevice":
+        raise RuntimeError(
+            "Bluetooth headset commercial mode requires --capture-backend sounddevice, "
+            "because startup preflight must validate duplex with the same device stack."
+        )
+
+    result = run_bluetooth_duplex_preflight(
+        BluetoothPreflightConfig(
+            input_device=input_device,
+            output_device=output_device,
+            preferred_input_samplerate=int(input_samplerate),
+            preferred_output_samplerate=int(playback_sample_rate),
+            duration_sec=float(preflight_duration_sec),
+        )
+    )
+
+    print(
+        "[BT-PREFLIGHT] "
+        f"input={result.input_device_name!r} "
+        f"output={result.output_device_name!r} "
+        f"sr={result.samplerate} "
+        f"mean_rms={result.mean_rms:.6f} "
+        f"max_peak={result.max_peak:.6f} "
+        f"nonzero_ratio={result.nonzero_ratio:.6f} "
+        f"voiced_frame_ratio={result.voiced_frame_ratio:.6f} "
+        f"status_events={result.status_events} "
+        f"passed={result.passed}"
+    )
+
+    if not result.passed:
+        notes = "\n".join(f"- {x}" for x in result.notes) if result.notes else ""
+        raise RuntimeError(
+            "Bluetooth headset duplex preflight failed.\n"
+            f"Reason: {result.failure_reason}\n"
+            f"Input: {result.input_device_name!r}\n"
+            f"Output: {result.output_device_name!r}\n"
+            f"{notes}"
+        )
+
+    return result.input_device_index, result.output_device_index
 
 
 def main() -> None:
@@ -219,6 +306,7 @@ def main() -> None:
     parser.add_argument("--pure-playback", action="store_true")
     parser.add_argument("--adapter-debug", action="store_true")
     parser.add_argument("--aligner-debug", action="store_true")
+    parser.add_argument("--tracking-debug", action="store_true")
     parser.add_argument("--disable-seek", action="store_true")
     parser.add_argument("--bypass-partial-adapter", action="store_true")
 
@@ -239,6 +327,9 @@ def main() -> None:
 
     parser.add_argument("--asr-debug-feed", action="store_true")
     parser.add_argument("--asr-debug-feed-every", type=int, default=20)
+
+    parser.add_argument("--skip-bluetooth-preflight", action="store_true")
+    parser.add_argument("--preflight-duration-sec", type=float, default=3.5)
 
     args = parser.parse_args()
 
@@ -261,16 +352,25 @@ def main() -> None:
 
     parsed_input_device = _parse_input_device_arg(args.input_device)
 
+
     if args.capture_backend == "sounddevice":
         rec_cfg = pick_working_input_config(
-            preferred_device=parsed_input_device if isinstance(parsed_input_device, int) else None
+            preferred_device=parsed_input_device if isinstance(parsed_input_device, int) else None,
+            preferred_name_substring=parsed_input_device if isinstance(parsed_input_device, str) else None,
+            preferred_rates=(
+                [args.input_samplerate, 48000, 44100, 16000]
+                if args.input_samplerate is not None
+                else [48000, 44100, 16000]
+            ),
         ) or {
             "device": parsed_input_device,
             "samplerate": args.input_samplerate or 48000,
         }
+
         if args.input_samplerate is not None:
             rec_cfg["samplerate"] = args.input_samplerate
-        effective_input_device: int | str | None = rec_cfg["device"]
+
+        effective_input_device = rec_cfg["device"]
         effective_input_samplerate = int(rec_cfg["samplerate"])
     else:
         effective_input_device = parsed_input_device
@@ -286,12 +386,22 @@ def main() -> None:
             "not sounddevice raw device index."
         )
 
+    effective_input_device, effective_output_device = _run_bluetooth_preflight_or_fail(
+        capture_backend=args.capture_backend,
+        input_device=effective_input_device,
+        output_device=args.output_device,
+        input_samplerate=effective_input_samplerate,
+        playback_sample_rate=playback_sample_rate,
+        preflight_duration_sec=float(args.preflight_duration_sec),
+        skip_bluetooth_preflight=bool(args.skip_bluetooth_preflight),
+    )
+
     print(
         f"[RUN-CONFIG] lesson_id={lesson_id} "
         f"capture_backend={args.capture_backend} "
         f"input_device={effective_input_device!r} "
         f"input_samplerate={effective_input_samplerate} "
-        f"output_device={args.output_device!r} "
+        f"output_device={effective_output_device!r} "
         f"playback_sr={playback_sample_rate} "
         f"playback_latency={args.playback_latency} "
         f"playback_blocksize={int(args.playback_blocksize)} "
@@ -314,7 +424,7 @@ def main() -> None:
         use_partial_adapter=not bool(args.bypass_partial_adapter),
         audio_queue_maxsize=int(args.audio_queue_maxsize),
         asr_event_queue_maxsize=int(args.asr_event_queue_maxsize),
-        output_device=args.output_device,
+        output_device=effective_output_device,
         playback_latency=args.playback_latency,
         playback_blocksize=int(args.playback_blocksize),
         capture_backend=args.capture_backend,
@@ -328,9 +438,10 @@ def main() -> None:
     )
 
     config["control"]["disable_seek"] = bool(args.disable_seek or args.asr == "fake")
-    config["debug"]["enabled"] = bool(args.adapter_debug or args.aligner_debug)
+    config["debug"]["enabled"] = bool(args.adapter_debug or args.aligner_debug or args.tracking_debug)
     config["debug"]["adapter_debug"] = bool(args.adapter_debug)
     config["debug"]["aligner_debug"] = bool(args.aligner_debug)
+    config["debug"]["tracking_debug"] = bool(args.tracking_debug)
     config["alignment"]["debug"] = bool(args.aligner_debug)
 
     runtime = build_runtime(config)
@@ -340,6 +451,7 @@ def main() -> None:
         runtime.run(lesson_id)
     except KeyboardInterrupt:
         print("\nStopped by user.")
+
 
 if __name__ == "__main__":
     main()

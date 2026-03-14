@@ -18,6 +18,7 @@ class PlaybackState(str, Enum):
 
 class ControlAction(str, Enum):
     NOOP = "noop"
+    SOFT_DUCK = "soft_duck"
     HOLD = "hold"
     RESUME = "resume"
     SEEK = "seek"
@@ -37,6 +38,26 @@ class PlayerCommandType(str, Enum):
     SEEK = "seek"
     STOP = "stop"
     SET_GAIN = "set_gain"
+
+
+class TrackingMode(str, Enum):
+    BOOTSTRAP = "bootstrap"
+    LOCKED = "locked"
+    WEAK_LOCKED = "weak_locked"
+    REACQUIRING = "reacquiring"
+    LOST = "lost"
+
+
+class UserReadState(str, Enum):
+    NOT_STARTED = "not_started"
+    WARMING_UP = "warming_up"
+    FOLLOWING = "following"
+    HESITATING = "hesitating"
+    PAUSED = "paused"
+    REPEATING = "repeating"
+    SKIPPING = "skipping"
+    REJOINING = "rejoining"
+    LOST = "lost"
 
 
 @dataclass(slots=True)
@@ -154,6 +175,72 @@ class AlignResult:
     debug_backward_run: int = 0
     debug_matched_count: int = 0
     debug_hyp_length: int = 0
+    local_match_ratio: float = 0.0
+    repeat_penalty: float = 0.0
+    emitted_at_sec: float = 0.0
+
+
+@dataclass(slots=True)
+class SignalQuality:
+    observed_at_sec: float
+    rms: float
+    peak: float
+    vad_active: bool
+    speaking_likelihood: float
+    silence_run_sec: float
+    clipping_ratio: float
+    dropout_detected: bool
+    quality_score: float
+
+
+@dataclass(slots=True)
+class TrackingQuality:
+    overall_score: float
+    observation_score: float
+    temporal_consistency_score: float
+    anchor_score: float
+    mode: TrackingMode
+    is_reliable: bool
+
+
+@dataclass(slots=True)
+class TrackingSnapshot:
+    candidate_ref_idx: int
+    committed_ref_idx: int
+    candidate_ref_time_sec: float
+    confidence: float
+    stable: bool
+    local_match_ratio: float
+    repeat_penalty: float
+    monotonic_consistency: float
+    anchor_consistency: float
+    emitted_at_sec: float
+    tracking_mode: TrackingMode
+    tracking_quality: TrackingQuality
+    matched_text: str = ""
+
+
+@dataclass(slots=True)
+class ProgressEstimate:
+    estimated_ref_idx: int
+    estimated_ref_time_sec: float
+    progress_velocity_idx_per_sec: float
+
+    event_emitted_at_sec: float
+    last_progress_at_sec: float
+    progress_age_sec: float
+
+    source_candidate_ref_idx: int
+    source_committed_ref_idx: int
+
+    tracking_mode: TrackingMode
+    tracking_quality: float
+    stable: bool
+    confidence: float
+
+    active_speaking: bool
+    recently_progressed: bool
+    user_state: UserReadState
 
 
 @dataclass(slots=True)
@@ -164,3 +251,28 @@ class ControlDecision:
     lead_sec: Optional[float] = None
     target_gain: Optional[float] = None
     replay_lockin: bool = False
+    confidence: float = 0.0
+    aggressiveness: str = "low"
+
+
+@dataclass(slots=True)
+class DeviceProfileSnapshot:
+    input_device_id: str
+    output_device_id: str
+    input_kind: str
+    output_kind: str
+    input_sample_rate: int
+    output_sample_rate: int
+    estimated_input_latency_ms: float
+    estimated_output_latency_ms: float
+    noise_floor_rms: float
+    input_gain_hint: str
+    reliability_tier: str
+
+
+@dataclass(slots=True)
+class LatencyCalibrationSnapshot:
+    estimated_input_latency_ms: float
+    estimated_output_latency_ms: float
+    confidence: float
+    calibrated: bool

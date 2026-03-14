@@ -48,6 +48,7 @@ class IncrementalAligner(Aligner):
         clause_boundary_bonus: float = 0.15,
         cross_clause_backward_extra_penalty: float = 0.20,
         debug: bool = False,
+        max_hyp_tokens: int = 16,
     ) -> None:
         self.window_selector = WindowSelector(look_back=window_back, look_ahead=window_ahead)
         self.scorer = AlignmentScorer()
@@ -57,6 +58,7 @@ class IncrementalAligner(Aligner):
         self.clause_boundary_bonus = float(clause_boundary_bonus)
         self.cross_clause_backward_extra_penalty = float(cross_clause_backward_extra_penalty)
         self.debug = bool(debug)
+        self.max_hyp_tokens = max(6, int(max_hyp_tokens))
 
         self.ref_map: ReferenceMap | None = None
         self.ref_tokens: list[_RefTokenView] = []
@@ -92,25 +94,21 @@ class IncrementalAligner(Aligner):
         if event.event_type not in (AsrEventType.PARTIAL, AsrEventType.FINAL):
             return None
 
-        if len(event.chars) != len(event.pinyin_seq):
-            min_len = min(len(event.chars), len(event.pinyin_seq))
-            chars = event.chars[:min_len]
-            pinyin_seq = event.pinyin_seq[:min_len]
-        else:
-            chars = event.chars
-            pinyin_seq = event.pinyin_seq
-
-        if not chars:
+        raw_pairs = list(zip(event.chars, event.pinyin_seq, strict=False))
+        hyp_pairs, repeat_penalty = self._prepare_hypothesis(raw_pairs)
+        if not hyp_pairs:
             return None
 
-        hyp_tokens = [HypToken(char=c, pinyin=py) for c, py in zip(chars, pinyin_seq, strict=True)]
+        hyp_tokens = [HypToken(char=c, pinyin=py) for c, py in hyp_pairs]
         window_tokens, window_start, window_end = self.window_selector.select(
-            self.ref_map, self.state.committed_idx
+            self.ref_map,
+            self.state.committed_idx,
         )
-        candidate = self._align_window(
+        candidate, local_match_ratio = self._align_window(
             hyp_tokens=hyp_tokens,
             ref_tokens=window_tokens,
             ref_offset=window_start,
+            repeat_penalty=repeat_penalty,
         )
         stable = self._observe_candidate(candidate, event.event_type)
 
@@ -157,6 +155,9 @@ class IncrementalAligner(Aligner):
             debug_backward_run=self.state.backward_run,
             debug_matched_count=len(candidate.matched_ref_indices),
             debug_hyp_length=len(hyp_tokens),
+            local_match_ratio=local_match_ratio,
+            repeat_penalty=repeat_penalty,
+            emitted_at_sec=event.emitted_at_sec,
         )
 
     def _observe_candidate(self, candidate: CandidateAlignment, event_type: AsrEventType) -> bool:
@@ -214,22 +215,60 @@ class IncrementalAligner(Aligner):
 
         return stable
 
+    def _prepare_hypothesis(
+        self,
+        raw_pairs: list[tuple[str, str]],
+    ) -> tuple[list[tuple[str, str]], float]:
+        if not raw_pairs:
+            return [], 0.0
+
+        compacted: list[tuple[str, str]] = []
+        same_run = 0
+        prev_char = ""
+
+        for ch, py in raw_pairs:
+            if ch == prev_char:
+                same_run += 1
+            else:
+                same_run = 1
+                prev_char = ch
+
+            if same_run > 2:
+                continue
+
+            compacted.append((ch, py))
+
+        if len(compacted) > self.max_hyp_tokens:
+            compacted = compacted[-self.max_hyp_tokens :]
+
+        repeat_hits = 0
+        for i in range(1, len(compacted)):
+            if compacted[i][0] == compacted[i - 1][0]:
+                repeat_hits += 1
+
+        repeat_penalty = repeat_hits / max(1, len(compacted) - 1)
+        return compacted, repeat_penalty
+
     def _align_window(
         self,
         hyp_tokens: list[HypToken],
         ref_tokens: list[_RefTokenView],
         ref_offset: int,
-    ) -> CandidateAlignment:
+        repeat_penalty: float,
+    ) -> tuple[CandidateAlignment, float]:
         m = len(hyp_tokens)
         n = len(ref_tokens)
 
         if m == 0 or n == 0:
             committed = self.state.committed_idx
-            return CandidateAlignment(
-                ref_start_idx=committed,
-                ref_end_idx=committed,
-                score=0.0,
-                confidence=0.0,
+            return (
+                CandidateAlignment(
+                    ref_start_idx=committed,
+                    ref_end_idx=committed,
+                    score=0.0,
+                    confidence=0.0,
+                ),
+                0.0,
             )
 
         dp = [[0.0] * (n + 1) for _ in range(m + 1)]
@@ -289,12 +328,22 @@ class IncrementalAligner(Aligner):
                     best_j = j
 
         matched_indices: list[int] = []
+        positive_match_count = 0
+
         i = m
         j = best_j
         while i > 0 and j > 0:
             op = trace[i][j]
             if op == "M":
-                matched_indices.append(ref_offset + j - 1)
+                ref_global_idx = ref_offset + j - 1
+                matched_indices.append(ref_global_idx)
+
+                ref = ref_tokens[j - 1]
+                hyp = hyp_tokens[i - 1]
+                pair_score = self.scorer.score_token_pair(ref.char, ref.pinyin, hyp.char, hyp.pinyin)
+                if pair_score > 0:
+                    positive_match_count += 1
+
                 i -= 1
                 j -= 1
             elif op == "I":
@@ -309,15 +358,27 @@ class IncrementalAligner(Aligner):
         ref_start_idx = matched_indices[0] if matched_indices else max(ref_offset, ref_end_idx)
         backward_jump = ref_end_idx < self.state.committed_idx
         norm_score = best_score / max(1, len(hyp_tokens))
-        confidence = 1.0 / (1.0 + exp(-1.25 * norm_score))
+        base_conf = 1.0 / (1.0 + exp(-1.20 * norm_score))
+
+        local_match_ratio = positive_match_count / max(1, len(hyp_tokens))
+        forward_bonus = 0.06 if ref_end_idx >= self.state.committed_idx else -0.08
+        confidence = (
+            0.62 * base_conf
+            + 0.30 * local_match_ratio
+            + forward_bonus
+            - 0.22 * repeat_penalty
+        )
         mode = "backward" if backward_jump else "normal"
 
-        return CandidateAlignment(
-            ref_start_idx=ref_start_idx,
-            ref_end_idx=ref_end_idx,
-            score=best_score,
-            confidence=max(0.0, min(1.0, confidence)),
-            matched_ref_indices=matched_indices,
-            backward_jump=backward_jump,
-            mode=mode,
+        return (
+            CandidateAlignment(
+                ref_start_idx=ref_start_idx,
+                ref_end_idx=ref_end_idx,
+                score=best_score,
+                confidence=max(0.0, min(1.0, confidence)),
+                matched_ref_indices=matched_indices,
+                backward_jump=backward_jump,
+                mode=mode,
+            ),
+            local_match_ratio,
         )

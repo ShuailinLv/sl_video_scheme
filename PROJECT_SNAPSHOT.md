@@ -38,6 +38,201 @@ class ElevenLabsScribeProvider(AnalyticsProvider):
 ```
 
 ---
+### 文件: `shadowing_app/src/shadowing/audio/device_profile.py`
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class DeviceProfile:
+    input_device_id: str
+    output_device_id: str
+    input_kind: str
+    output_kind: str
+    input_sample_rate: int
+    output_sample_rate: int
+    estimated_input_latency_ms: float
+    estimated_output_latency_ms: float
+    noise_floor_rms: float
+    input_gain_hint: str
+    reliability_tier: str
+
+
+def classify_input_device(device_name: str | None) -> str:
+    name = (device_name or "").strip().lower()
+    if not name:
+        return "unknown"
+    if "bluetooth" in name or "耳机" in name or "headset" in name:
+        return "bluetooth_headset"
+    if "usb" in name or "麦克风" in name or "microphone" in name:
+        return "usb_mic"
+    if "阵列" in name or "array" in name or "realtek" in name:
+        return "builtin_mic"
+    return "unknown"
+
+
+def classify_output_device(device_name: str | None) -> str:
+    name = (device_name or "").strip().lower()
+    if not name:
+        return "unknown"
+    if "bluetooth" in name or "耳机" in name or "headset" in name:
+        return "bluetooth_headset"
+    if "speaker" in name or "扬声器" in name:
+        return "speaker"
+    if "usb" in name:
+        return "wired_headset"
+    return "unknown"
+
+
+def infer_input_gain_hint(noise_floor_rms: float) -> str:
+    if noise_floor_rms < 0.0015:
+        return "high"
+    if noise_floor_rms < 0.004:
+        return "normal"
+    return "low"
+
+
+def infer_reliability_tier(input_kind: str, output_kind: str) -> str:
+    if input_kind == "bluetooth_headset" or output_kind == "bluetooth_headset":
+        return "low"
+    if input_kind == "unknown" or output_kind == "unknown":
+        return "medium"
+    return "high"
+
+
+def default_input_latency_ms(input_kind: str) -> float:
+    if input_kind == "bluetooth_headset":
+        return 140.0
+    if input_kind == "usb_mic":
+        return 35.0
+    if input_kind == "builtin_mic":
+        return 28.0
+    return 50.0
+
+
+def default_output_latency_ms(output_kind: str) -> float:
+    if output_kind == "bluetooth_headset":
+        return 180.0
+    if output_kind == "wired_headset":
+        return 40.0
+    if output_kind == "speaker":
+        return 35.0
+    return 60.0
+
+
+def build_device_profile(
+    input_device_name: str | None,
+    output_device_name: str | None,
+    input_sample_rate: int,
+    output_sample_rate: int,
+    noise_floor_rms: float,
+) -> DeviceProfile:
+    input_kind = classify_input_device(input_device_name)
+    output_kind = classify_output_device(output_device_name)
+
+    return DeviceProfile(
+        input_device_id=str(input_device_name or "unknown"),
+        output_device_id=str(output_device_name or "unknown"),
+        input_kind=input_kind,
+        output_kind=output_kind,
+        input_sample_rate=int(input_sample_rate),
+        output_sample_rate=int(output_sample_rate),
+        estimated_input_latency_ms=float(default_input_latency_ms(input_kind)),
+        estimated_output_latency_ms=float(default_output_latency_ms(output_kind)),
+        noise_floor_rms=float(noise_floor_rms),
+        input_gain_hint=infer_input_gain_hint(noise_floor_rms),
+        reliability_tier=infer_reliability_tier(input_kind, output_kind),
+    )
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/audio/latency_calibrator.py`
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from shadowing.audio.device_profile import DeviceProfile
+from shadowing.types import SignalQuality
+
+
+@dataclass(slots=True)
+class LatencyCalibrationState:
+    estimated_input_latency_ms: float
+    estimated_output_latency_ms: float
+    confidence: float
+    calibrated: bool
+
+
+class LatencyCalibrator:
+    def __init__(
+        self,
+        input_latency_adapt_ms: float = 12.0,
+        output_latency_adapt_ms: float = 18.0,
+    ) -> None:
+        self.input_latency_adapt_ms = float(input_latency_adapt_ms)
+        self.output_latency_adapt_ms = float(output_latency_adapt_ms)
+
+        self._state: LatencyCalibrationState | None = None
+        self._last_active_at_sec = 0.0
+        self._first_signal_active_at_sec = 0.0
+        self._first_progress_at_sec = 0.0
+
+    def reset(self, device_profile: DeviceProfile) -> None:
+        self._state = LatencyCalibrationState(
+            estimated_input_latency_ms=float(device_profile.estimated_input_latency_ms),
+            estimated_output_latency_ms=float(device_profile.estimated_output_latency_ms),
+            confidence=0.20,
+            calibrated=False,
+        )
+        self._last_active_at_sec = 0.0
+        self._first_signal_active_at_sec = 0.0
+        self._first_progress_at_sec = 0.0
+
+    def observe_signal(self, signal_quality: SignalQuality) -> None:
+        if self._state is None:
+            return
+        if signal_quality.vad_active or signal_quality.speaking_likelihood >= 0.48:
+            self._last_active_at_sec = signal_quality.observed_at_sec
+            if self._first_signal_active_at_sec <= 0.0:
+                self._first_signal_active_at_sec = signal_quality.observed_at_sec
+
+    def observe_progress(self, progress_event_at_sec: float) -> None:
+        if self._state is None:
+            return
+        if progress_event_at_sec <= 0.0:
+            return
+
+        if self._first_progress_at_sec <= 0.0:
+            self._first_progress_at_sec = progress_event_at_sec
+
+        if self._first_signal_active_at_sec > 0.0:
+            delta_ms = max(0.0, (progress_event_at_sec - self._first_signal_active_at_sec) * 1000.0)
+
+            adapted_input = min(
+                260.0,
+                max(10.0, self._state.estimated_input_latency_ms * 0.82 + delta_ms * 0.18),
+            )
+            self._state.estimated_input_latency_ms = adapted_input
+
+            if delta_ms > 120.0:
+                self._state.estimated_output_latency_ms = min(
+                    280.0,
+                    self._state.estimated_output_latency_ms + self.output_latency_adapt_ms * 0.10,
+                )
+
+            self._state.confidence = min(0.92, self._state.confidence + 0.12)
+            self._state.calibrated = self._state.confidence >= 0.55
+
+    def snapshot(self) -> LatencyCalibrationState | None:
+        return self._state
+```
+
+---
 ### 文件: `shadowing_app/src/shadowing/bootstrap.py`
 
 ```python
@@ -165,6 +360,7 @@ def build_runtime(config: dict) -> ShadowingRuntime:
             align_cfg.get("cross_clause_backward_extra_penalty", 0.20)
         ),
         debug=bool(align_cfg.get("debug", False)),
+        max_hyp_tokens=int(align_cfg.get("max_hyp_tokens", 16)),
     )
 
     control_cfg = config.get("control", {})
@@ -177,9 +373,25 @@ def build_runtime(config: dict) -> ShadowingRuntime:
         seek_cooldown_sec=float(control_cfg.get("seek_cooldown_sec", 1.20)),
         gain_following=float(control_cfg.get("gain_following", 0.55)),
         gain_transition=float(control_cfg.get("gain_transition", 0.80)),
+        gain_soft_duck=float(control_cfg.get("gain_soft_duck", 0.42)),
         recover_after_seek_sec=float(control_cfg.get("recover_after_seek_sec", 0.60)),
         startup_grace_sec=float(control_cfg.get("startup_grace_sec", 0.80)),
         low_confidence_hold_sec=float(control_cfg.get("low_confidence_hold_sec", 0.60)),
+        bootstrapping_sec=float(control_cfg.get("bootstrapping_sec", 1.80)),
+        guide_play_sec=float(control_cfg.get("guide_play_sec", 2.20)),
+        no_progress_hold_min_play_sec=float(control_cfg.get("no_progress_hold_min_play_sec", 4.00)),
+        speaking_recent_sec=float(control_cfg.get("speaking_recent_sec", 0.90)),
+        progress_stale_sec=float(control_cfg.get("progress_stale_sec", 1.10)),
+        hold_trend_sec=float(control_cfg.get("hold_trend_sec", 0.75)),
+        hold_extra_lead_sec=float(control_cfg.get("hold_extra_lead_sec", 0.18)),
+        low_confidence_continue_sec=float(control_cfg.get("low_confidence_continue_sec", 1.40)),
+        tracking_quality_hold_min=float(control_cfg.get("tracking_quality_hold_min", 0.60)),
+        tracking_quality_seek_min=float(control_cfg.get("tracking_quality_seek_min", 0.72)),
+        resume_from_hold_event_fresh_sec=float(control_cfg.get("resume_from_hold_event_fresh_sec", 0.45)),
+        resume_from_hold_speaking_lead_slack_sec=float(
+            control_cfg.get("resume_from_hold_speaking_lead_slack_sec", 0.45)
+        ),
+        reacquire_soft_duck_sec=float(control_cfg.get("reacquire_soft_duck_sec", 2.00)),
     )
 
     controller = StateMachineController(
@@ -377,12 +589,17 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from shadowing.types import AlignResult, ControlDecision, PlaybackStatus
+from shadowing.types import ControlDecision, PlaybackStatus, ProgressEstimate, SignalQuality
 
 
 class Controller(ABC):
     @abstractmethod
-    def decide(self, playback: PlaybackStatus, alignment: AlignResult | None) -> ControlDecision: ...
+    def decide(
+        self,
+        playback: PlaybackStatus,
+        progress: ProgressEstimate | None,
+        signal_quality: SignalQuality | None,
+    ) -> ControlDecision: ...
 ```
 
 ---
@@ -479,6 +696,122 @@ from shadowing.types import LessonManifest, ReferenceMap
 class TTSProvider(ABC):
     @abstractmethod
     def synthesize_lesson(self, lesson_id: str, text: str, output_dir: str) -> tuple[LessonManifest, ReferenceMap]: ...
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/observation/signal_quality.py`
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from shadowing.types import SignalQuality
+
+
+@dataclass(slots=True)
+class _SignalState:
+    last_observed_at_sec: float = 0.0
+    last_rms: float = 0.0
+    last_peak: float = 0.0
+    noise_floor_rms: float = 0.0025
+    speaking_likelihood: float = 0.0
+    last_active_at_sec: float = 0.0
+    clipping_ratio: float = 0.0
+    dropout_detected: bool = False
+
+
+class SignalQualityMonitor:
+    def __init__(
+        self,
+        min_vad_rms: float = 0.006,
+        vad_noise_multiplier: float = 2.8,
+        speaking_decay: float = 0.92,
+        speaking_rise: float = 0.22,
+        clipping_threshold: float = 0.98,
+    ) -> None:
+        self.min_vad_rms = float(min_vad_rms)
+        self.vad_noise_multiplier = float(vad_noise_multiplier)
+        self.speaking_decay = float(speaking_decay)
+        self.speaking_rise = float(speaking_rise)
+        self.clipping_threshold = float(clipping_threshold)
+        self.state = _SignalState()
+
+    def feed_pcm16(self, pcm_bytes: bytes, observed_at_sec: float) -> None:
+        if not pcm_bytes:
+            return
+
+        audio_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if audio_i16.size == 0:
+            return
+
+        audio_f32 = audio_i16.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(np.square(audio_f32)))) if audio_f32.size else 0.0
+        peak = float(np.max(np.abs(audio_f32))) if audio_f32.size else 0.0
+        clipping_ratio = float(np.mean(np.abs(audio_f32) >= self.clipping_threshold)) if audio_f32.size else 0.0
+
+        noise_floor = self.state.noise_floor_rms
+        dynamic_threshold = max(self.min_vad_rms, noise_floor * self.vad_noise_multiplier)
+        vad_active = rms >= dynamic_threshold and peak >= max(0.012, dynamic_threshold * 1.2)
+
+        if vad_active:
+            self.state.last_active_at_sec = observed_at_sec
+            self.state.speaking_likelihood = min(
+                1.0,
+                self.state.speaking_likelihood * self.speaking_decay + self.speaking_rise + 0.10,
+            )
+        else:
+            self.state.speaking_likelihood *= self.speaking_decay
+
+        if rms < max(self.min_vad_rms * 0.7, dynamic_threshold * 0.8):
+            self.state.noise_floor_rms = 0.96 * noise_floor + 0.04 * rms
+        else:
+            self.state.noise_floor_rms = 0.995 * noise_floor + 0.005 * rms
+
+        self.state.last_observed_at_sec = observed_at_sec
+        self.state.last_rms = rms
+        self.state.last_peak = peak
+        self.state.clipping_ratio = clipping_ratio
+        self.state.dropout_detected = rms <= 1e-5 and peak <= 1e-5
+
+    def snapshot(self, now_sec: float) -> SignalQuality:
+        last_seen = self.state.last_observed_at_sec
+        silence_run = 9999.0 if self.state.last_active_at_sec <= 0.0 else max(
+            0.0,
+            now_sec - self.state.last_active_at_sec,
+        )
+
+        freshness_penalty = 0.0
+        if last_seen > 0.0:
+            freshness_penalty = min(0.35, max(0.0, now_sec - last_seen) * 0.30)
+
+        base_quality = 0.50
+        base_quality += min(0.20, self.state.last_peak * 0.6)
+        base_quality += min(0.15, self.state.speaking_likelihood * 0.20)
+        base_quality -= min(0.18, self.state.clipping_ratio * 2.0)
+        base_quality -= freshness_penalty
+        if self.state.dropout_detected:
+            base_quality -= 0.20
+
+        dynamic_threshold = max(self.min_vad_rms, self.state.noise_floor_rms * self.vad_noise_multiplier)
+        vad_active = self.state.last_rms >= dynamic_threshold and self.state.last_peak >= max(
+            0.012,
+            dynamic_threshold * 1.2,
+        )
+
+        return SignalQuality(
+            observed_at_sec=float(last_seen),
+            rms=float(self.state.last_rms),
+            peak=float(self.state.last_peak),
+            vad_active=bool(vad_active),
+            speaking_likelihood=float(max(0.0, min(1.0, self.state.speaking_likelihood))),
+            silence_run_sec=float(silence_run),
+            clipping_ratio=float(self.state.clipping_ratio),
+            dropout_detected=bool(self.state.dropout_detected),
+            quality_score=float(max(0.0, min(1.0, base_quality))),
+        )
 ```
 
 ---
@@ -937,6 +1270,7 @@ class IncrementalAligner(Aligner):
         clause_boundary_bonus: float = 0.15,
         cross_clause_backward_extra_penalty: float = 0.20,
         debug: bool = False,
+        max_hyp_tokens: int = 16,
     ) -> None:
         self.window_selector = WindowSelector(look_back=window_back, look_ahead=window_ahead)
         self.scorer = AlignmentScorer()
@@ -946,6 +1280,7 @@ class IncrementalAligner(Aligner):
         self.clause_boundary_bonus = float(clause_boundary_bonus)
         self.cross_clause_backward_extra_penalty = float(cross_clause_backward_extra_penalty)
         self.debug = bool(debug)
+        self.max_hyp_tokens = max(6, int(max_hyp_tokens))
 
         self.ref_map: ReferenceMap | None = None
         self.ref_tokens: list[_RefTokenView] = []
@@ -981,25 +1316,21 @@ class IncrementalAligner(Aligner):
         if event.event_type not in (AsrEventType.PARTIAL, AsrEventType.FINAL):
             return None
 
-        if len(event.chars) != len(event.pinyin_seq):
-            min_len = min(len(event.chars), len(event.pinyin_seq))
-            chars = event.chars[:min_len]
-            pinyin_seq = event.pinyin_seq[:min_len]
-        else:
-            chars = event.chars
-            pinyin_seq = event.pinyin_seq
-
-        if not chars:
+        raw_pairs = list(zip(event.chars, event.pinyin_seq, strict=False))
+        hyp_pairs, repeat_penalty = self._prepare_hypothesis(raw_pairs)
+        if not hyp_pairs:
             return None
 
-        hyp_tokens = [HypToken(char=c, pinyin=py) for c, py in zip(chars, pinyin_seq, strict=True)]
+        hyp_tokens = [HypToken(char=c, pinyin=py) for c, py in hyp_pairs]
         window_tokens, window_start, window_end = self.window_selector.select(
-            self.ref_map, self.state.committed_idx
+            self.ref_map,
+            self.state.committed_idx,
         )
-        candidate = self._align_window(
+        candidate, local_match_ratio = self._align_window(
             hyp_tokens=hyp_tokens,
             ref_tokens=window_tokens,
             ref_offset=window_start,
+            repeat_penalty=repeat_penalty,
         )
         stable = self._observe_candidate(candidate, event.event_type)
 
@@ -1046,6 +1377,9 @@ class IncrementalAligner(Aligner):
             debug_backward_run=self.state.backward_run,
             debug_matched_count=len(candidate.matched_ref_indices),
             debug_hyp_length=len(hyp_tokens),
+            local_match_ratio=local_match_ratio,
+            repeat_penalty=repeat_penalty,
+            emitted_at_sec=event.emitted_at_sec,
         )
 
     def _observe_candidate(self, candidate: CandidateAlignment, event_type: AsrEventType) -> bool:
@@ -1103,22 +1437,60 @@ class IncrementalAligner(Aligner):
 
         return stable
 
+    def _prepare_hypothesis(
+        self,
+        raw_pairs: list[tuple[str, str]],
+    ) -> tuple[list[tuple[str, str]], float]:
+        if not raw_pairs:
+            return [], 0.0
+
+        compacted: list[tuple[str, str]] = []
+        same_run = 0
+        prev_char = ""
+
+        for ch, py in raw_pairs:
+            if ch == prev_char:
+                same_run += 1
+            else:
+                same_run = 1
+                prev_char = ch
+
+            if same_run > 2:
+                continue
+
+            compacted.append((ch, py))
+
+        if len(compacted) > self.max_hyp_tokens:
+            compacted = compacted[-self.max_hyp_tokens :]
+
+        repeat_hits = 0
+        for i in range(1, len(compacted)):
+            if compacted[i][0] == compacted[i - 1][0]:
+                repeat_hits += 1
+
+        repeat_penalty = repeat_hits / max(1, len(compacted) - 1)
+        return compacted, repeat_penalty
+
     def _align_window(
         self,
         hyp_tokens: list[HypToken],
         ref_tokens: list[_RefTokenView],
         ref_offset: int,
-    ) -> CandidateAlignment:
+        repeat_penalty: float,
+    ) -> tuple[CandidateAlignment, float]:
         m = len(hyp_tokens)
         n = len(ref_tokens)
 
         if m == 0 or n == 0:
             committed = self.state.committed_idx
-            return CandidateAlignment(
-                ref_start_idx=committed,
-                ref_end_idx=committed,
-                score=0.0,
-                confidence=0.0,
+            return (
+                CandidateAlignment(
+                    ref_start_idx=committed,
+                    ref_end_idx=committed,
+                    score=0.0,
+                    confidence=0.0,
+                ),
+                0.0,
             )
 
         dp = [[0.0] * (n + 1) for _ in range(m + 1)]
@@ -1178,12 +1550,22 @@ class IncrementalAligner(Aligner):
                     best_j = j
 
         matched_indices: list[int] = []
+        positive_match_count = 0
+
         i = m
         j = best_j
         while i > 0 and j > 0:
             op = trace[i][j]
             if op == "M":
-                matched_indices.append(ref_offset + j - 1)
+                ref_global_idx = ref_offset + j - 1
+                matched_indices.append(ref_global_idx)
+
+                ref = ref_tokens[j - 1]
+                hyp = hyp_tokens[i - 1]
+                pair_score = self.scorer.score_token_pair(ref.char, ref.pinyin, hyp.char, hyp.pinyin)
+                if pair_score > 0:
+                    positive_match_count += 1
+
                 i -= 1
                 j -= 1
             elif op == "I":
@@ -1198,17 +1580,29 @@ class IncrementalAligner(Aligner):
         ref_start_idx = matched_indices[0] if matched_indices else max(ref_offset, ref_end_idx)
         backward_jump = ref_end_idx < self.state.committed_idx
         norm_score = best_score / max(1, len(hyp_tokens))
-        confidence = 1.0 / (1.0 + exp(-1.25 * norm_score))
+        base_conf = 1.0 / (1.0 + exp(-1.20 * norm_score))
+
+        local_match_ratio = positive_match_count / max(1, len(hyp_tokens))
+        forward_bonus = 0.06 if ref_end_idx >= self.state.committed_idx else -0.08
+        confidence = (
+            0.62 * base_conf
+            + 0.30 * local_match_ratio
+            + forward_bonus
+            - 0.22 * repeat_penalty
+        )
         mode = "backward" if backward_jump else "normal"
 
-        return CandidateAlignment(
-            ref_start_idx=ref_start_idx,
-            ref_end_idx=ref_end_idx,
-            score=best_score,
-            confidence=max(0.0, min(1.0, confidence)),
-            matched_ref_indices=matched_indices,
-            backward_jump=backward_jump,
-            mode=mode,
+        return (
+            CandidateAlignment(
+                ref_start_idx=ref_start_idx,
+                ref_end_idx=ref_end_idx,
+                score=best_score,
+                confidence=max(0.0, min(1.0, confidence)),
+                matched_ref_indices=matched_indices,
+                backward_jump=backward_jump,
+                mode=mode,
+            ),
+            local_match_ratio,
         )
 ```
 
@@ -2435,9 +2829,29 @@ class ControlPolicy:
     seek_cooldown_sec: float = 1.20
     gain_following: float = 0.55
     gain_transition: float = 0.80
+    gain_soft_duck: float = 0.42
     recover_after_seek_sec: float = 0.60
+
     startup_grace_sec: float = 0.80
     low_confidence_hold_sec: float = 0.60
+
+    bootstrapping_sec: float = 1.80
+    guide_play_sec: float = 2.20
+    no_progress_hold_min_play_sec: float = 4.00
+
+    speaking_recent_sec: float = 0.90
+    progress_stale_sec: float = 1.10
+    hold_trend_sec: float = 0.75
+    hold_extra_lead_sec: float = 0.18
+    low_confidence_continue_sec: float = 1.40
+
+    tracking_quality_hold_min: float = 0.60
+    tracking_quality_seek_min: float = 0.72
+
+    resume_from_hold_event_fresh_sec: float = 0.45
+    resume_from_hold_speaking_lead_slack_sec: float = 0.45
+
+    reacquire_soft_duck_sec: float = 2.00
 ```
 
 ---
@@ -2450,7 +2864,15 @@ import time
 
 from shadowing.interfaces.controller import Controller
 from shadowing.realtime.control.policy import ControlPolicy
-from shadowing.types import AlignResult, ControlAction, ControlDecision, PlaybackStatus
+from shadowing.types import (
+    ControlAction,
+    ControlDecision,
+    PlaybackStatus,
+    ProgressEstimate,
+    SignalQuality,
+    TrackingMode,
+    UserReadState,
+)
 
 
 class StateMachineController(Controller):
@@ -2466,47 +2888,37 @@ class StateMachineController(Controller):
 
         self._last_seek_at = 0.0
         self._session_started_at = time.monotonic()
-        self._last_good_alignment_at = 0.0
 
-        self._ever_resumed_or_played = False
+        self._phase = "bootstrapping"
+        self._hold_condition_started_at = 0.0
+        self._last_good_progress_at = 0.0
+
         self._last_decision_log_at = 0.0
         self._last_decision_signature = ""
-        self._last_alignment_ref_time_sec = 0.0
-
-        self._no_alignment_keep_playing_sec = max(
-            1.20,
-            self.policy.startup_grace_sec + self.policy.low_confidence_hold_sec,
-        )
-        self._low_confidence_keep_playing_sec = max(
-            1.50,
-            self.policy.low_confidence_hold_sec + 0.60,
-        )
         self._decision_log_interval_sec = 1.20
 
-    def decide(self, playback: PlaybackStatus, alignment: AlignResult | None) -> ControlDecision:
+    def decide(
+        self,
+        playback: PlaybackStatus,
+        progress: ProgressEstimate | None,
+        signal_quality: SignalQuality | None,
+    ) -> ControlDecision:
         now = time.monotonic()
 
         if playback.state.value == "playing" and playback.t_ref_emitted_content_sec <= 0.05:
             self._session_started_at = now
 
-        if playback.state.value == "playing":
-            self._ever_resumed_or_played = True
+        if progress is not None and progress.tracking_quality >= self.policy.tracking_quality_hold_min:
+            self._last_good_progress_at = now
 
-        if alignment is not None and alignment.confidence >= self.policy.min_confidence:
-            self._last_good_alignment_at = now
-            self._last_alignment_ref_time_sec = alignment.ref_time_sec
+        self._update_phase(now, progress, signal_quality)
 
-        if alignment is None:
-            decision = self._decide_without_alignment(playback, now)
-            self._log_decision_if_needed(playback, alignment, decision, now)
+        if progress is None:
+            decision = self._decide_without_progress(playback, signal_quality, now)
+            self._log_decision_if_needed(playback, progress, signal_quality, decision, now)
             return decision
 
-        if alignment.confidence < self.policy.min_confidence:
-            decision = self._decide_low_confidence(playback, alignment, now)
-            self._log_decision_if_needed(playback, alignment, decision, now)
-            return decision
-
-        lead = playback.t_ref_heard_content_sec - alignment.ref_time_sec
+        lead = playback.t_ref_heard_content_sec - progress.estimated_ref_time_sec
 
         if self._is_in_seek_recovery(now):
             decision = ControlDecision(
@@ -2514,19 +2926,23 @@ class StateMachineController(Controller):
                 reason="recover_after_seek",
                 lead_sec=lead,
                 target_gain=self.policy.gain_transition,
+                confidence=progress.tracking_quality,
             )
-            self._log_decision_if_needed(playback, alignment, decision, now)
+            self._log_decision_if_needed(playback, progress, signal_quality, decision, now)
             return decision
 
         if playback.state.value == "holding":
-            if lead <= self.policy.resume_if_lead_sec:
+            if self._should_resume_from_hold(lead, progress, signal_quality, now):
                 decision = ControlDecision(
                     action=ControlAction.RESUME,
-                    reason="user_caught_up",
+                    reason="rejoin_resume",
                     lead_sec=lead,
                     target_gain=self.policy.gain_following,
+                    confidence=progress.tracking_quality,
+                    aggressiveness="medium",
                 )
-                self._log_decision_if_needed(playback, alignment, decision, now)
+                self._hold_condition_started_at = 0.0
+                self._log_decision_if_needed(playback, progress, signal_quality, decision, now)
                 return decision
 
             decision = ControlDecision(
@@ -2534,147 +2950,326 @@ class StateMachineController(Controller):
                 reason="holding_wait",
                 lead_sec=lead,
                 target_gain=self.policy.gain_following,
+                confidence=progress.tracking_quality,
             )
-            self._log_decision_if_needed(playback, alignment, decision, now)
+            self._log_decision_if_needed(playback, progress, signal_quality, decision, now)
             return decision
 
-        if lead > self.policy.hold_if_lead_sec:
+        if self._phase in ("bootstrapping", "guiding"):
+            if self._signal_active(signal_quality):
+                decision = ControlDecision(
+                    action=ControlAction.SOFT_DUCK,
+                    reason="guide_soft_duck",
+                    lead_sec=lead,
+                    target_gain=self.policy.gain_soft_duck,
+                    confidence=progress.tracking_quality,
+                    aggressiveness="low",
+                )
+            else:
+                decision = ControlDecision(
+                    action=ControlAction.NOOP,
+                    reason="guide_play",
+                    lead_sec=lead,
+                    target_gain=self.policy.gain_transition,
+                    confidence=progress.tracking_quality,
+                )
+            self._log_decision_if_needed(playback, progress, signal_quality, decision, now)
+            return decision
+
+        if self._phase in ("uncertain_follow", "reacquiring"):
+            if lead > (self.policy.hold_if_lead_sec + self.policy.hold_extra_lead_sec):
+                decision = ControlDecision(
+                    action=ControlAction.SOFT_DUCK,
+                    reason="reacquire_soft_duck",
+                    lead_sec=lead,
+                    target_gain=self.policy.gain_soft_duck,
+                    confidence=progress.tracking_quality,
+                    aggressiveness="low",
+                )
+            else:
+                decision = ControlDecision(
+                    action=ControlAction.NOOP,
+                    reason="uncertain_follow_keep_playing",
+                    lead_sec=lead,
+                    target_gain=self.policy.gain_transition,
+                    confidence=progress.tracking_quality,
+                )
+            self._log_decision_if_needed(playback, progress, signal_quality, decision, now)
+            return decision
+
+        if self._should_hold(playback, progress, signal_quality, lead, now):
             decision = ControlDecision(
                 action=ControlAction.HOLD,
                 reason="reference_too_far_ahead",
                 lead_sec=lead,
                 target_gain=self.policy.gain_following,
+                confidence=progress.tracking_quality,
+                aggressiveness="medium",
             )
-            self._log_decision_if_needed(playback, alignment, decision, now)
+            self._log_decision_if_needed(playback, progress, signal_quality, decision, now)
             return decision
 
-        if not self.disable_seek:
-            if (
-                alignment.stable
-                and lead < self.policy.seek_if_lag_sec
-                and (now - self._last_seek_at) >= self.policy.seek_cooldown_sec
-            ):
-                target_time = alignment.ref_time_sec + self.policy.target_lead_sec
-                if self.total_duration_sec is not None:
-                    target_time = min(max(0.0, target_time), self.total_duration_sec)
-                else:
-                    target_time = max(0.0, target_time)
+        if self._should_seek(progress, lead, now):
+            target_time = progress.estimated_ref_time_sec + self.policy.target_lead_sec
+            if self.total_duration_sec is not None:
+                target_time = min(max(0.0, target_time), self.total_duration_sec)
+            else:
+                target_time = max(0.0, target_time)
 
-                self._last_seek_at = now
-                decision = ControlDecision(
-                    action=ControlAction.SEEK,
-                    reason="user_skipped_forward",
-                    target_time_sec=target_time,
-                    lead_sec=lead,
-                    target_gain=self.policy.gain_following,
-                )
-                self._log_decision_if_needed(playback, alignment, decision, now)
-                return decision
+            self._last_seek_at = now
+            decision = ControlDecision(
+                action=ControlAction.SEEK,
+                reason="user_skipped_forward",
+                target_time_sec=target_time,
+                lead_sec=lead,
+                target_gain=self.policy.gain_following,
+                confidence=progress.tracking_quality,
+                aggressiveness="high",
+            )
+            self._log_decision_if_needed(playback, progress, signal_quality, decision, now)
+            return decision
 
         decision = ControlDecision(
             action=ControlAction.NOOP,
             reason="within_band",
             lead_sec=lead,
-            target_gain=self.policy.gain_following if alignment.stable else self.policy.gain_transition,
+            target_gain=self.policy.gain_following,
+            confidence=progress.tracking_quality,
         )
-        self._log_decision_if_needed(playback, alignment, decision, now)
+        self._log_decision_if_needed(playback, progress, signal_quality, decision, now)
         return decision
 
-    def _decide_without_alignment(self, playback: PlaybackStatus, now: float) -> ControlDecision:
-        elapsed_since_start = now - self._session_started_at
+    def _update_phase(
+        self,
+        now: float,
+        progress: ProgressEstimate | None,
+        signal_quality: SignalQuality | None,
+    ) -> None:
+        elapsed = now - self._session_started_at
 
-        if elapsed_since_start < self.policy.startup_grace_sec:
+        if progress is None:
+            if elapsed < self.policy.bootstrapping_sec:
+                self._phase = "bootstrapping"
+                return
+            if elapsed < self.policy.no_progress_hold_min_play_sec:
+                self._phase = "guiding"
+                return
+            self._phase = "waiting"
+            return
+
+        if progress.tracking_mode == TrackingMode.LOST:
+            self._phase = "reacquiring"
+            return
+
+        if progress.tracking_mode == TrackingMode.REACQUIRING:
+            self._phase = "reacquiring"
+            return
+
+        if elapsed < self.policy.bootstrapping_sec:
+            self._phase = "bootstrapping"
+            return
+
+        if elapsed < self.policy.guide_play_sec and progress.user_state in (
+            UserReadState.WARMING_UP,
+            UserReadState.HESITATING,
+            UserReadState.NOT_STARTED,
+        ):
+            self._phase = "guiding"
+            return
+
+        if progress.user_state in (UserReadState.REJOINING, UserReadState.SKIPPING):
+            self._phase = "reacquiring"
+            return
+
+        if progress.user_state == UserReadState.FOLLOWING and progress.tracking_quality >= self.policy.tracking_quality_hold_min:
+            self._phase = "following"
+            return
+
+        if progress.user_state in (
+            UserReadState.WARMING_UP,
+            UserReadState.HESITATING,
+            UserReadState.REPEATING,
+        ):
+            self._phase = "uncertain_follow"
+            return
+
+        if progress.user_state in (
+            UserReadState.PAUSED,
+            UserReadState.NOT_STARTED,
+        ):
+            self._phase = "waiting"
+            return
+
+        if self._signal_active(signal_quality):
+            self._phase = "uncertain_follow"
+            return
+
+        self._phase = "waiting"
+
+    def _decide_without_progress(
+        self,
+        playback: PlaybackStatus,
+        signal_quality: SignalQuality | None,
+        now: float,
+    ) -> ControlDecision:
+        elapsed = now - self._session_started_at
+
+        if elapsed < self.policy.bootstrapping_sec:
             return ControlDecision(
                 action=ControlAction.NOOP,
-                reason="startup_grace",
+                reason="bootstrapping",
+                target_gain=self.policy.gain_transition,
+                aggressiveness="low",
+            )
+
+        if elapsed < self.policy.no_progress_hold_min_play_sec:
+            if self._signal_active(signal_quality):
+                return ControlDecision(
+                    action=ControlAction.SOFT_DUCK,
+                    reason="guiding_soft_duck_no_progress",
+                    target_gain=self.policy.gain_soft_duck,
+                    aggressiveness="low",
+                )
+            return ControlDecision(
+                action=ControlAction.NOOP,
+                reason="guiding_no_progress",
                 target_gain=self.policy.gain_transition,
             )
 
-        stale_for = self._stale_good_alignment_sec(now)
+        stale_good = self._stale_good_progress_sec(now)
 
         if playback.state.value == "holding":
             return ControlDecision(
                 action=ControlAction.NOOP,
-                reason="waiting_for_alignment",
+                reason="waiting_for_progress",
                 target_gain=self.policy.gain_following,
             )
 
-        if self._ever_resumed_or_played and stale_for < self._no_alignment_keep_playing_sec:
+        if self._signal_active(signal_quality):
+            return ControlDecision(
+                action=ControlAction.SOFT_DUCK,
+                reason="no_progress_but_signal_active",
+                target_gain=self.policy.gain_soft_duck,
+                aggressiveness="low",
+            )
+
+        if stale_good < self.policy.low_confidence_continue_sec:
             return ControlDecision(
                 action=ControlAction.NOOP,
-                reason="keep_playing_no_alignment",
+                reason="keep_playing_recent_good_progress",
                 target_gain=self.policy.gain_transition,
             )
 
-        return ControlDecision(
-            action=ControlAction.HOLD,
-            reason="waiting_for_alignment",
-            target_gain=self.policy.gain_following,
-        )
-
-    def _decide_low_confidence(
-        self,
-        playback: PlaybackStatus,
-        alignment: AlignResult,
-        now: float,
-    ) -> ControlDecision:
-        lead = playback.t_ref_heard_content_sec - alignment.ref_time_sec
-        elapsed_since_start = now - self._session_started_at
-
-        if elapsed_since_start < self.policy.startup_grace_sec:
-            return ControlDecision(
-                action=ControlAction.NOOP,
-                reason="startup_low_confidence_grace",
-                lead_sec=lead,
-                target_gain=self.policy.gain_transition,
-            )
-
-        stale_for = self._stale_good_alignment_sec(now)
-
-        if playback.state.value == "holding":
-            if lead <= self.policy.resume_if_lead_sec and alignment.candidate_ref_idx >= alignment.committed_ref_idx:
-                return ControlDecision(
-                    action=ControlAction.RESUME,
-                    reason="low_confidence_but_caught_up",
-                    lead_sec=lead,
-                    target_gain=self.policy.gain_transition,
-                )
-
-            return ControlDecision(
-                action=ControlAction.NOOP,
-                reason="low_confidence_wait",
-                lead_sec=lead,
-                target_gain=self.policy.gain_transition,
-            )
-
-        if self._ever_resumed_or_played:
-            if stale_for < self._low_confidence_keep_playing_sec and lead <= (self.policy.hold_if_lead_sec + 0.35):
-                return ControlDecision(
-                    action=ControlAction.NOOP,
-                    reason="keep_playing_low_confidence",
-                    lead_sec=lead,
-                    target_gain=self.policy.gain_transition,
-                )
-
-        if lead > (self.policy.hold_if_lead_sec + 0.20):
+        if playback.t_ref_heard_content_sec > (self.policy.hold_if_lead_sec + self.policy.hold_extra_lead_sec):
             return ControlDecision(
                 action=ControlAction.HOLD,
-                reason="low_confidence_and_ref_ahead",
-                lead_sec=lead,
-                target_gain=self.policy.gain_transition,
+                reason="no_progress_timeout",
+                target_gain=self.policy.gain_following,
+                aggressiveness="medium",
             )
 
         return ControlDecision(
             action=ControlAction.NOOP,
-            reason="low_confidence_keep_running",
-            lead_sec=lead,
+            reason="wait_progress_soft",
             target_gain=self.policy.gain_transition,
         )
 
-    def _stale_good_alignment_sec(self, now: float) -> float:
-        if self._last_good_alignment_at <= 0:
+    def _should_resume_from_hold(
+        self,
+        lead: float,
+        progress: ProgressEstimate,
+        signal_quality: SignalQuality | None,
+        now: float,
+    ) -> bool:
+        if lead <= self.policy.resume_if_lead_sec:
+            return True
+
+        signal_active = self._signal_active(signal_quality)
+        event_fresh = (now - progress.event_emitted_at_sec) <= self.policy.resume_from_hold_event_fresh_sec
+
+        if progress.user_state in (UserReadState.REJOINING, UserReadState.FOLLOWING):
+            if event_fresh and signal_active:
+                if lead <= (self.policy.hold_if_lead_sec + self.policy.resume_from_hold_speaking_lead_slack_sec):
+                    return True
+
+        if progress.active_speaking and event_fresh:
+            if lead <= (self.policy.hold_if_lead_sec + self.policy.resume_from_hold_speaking_lead_slack_sec):
+                return True
+
+        if progress.tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED):
+            if progress.recently_progressed and lead <= (self.policy.resume_if_lead_sec + 0.18):
+                return True
+
+        return False
+
+    def _should_hold(
+        self,
+        playback: PlaybackStatus,
+        progress: ProgressEstimate,
+        signal_quality: SignalQuality | None,
+        lead: float,
+        now: float,
+    ) -> bool:
+        if self._phase not in ("following", "waiting"):
+            self._hold_condition_started_at = 0.0
+            return False
+
+        if progress.tracking_quality < self.policy.tracking_quality_hold_min:
+            self._hold_condition_started_at = 0.0
+            return False
+
+        if progress.active_speaking or self._signal_active(signal_quality):
+            self._hold_condition_started_at = 0.0
+            return False
+
+        hold_threshold = self.policy.hold_if_lead_sec
+        if progress.confidence < self.policy.min_confidence:
+            hold_threshold += self.policy.hold_extra_lead_sec
+
+        if lead <= hold_threshold:
+            self._hold_condition_started_at = 0.0
+            return False
+
+        if progress.progress_age_sec < self.policy.progress_stale_sec:
+            self._hold_condition_started_at = 0.0
+            return False
+
+        if self._hold_condition_started_at <= 0.0:
+            self._hold_condition_started_at = now
+            return False
+
+        if (now - self._hold_condition_started_at) < self.policy.hold_trend_sec:
+            return False
+
+        return True
+
+    def _should_seek(self, progress: ProgressEstimate, lead: float, now: float) -> bool:
+        if self.disable_seek:
+            return False
+        if progress.tracking_mode != TrackingMode.LOCKED:
+            return False
+        if progress.tracking_quality < self.policy.tracking_quality_seek_min:
+            return False
+        if not progress.stable:
+            return False
+        if lead >= self.policy.seek_if_lag_sec:
+            return False
+        if (now - self._last_seek_at) < self.policy.seek_cooldown_sec:
+            return False
+        return True
+
+    def _signal_active(self, signal_quality: SignalQuality | None) -> bool:
+        if signal_quality is None:
+            return False
+        return bool(
+            signal_quality.vad_active
+            or signal_quality.speaking_likelihood >= 0.48
+        )
+
+    def _stale_good_progress_sec(self, now: float) -> float:
+        if self._last_good_progress_at <= 0:
             return float("inf")
-        return now - self._last_good_alignment_at
+        return now - self._last_good_progress_at
 
     def _is_in_seek_recovery(self, now_sec: float) -> bool:
         return (now_sec - self._last_seek_at) < self.policy.recover_after_seek_sec
@@ -2682,25 +3277,33 @@ class StateMachineController(Controller):
     def _log_decision_if_needed(
         self,
         playback: PlaybackStatus,
-        alignment: AlignResult | None,
+        progress: ProgressEstimate | None,
+        signal_quality: SignalQuality | None,
         decision: ControlDecision,
         now: float,
     ) -> None:
         lead_str = "None" if decision.lead_sec is None else f"{decision.lead_sec:.3f}"
-        conf_str = "None" if alignment is None else f"{alignment.confidence:.3f}"
-        cand_str = "None" if alignment is None else str(alignment.candidate_ref_idx)
-        committed_str = "None" if alignment is None else str(alignment.committed_ref_idx)
-        stable_str = "None" if alignment is None else str(alignment.stable)
+        conf_str = "None" if progress is None else f"{progress.confidence:.3f}"
+        tq_str = "None" if progress is None else f"{progress.tracking_quality:.3f}"
+        est_idx_str = "None" if progress is None else str(progress.estimated_ref_idx)
+        mode_str = "None" if progress is None else progress.tracking_mode.value
+        user_state_str = "None" if progress is None else progress.user_state.value
+        signal_str = "None" if signal_quality is None else f"{signal_quality.speaking_likelihood:.2f}"
 
         signature = (
-            f"{playback.state.value}|{decision.action.value}|{decision.reason}|"
-            f"{lead_str}|{conf_str}|{cand_str}|{committed_str}|{stable_str}"
+            f"{self._phase}|{playback.state.value}|{decision.action.value}|{decision.reason}|"
+            f"{lead_str}|{conf_str}|{tq_str}|{est_idx_str}|{mode_str}|{user_state_str}|{signal_str}"
         )
 
         should_log = False
         if signature != self._last_decision_signature:
             should_log = True
-        elif decision.action in (ControlAction.HOLD, ControlAction.RESUME, ControlAction.SEEK):
+        elif decision.action in (
+            ControlAction.HOLD,
+            ControlAction.RESUME,
+            ControlAction.SEEK,
+            ControlAction.SOFT_DUCK,
+        ):
             should_log = True
         elif (now - self._last_decision_log_at) >= self._decision_log_interval_sec:
             should_log = True
@@ -2708,20 +3311,19 @@ class StateMachineController(Controller):
         if not should_log:
             return
 
-        stale_good = self._stale_good_alignment_sec(now)
-        stale_good_str = "inf" if stale_good == float("inf") else f"{stale_good:.2f}"
-
         print(
             "[CTRL] "
+            f"phase={self._phase} "
             f"playback={playback.state.value} "
             f"action={decision.action.value} "
             f"reason={decision.reason} "
             f"lead={lead_str} "
-            f"align_conf={conf_str} "
-            f"stable={stable_str} "
-            f"candidate={cand_str} "
-            f"committed={committed_str} "
-            f"stale_good={stale_good_str}"
+            f"progress_conf={conf_str} "
+            f"tracking_q={tq_str} "
+            f"mode={mode_str} "
+            f"user_state={user_state_str} "
+            f"signal={signal_str} "
+            f"estimated={est_idx_str}"
         )
 
         self._last_decision_signature = signature
@@ -2734,19 +3336,27 @@ class StateMachineController(Controller):
 ```python
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
+from pathlib import Path
 
-from shadowing.interfaces.aligner import Aligner
+from shadowing.audio.device_profile import build_device_profile
+from shadowing.audio.latency_calibrator import LatencyCalibrator
 from shadowing.interfaces.asr import ASRProvider
 from shadowing.interfaces.controller import Controller
 from shadowing.interfaces.player import Player
 from shadowing.interfaces.recorder import Recorder
 from shadowing.interfaces.repository import LessonRepository
+from shadowing.observation.signal_quality import SignalQualityMonitor
+from shadowing.progress.commercial_progress_estimator import CommercialProgressEstimator
 from shadowing.realtime.asr.normalizer import TextNormalizer
 from shadowing.realtime.asr.partial_adapter import RawPartialAdapter
-from shadowing.types import AlignResult, AsrEvent, ControlAction, PlayerCommand, PlayerCommandType
+from shadowing.telemetry.event_logger import EventLogger
+from shadowing.telemetry.metrics import MetricsAggregator
+from shadowing.tracking.tracking_engine import TrackingEngine
+from shadowing.types import AsrEvent, ControlAction, PlayerCommand, PlayerCommandType
 
 
 class ShadowingOrchestrator:
@@ -2756,7 +3366,7 @@ class ShadowingOrchestrator:
         player: Player,
         recorder: Recorder,
         asr: ASRProvider,
-        aligner: Aligner,
+        aligner,
         controller: Controller,
         audio_queue_maxsize: int = 150,
         asr_event_queue_maxsize: int = 64,
@@ -2771,6 +3381,10 @@ class ShadowingOrchestrator:
 
         self.normalizer = TextNormalizer()
         self.partial_adapter = RawPartialAdapter()
+        self.signal_monitor = SignalQualityMonitor()
+        self.tracking_engine = TrackingEngine(aligner=self.aligner)
+        self.progress_estimator = CommercialProgressEstimator()
+        self.latency_calibrator = LatencyCalibrator()
 
         self.audio_frame_queue: queue.Queue[bytes] = queue.Queue(maxsize=audio_queue_maxsize)
         self.asr_event_queue: queue.Queue[AsrEvent] = queue.Queue(maxsize=asr_event_queue_maxsize)
@@ -2778,7 +3392,7 @@ class ShadowingOrchestrator:
         self.loop_interval_sec = float(loop_interval_sec)
         self._running = False
         self._asr_thread: threading.Thread | None = None
-        self._last_alignment: AlignResult | None = None
+        self._last_progress = None
         self._pure_playback = False
         self._debug_enabled = False
         self._last_seen_generation = 0
@@ -2791,9 +3405,18 @@ class ShadowingOrchestrator:
         self._asr_events_dropped = 0
         self._asr_poll_iterations = 0
 
+        self._telemetry_enabled = True
+        self._session_artifacts_dir = Path("artifacts/runtime_sessions")
+        self._event_logger: EventLogger | None = None
+        self._metrics = MetricsAggregator()
+
+        self._device_profile = None
+
     def configure_runtime(self, runtime_cfg: dict) -> None:
         self._pure_playback = bool(runtime_cfg.get("pure_playback", False))
         self._use_partial_adapter = bool(runtime_cfg.get("use_partial_adapter", True))
+        self._telemetry_enabled = bool(runtime_cfg.get("telemetry_enabled", True))
+        self._session_artifacts_dir = Path(runtime_cfg.get("session_artifacts_dir", "artifacts/runtime_sessions"))
 
     def configure_debug(self, debug_cfg: dict) -> None:
         self._debug_enabled = bool(debug_cfg.get("enabled", False))
@@ -2805,6 +3428,11 @@ class ShadowingOrchestrator:
             except Exception:
                 pass
 
+        try:
+            self.tracking_engine.debug = bool(debug_cfg.get("tracking_debug", False))
+        except Exception:
+            pass
+
     def start_session(self, lesson_id: str) -> None:
         manifest = self.repo.load_manifest(lesson_id)
         ref_map = self.repo.load_reference_map(lesson_id)
@@ -2813,18 +3441,62 @@ class ShadowingOrchestrator:
         if hasattr(self.controller, "total_duration_sec"):
             self.controller.total_duration_sec = ref_map.total_duration_sec
 
-        self.aligner.reset(ref_map)
+        now_sec = time.monotonic()
+        self._metrics = MetricsAggregator()
+        self._metrics.mark_session_started(now_sec)
+
+        session_dir = self._session_artifacts_dir / lesson_id / time.strftime("%Y%m%d_%H%M%S")
+        self._event_logger = EventLogger(str(session_dir), enabled=self._telemetry_enabled)
+
+        self._device_profile = build_device_profile(
+            input_device_name=getattr(self.recorder, "device", None),
+            output_device_name=getattr(self.player.config, "device", None) if hasattr(self.player, "config") else None,
+            input_sample_rate=int(getattr(self.recorder, "target_sample_rate", getattr(self.recorder, "sample_rate_in", 16000))),
+            output_sample_rate=int(getattr(self.player.config, "sample_rate", 44100)) if hasattr(self.player, "config") else 44100,
+            noise_floor_rms=0.0025,
+        )
+        self.latency_calibrator.reset(self._device_profile)
+
+        self._event_logger.log(
+            "session_started",
+            {
+                "lesson_id": lesson_id,
+                "lesson_text_length": len(manifest.lesson_text),
+                "sample_rate_out": manifest.sample_rate_out,
+                "chunk_count": len(chunks),
+                "ref_token_count": len(ref_map.tokens),
+                "total_duration_sec": ref_map.total_duration_sec,
+                "device_profile": {
+                    "input_device_id": self._device_profile.input_device_id,
+                    "output_device_id": self._device_profile.output_device_id,
+                    "input_kind": self._device_profile.input_kind,
+                    "output_kind": self._device_profile.output_kind,
+                    "input_sample_rate": self._device_profile.input_sample_rate,
+                    "output_sample_rate": self._device_profile.output_sample_rate,
+                    "estimated_input_latency_ms": self._device_profile.estimated_input_latency_ms,
+                    "estimated_output_latency_ms": self._device_profile.estimated_output_latency_ms,
+                    "noise_floor_rms": self._device_profile.noise_floor_rms,
+                    "input_gain_hint": self._device_profile.input_gain_hint,
+                    "reliability_tier": self._device_profile.reliability_tier,
+                },
+            },
+        )
+
+        self.tracking_engine.reset(ref_map)
+        self.progress_estimator.reset(ref_map, start_idx=0)
         self.player.load_chunks(chunks)
 
         self._running = True
         self._last_seen_generation = 0
-        self._last_alignment = None
+        self._last_progress = None
         self._audio_frames_enqueued = 0
         self._audio_frames_dropped = 0
         self._audio_queue_high_watermark = 0
         self._asr_events_emitted = 0
         self._asr_events_dropped = 0
         self._asr_poll_iterations = 0
+
+        self.player.start()
 
         if not self._pure_playback:
             if hasattr(self.asr, "hotwords"):
@@ -2838,8 +3510,6 @@ class ShadowingOrchestrator:
             self._asr_thread = threading.Thread(target=self._asr_worker, daemon=True)
             self._asr_thread.start()
             self.recorder.start(self._on_audio_frame)
-
-        self.player.start()
 
         while self._running:
             self._control_tick()
@@ -2869,6 +3539,66 @@ class ShadowingOrchestrator:
         except Exception:
             pass
 
+        latency_snapshot = self.latency_calibrator.snapshot()
+
+        if self._event_logger is not None:
+            self._event_logger.log(
+                "session_summary",
+                {
+                    "metrics": self._metrics.summary_dict(),
+                    "latency_calibration": (
+                        {
+                            "estimated_input_latency_ms": latency_snapshot.estimated_input_latency_ms,
+                            "estimated_output_latency_ms": latency_snapshot.estimated_output_latency_ms,
+                            "confidence": latency_snapshot.confidence,
+                            "calibrated": latency_snapshot.calibrated,
+                        }
+                        if latency_snapshot is not None
+                        else None
+                    ),
+                    "orchestrator_stats": {
+                        "audio_enqueued": self._audio_frames_enqueued,
+                        "audio_dropped": self._audio_frames_dropped,
+                        "audio_q_high_watermark": self._audio_queue_high_watermark,
+                        "asr_events_emitted": self._asr_events_emitted,
+                        "asr_events_dropped": self._asr_events_dropped,
+                        "asr_poll_iterations": self._asr_poll_iterations,
+                        "use_partial_adapter": self._use_partial_adapter,
+                    },
+                },
+            )
+
+            summary_path = self._event_logger.session_dir / "summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "metrics": self._metrics.summary_dict(),
+                        "latency_calibration": (
+                            {
+                                "estimated_input_latency_ms": latency_snapshot.estimated_input_latency_ms,
+                                "estimated_output_latency_ms": latency_snapshot.estimated_output_latency_ms,
+                                "confidence": latency_snapshot.confidence,
+                                "calibrated": latency_snapshot.calibrated,
+                            }
+                            if latency_snapshot is not None
+                            else None
+                        ),
+                        "orchestrator_stats": {
+                            "audio_enqueued": self._audio_frames_enqueued,
+                            "audio_dropped": self._audio_frames_dropped,
+                            "audio_q_high_watermark": self._audio_queue_high_watermark,
+                            "asr_events_emitted": self._asr_events_emitted,
+                            "asr_events_dropped": self._asr_events_dropped,
+                            "asr_poll_iterations": self._asr_poll_iterations,
+                            "use_partial_adapter": self._use_partial_adapter,
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
         if self._debug_enabled:
             print(
                 "[ORCH-STATS] "
@@ -2882,6 +3612,18 @@ class ShadowingOrchestrator:
             )
 
     def _on_audio_frame(self, pcm: bytes) -> None:
+        now_sec = time.monotonic()
+        self.signal_monitor.feed_pcm16(pcm, observed_at_sec=now_sec)
+
+        signal_snapshot = self.signal_monitor.snapshot(now_sec)
+        self.latency_calibrator.observe_signal(signal_snapshot)
+
+        if self._device_profile is not None:
+            self._device_profile.noise_floor_rms = signal_snapshot.rms if signal_snapshot.rms < 0.004 else self._device_profile.noise_floor_rms
+
+        if signal_snapshot.vad_active or signal_snapshot.speaking_likelihood >= 0.48:
+            self._metrics.observe_signal_active(now_sec)
+
         try:
             self.audio_frame_queue.put_nowait(pcm)
             self._audio_frames_enqueued += 1
@@ -2925,6 +3667,21 @@ class ShadowingOrchestrator:
                 if normalized is None:
                     continue
 
+                if normalized.event_type.value == "partial":
+                    self._metrics.observe_asr_partial(time.monotonic())
+
+                if self._event_logger is not None:
+                    self._event_logger.log(
+                        "asr_event",
+                        {
+                            "event_type": normalized.event_type.value,
+                            "text": normalized.text,
+                            "normalized_text": normalized.normalized_text,
+                            "chars_len": len(normalized.chars),
+                            "emitted_at_sec": normalized.emitted_at_sec,
+                        },
+                    )
+
                 try:
                     self.asr_event_queue.put_nowait(normalized)
                     self._asr_events_emitted += 1
@@ -2948,7 +3705,7 @@ class ShadowingOrchestrator:
             print(f"[SYNC] playback generation changed {self._last_seen_generation} -> {status.generation}")
 
         self._last_seen_generation = status.generation
-        self._last_alignment = None
+        self._last_progress = None
 
         while True:
             try:
@@ -2956,22 +3713,90 @@ class ShadowingOrchestrator:
             except queue.Empty:
                 break
 
-        self.aligner.on_playback_generation_changed(status.generation)
+        now_sec = time.monotonic()
+        self.tracking_engine.on_playback_generation_changed(status.generation)
+        self.progress_estimator.on_playback_generation_changed(now_sec)
+
+        if self._event_logger is not None:
+            self._event_logger.log(
+                "playback_generation_changed",
+                {
+                    "generation": status.generation,
+                    "observed_at_sec": now_sec,
+                },
+            )
 
     def _control_tick(self) -> None:
         status = self.player.get_status()
         self._handle_generation_change_if_needed(status)
 
-        latest_alignment = self._last_alignment
+        now_sec = time.monotonic()
+        signal_snapshot = self.signal_monitor.snapshot(now_sec)
+
+        if self._event_logger is not None:
+            self._event_logger.log(
+                "signal_snapshot",
+                {
+                    "observed_at_sec": signal_snapshot.observed_at_sec,
+                    "rms": signal_snapshot.rms,
+                    "peak": signal_snapshot.peak,
+                    "vad_active": signal_snapshot.vad_active,
+                    "speaking_likelihood": signal_snapshot.speaking_likelihood,
+                    "silence_run_sec": signal_snapshot.silence_run_sec,
+                    "quality_score": signal_snapshot.quality_score,
+                },
+            )
+
         while not self._pure_playback:
             try:
                 event = self.asr_event_queue.get_nowait()
             except queue.Empty:
                 break
 
-            latest_alignment = self.aligner.update(event)
-            if latest_alignment is not None:
-                self._last_alignment = latest_alignment
+            tracking_snapshot = self.tracking_engine.update(event)
+            if tracking_snapshot is not None:
+                self._metrics.observe_tracking_mode(tracking_snapshot.tracking_mode.value)
+
+                if self._event_logger is not None:
+                    self._event_logger.log(
+                        "tracking_snapshot",
+                        {
+                            "candidate_ref_idx": tracking_snapshot.candidate_ref_idx,
+                            "committed_ref_idx": tracking_snapshot.committed_ref_idx,
+                            "candidate_ref_time_sec": tracking_snapshot.candidate_ref_time_sec,
+                            "confidence": tracking_snapshot.confidence,
+                            "stable": tracking_snapshot.stable,
+                            "local_match_ratio": tracking_snapshot.local_match_ratio,
+                            "repeat_penalty": tracking_snapshot.repeat_penalty,
+                            "monotonic_consistency": tracking_snapshot.monotonic_consistency,
+                            "anchor_consistency": tracking_snapshot.anchor_consistency,
+                            "tracking_mode": tracking_snapshot.tracking_mode.value,
+                            "tracking_quality": {
+                                "overall_score": tracking_snapshot.tracking_quality.overall_score,
+                                "observation_score": tracking_snapshot.tracking_quality.observation_score,
+                                "temporal_consistency_score": tracking_snapshot.tracking_quality.temporal_consistency_score,
+                                "anchor_score": tracking_snapshot.tracking_quality.anchor_score,
+                                "is_reliable": tracking_snapshot.tracking_quality.is_reliable,
+                            },
+                            "matched_text": tracking_snapshot.matched_text,
+                            "emitted_at_sec": tracking_snapshot.emitted_at_sec,
+                        },
+                    )
+
+                self.latency_calibrator.observe_progress(float(tracking_snapshot.emitted_at_sec))
+
+                self._last_progress = self.progress_estimator.update(
+                    tracking_snapshot,
+                    signal_snapshot,
+                    now_sec,
+                )
+
+                if self._last_progress is not None:
+                    self._metrics.observe_progress(
+                        now_sec=now_sec,
+                        tracking_quality=self._last_progress.tracking_quality,
+                        is_reliable=self._last_progress.tracking_quality >= 0.66,
+                    )
 
         status = self.player.get_status()
 
@@ -2982,7 +3807,67 @@ class ShadowingOrchestrator:
         if self._pure_playback:
             return
 
-        decision = self.controller.decide(status, latest_alignment)
+        latest_progress = self.progress_estimator.snapshot(now_sec, signal_snapshot)
+        self._last_progress = latest_progress
+
+        if latest_progress is not None and self._event_logger is not None:
+            self._event_logger.log(
+                "progress_snapshot",
+                {
+                    "estimated_ref_idx": latest_progress.estimated_ref_idx,
+                    "estimated_ref_time_sec": latest_progress.estimated_ref_time_sec,
+                    "progress_velocity_idx_per_sec": latest_progress.progress_velocity_idx_per_sec,
+                    "progress_age_sec": latest_progress.progress_age_sec,
+                    "source_candidate_ref_idx": latest_progress.source_candidate_ref_idx,
+                    "source_committed_ref_idx": latest_progress.source_committed_ref_idx,
+                    "tracking_mode": latest_progress.tracking_mode.value,
+                    "tracking_quality": latest_progress.tracking_quality,
+                    "stable": latest_progress.stable,
+                    "confidence": latest_progress.confidence,
+                    "active_speaking": latest_progress.active_speaking,
+                    "recently_progressed": latest_progress.recently_progressed,
+                    "user_state": latest_progress.user_state.value,
+                    "event_emitted_at_sec": latest_progress.event_emitted_at_sec,
+                    "last_progress_at_sec": latest_progress.last_progress_at_sec,
+                },
+            )
+
+        latency_snapshot = self.latency_calibrator.snapshot()
+        if latency_snapshot is not None and self._event_logger is not None:
+            self._event_logger.log(
+                "latency_calibration",
+                {
+                    "estimated_input_latency_ms": latency_snapshot.estimated_input_latency_ms,
+                    "estimated_output_latency_ms": latency_snapshot.estimated_output_latency_ms,
+                    "confidence": latency_snapshot.confidence,
+                    "calibrated": latency_snapshot.calibrated,
+                },
+            )
+
+        decision = self.controller.decide(status, latest_progress, signal_snapshot)
+        self._metrics.observe_action(
+            action=decision.action.value,
+            reason=decision.reason,
+            now_sec=now_sec,
+        )
+
+        if self._event_logger is not None:
+            self._event_logger.log(
+                "control_decision",
+                {
+                    "action": decision.action.value,
+                    "reason": decision.reason,
+                    "target_time_sec": decision.target_time_sec,
+                    "lead_sec": decision.lead_sec,
+                    "target_gain": decision.target_gain,
+                    "confidence": decision.confidence,
+                    "aggressiveness": decision.aggressiveness,
+                    "playback_state": status.state.value,
+                    "playback_generation": status.generation,
+                    "t_ref_heard_content_sec": status.t_ref_heard_content_sec,
+                    "t_ref_emitted_content_sec": status.t_ref_emitted_content_sec,
+                },
+            )
 
         if decision.target_gain is not None:
             self.player.submit_command(
@@ -3564,6 +4449,471 @@ class SoundDevicePlayer(Player):
 ```
 
 ---
+### 文件: `shadowing_app/src/shadowing/realtime/progress/behavior_interpreter.py`
+
+```python
+from __future__ import annotations
+
+from shadowing.types import SignalQuality, TrackingMode, TrackingSnapshot, UserReadState
+
+
+class BehaviorInterpreter:
+    def __init__(
+        self,
+        recent_progress_sec: float = 0.90,
+        strong_signal_threshold: float = 0.58,
+        weak_signal_threshold: float = 0.42,
+        repeat_penalty_threshold: float = 0.34,
+        skip_forward_tokens: int = 8,
+    ) -> None:
+        self.recent_progress_sec = float(recent_progress_sec)
+        self.strong_signal_threshold = float(strong_signal_threshold)
+        self.weak_signal_threshold = float(weak_signal_threshold)
+        self.repeat_penalty_threshold = float(repeat_penalty_threshold)
+        self.skip_forward_tokens = int(skip_forward_tokens)
+
+    def infer(
+        self,
+        *,
+        progress_age: float,
+        signal_quality: SignalQuality | None,
+        tracking: TrackingSnapshot | None,
+        tracking_mode: TrackingMode,
+        tracking_quality: float,
+        candidate_idx: int,
+        estimated_idx: int,
+    ) -> UserReadState:
+        signal_speaking = self._is_signal_speaking(signal_quality)
+        signal_weak_speaking = self._is_signal_weak_speaking(signal_quality)
+
+        if tracking_mode == TrackingMode.LOST:
+            if signal_speaking:
+                return UserReadState.REJOINING
+            return UserReadState.LOST
+
+        if tracking_mode == TrackingMode.REACQUIRING:
+            if signal_speaking:
+                return UserReadState.REJOINING
+            return UserReadState.HESITATING
+
+        repeat_penalty = tracking.repeat_penalty if tracking is not None else 0.0
+        if repeat_penalty >= self.repeat_penalty_threshold and signal_speaking:
+            return UserReadState.REPEATING
+
+        if candidate_idx - estimated_idx >= self.skip_forward_tokens and tracking_quality >= 0.72:
+            return UserReadState.SKIPPING
+
+        if progress_age <= self.recent_progress_sec:
+            if tracking_quality >= 0.60:
+                return UserReadState.FOLLOWING
+            if signal_speaking:
+                return UserReadState.HESITATING
+            return UserReadState.WARMING_UP
+
+        if progress_age <= 1.80:
+            if signal_speaking and tracking_quality >= 0.36:
+                return UserReadState.HESITATING
+            if signal_weak_speaking:
+                return UserReadState.WARMING_UP
+
+        if not signal_speaking and progress_age > 1.20:
+            return UserReadState.PAUSED
+
+        if signal_speaking:
+            return UserReadState.WARMING_UP
+
+        return UserReadState.NOT_STARTED
+
+    def _is_signal_speaking(self, signal_quality: SignalQuality | None) -> bool:
+        if signal_quality is None:
+            return False
+        return bool(
+            signal_quality.vad_active
+            or signal_quality.speaking_likelihood >= self.strong_signal_threshold
+        )
+
+    def _is_signal_weak_speaking(self, signal_quality: SignalQuality | None) -> bool:
+        if signal_quality is None:
+            return False
+        return bool(
+            signal_quality.vad_active
+            or signal_quality.speaking_likelihood >= self.weak_signal_threshold
+        )
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/realtime/progress/commercial_progress_estimator.py`
+
+```python
+from __future__ import annotations
+
+from shadowing.progress.behavior_interpreter import BehaviorInterpreter
+from shadowing.types import (
+    ProgressEstimate,
+    ReferenceMap,
+    SignalQuality,
+    TrackingMode,
+    TrackingSnapshot,
+)
+
+
+class CommercialProgressEstimator:
+    def __init__(
+        self,
+        recent_progress_sec: float = 0.90,
+        active_speaking_signal_min: float = 0.45,
+        min_tracking_for_follow: float = 0.58,
+    ) -> None:
+        self.recent_progress_sec = float(recent_progress_sec)
+        self.active_speaking_signal_min = float(active_speaking_signal_min)
+        self.min_tracking_for_follow = float(min_tracking_for_follow)
+
+        self.behavior_interpreter = BehaviorInterpreter(
+            recent_progress_sec=recent_progress_sec,
+        )
+
+        self._ref_map: ReferenceMap | None = None
+        self._estimated_idx_f = 0.0
+        self._last_progress_at_sec = 0.0
+        self._last_event_at_sec = 0.0
+        self._last_velocity = 0.0
+        self._last_estimated_idx_at_progress = 0.0
+        self._last_tracking: TrackingSnapshot | None = None
+        self._last_snapshot: ProgressEstimate | None = None
+        self._force_reacquire_until_sec = 0.0
+
+    def reset(self, reference_map: ReferenceMap, start_idx: int = 0) -> None:
+        self._ref_map = reference_map
+        start_idx = max(0, min(int(start_idx), max(0, len(reference_map.tokens) - 1)))
+        self._estimated_idx_f = float(start_idx)
+        self._last_progress_at_sec = 0.0
+        self._last_event_at_sec = 0.0
+        self._last_velocity = 0.0
+        self._last_estimated_idx_at_progress = float(start_idx)
+        self._last_tracking = None
+        self._last_snapshot = None
+        self._force_reacquire_until_sec = 0.0
+
+    def on_playback_generation_changed(self, now_sec: float) -> None:
+        self._force_reacquire_until_sec = float(now_sec) + 0.80
+
+    def update(
+        self,
+        tracking: TrackingSnapshot | None,
+        signal_quality: SignalQuality | None,
+        now_sec: float,
+    ) -> ProgressEstimate | None:
+        if self._ref_map is None or not self._ref_map.tokens:
+            return None
+
+        if tracking is None:
+            return self.snapshot(now_sec, signal_quality)
+
+        self._last_tracking = tracking
+        self._last_event_at_sec = float(tracking.emitted_at_sec)
+
+        current_idx = int(round(self._estimated_idx_f))
+        candidate_idx = int(tracking.candidate_ref_idx)
+        committed_idx = int(tracking.committed_ref_idx)
+        target_idx = float(max(current_idx, committed_idx, candidate_idx))
+
+        weight = self._weight_for_tracking(tracking)
+        updated_idx = max(
+            self._estimated_idx_f,
+            (1.0 - weight) * self._estimated_idx_f + weight * target_idx,
+        )
+
+        if (
+            tracking.tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED)
+            and tracking.local_match_ratio >= 0.68
+            and candidate_idx > current_idx
+        ):
+            updated_idx = max(updated_idx, float(current_idx) + 0.60)
+
+        estimated_idx = max(0, min(int(round(updated_idx)), len(self._ref_map.tokens) - 1))
+        self._estimated_idx_f = float(estimated_idx)
+
+        progressed = estimated_idx > current_idx
+        if progressed:
+            if self._last_progress_at_sec > 0.0 and tracking.emitted_at_sec > self._last_progress_at_sec:
+                dt = max(1e-6, tracking.emitted_at_sec - self._last_progress_at_sec)
+                self._last_velocity = (estimated_idx - self._last_estimated_idx_at_progress) / dt
+            self._last_progress_at_sec = float(tracking.emitted_at_sec)
+            self._last_estimated_idx_at_progress = float(estimated_idx)
+
+        self._last_snapshot = self._render_snapshot(now_sec, signal_quality)
+        return self._last_snapshot
+
+    def snapshot(self, now_sec: float, signal_quality: SignalQuality | None) -> ProgressEstimate | None:
+        if self._ref_map is None or not self._ref_map.tokens:
+            return None
+        if self._last_tracking is None and self._last_snapshot is None:
+            return None
+        self._last_snapshot = self._render_snapshot(now_sec, signal_quality)
+        return self._last_snapshot
+
+    def _weight_for_tracking(self, tracking: TrackingSnapshot) -> float:
+        if tracking.tracking_mode == TrackingMode.LOCKED:
+            return 0.82 if tracking.stable else 0.68
+        if tracking.tracking_mode == TrackingMode.WEAK_LOCKED:
+            return 0.42
+        if tracking.tracking_mode == TrackingMode.REACQUIRING:
+            return 0.16
+        return 0.05
+
+    def _render_snapshot(
+        self,
+        now_sec: float,
+        signal_quality: SignalQuality | None,
+    ) -> ProgressEstimate:
+        assert self._ref_map is not None
+
+        tracking = self._last_tracking
+        estimated_idx = max(0, min(int(round(self._estimated_idx_f)), len(self._ref_map.tokens) - 1))
+        estimated_ref_time_sec = float(self._ref_map.tokens[estimated_idx].t_start)
+
+        progress_age = 9999.0
+        if self._last_progress_at_sec > 0.0:
+            progress_age = max(0.0, now_sec - self._last_progress_at_sec)
+
+        recently_progressed = progress_age <= self.recent_progress_sec
+
+        signal_speaking = False
+        if signal_quality is not None:
+            signal_speaking = (
+                signal_quality.vad_active
+                or signal_quality.speaking_likelihood >= self.active_speaking_signal_min
+            )
+
+        tracking_mode = TrackingMode.BOOTSTRAP
+        tracking_quality = 0.0
+        confidence = 0.0
+        stable = False
+        source_candidate_ref_idx = estimated_idx
+        source_committed_ref_idx = estimated_idx
+        event_emitted_at_sec = self._last_event_at_sec
+
+        if tracking is not None:
+            tracking_mode = tracking.tracking_mode
+            tracking_quality = tracking.tracking_quality.overall_score
+            confidence = tracking.confidence
+            stable = tracking.stable
+            source_candidate_ref_idx = tracking.candidate_ref_idx
+            source_committed_ref_idx = tracking.committed_ref_idx
+
+        if now_sec <= self._force_reacquire_until_sec:
+            tracking_mode = TrackingMode.REACQUIRING
+            tracking_quality = min(tracking_quality, 0.55)
+
+        active_speaking = False
+        if recently_progressed:
+            active_speaking = True
+        elif signal_speaking and tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED):
+            active_speaking = True
+        elif signal_speaking and tracking_quality >= 0.70:
+            active_speaking = True
+
+        user_state = self.behavior_interpreter.infer(
+            progress_age=progress_age,
+            signal_quality=signal_quality,
+            tracking=tracking,
+            tracking_mode=tracking_mode,
+            tracking_quality=tracking_quality,
+            candidate_idx=source_candidate_ref_idx,
+            estimated_idx=estimated_idx,
+        )
+
+        return ProgressEstimate(
+            estimated_ref_idx=estimated_idx,
+            estimated_ref_time_sec=estimated_ref_time_sec,
+            progress_velocity_idx_per_sec=float(self._last_velocity),
+            event_emitted_at_sec=float(event_emitted_at_sec),
+            last_progress_at_sec=float(self._last_progress_at_sec),
+            progress_age_sec=float(progress_age),
+            source_candidate_ref_idx=int(source_candidate_ref_idx),
+            source_committed_ref_idx=int(source_committed_ref_idx),
+            tracking_mode=tracking_mode,
+            tracking_quality=float(tracking_quality),
+            stable=bool(stable),
+            confidence=float(confidence),
+            active_speaking=bool(active_speaking),
+            recently_progressed=bool(recently_progressed),
+            user_state=user_state,
+        )
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/realtime/progress/monotonic_estimator.py`
+
+```python
+from __future__ import annotations
+
+from shadowing.types import AlignResult, ProgressEstimate, ReferenceMap
+
+
+class MonotonicProgressEstimator:
+    def __init__(
+        self,
+        active_speaking_confidence: float = 0.68,
+        recent_progress_sec: float = 0.90,
+        speaking_event_fresh_sec: float = 0.45,
+        local_match_for_speaking: float = 0.65,
+    ) -> None:
+        self.active_speaking_confidence = float(active_speaking_confidence)
+        self.recent_progress_sec = float(recent_progress_sec)
+        self.speaking_event_fresh_sec = float(speaking_event_fresh_sec)
+        self.local_match_for_speaking = float(local_match_for_speaking)
+
+        self._ref_map: ReferenceMap | None = None
+        self._estimated_idx_f = 0.0
+        self._last_source_candidate_idx = 0
+        self._last_progress_at_sec = 0.0
+        self._last_event_at_sec = 0.0
+        self._last_estimated_idx_at_progress = 0.0
+        self._last_velocity = 0.0
+        self._last_alignment: AlignResult | None = None
+        self._last_snapshot: ProgressEstimate | None = None
+
+    def reset(self, reference_map: ReferenceMap, start_idx: int = 0) -> None:
+        self._ref_map = reference_map
+        start_idx = max(0, min(int(start_idx), max(0, len(reference_map.tokens) - 1)))
+        self._estimated_idx_f = float(start_idx)
+        self._last_source_candidate_idx = start_idx
+        self._last_progress_at_sec = 0.0
+        self._last_event_at_sec = 0.0
+        self._last_estimated_idx_at_progress = float(start_idx)
+        self._last_velocity = 0.0
+        self._last_alignment = None
+        self._last_snapshot = None
+
+    def on_playback_generation_changed(self, start_idx: int | None = None) -> None:
+        if self._ref_map is None:
+            return
+        idx = int(round(self._estimated_idx_f)) if start_idx is None else int(start_idx)
+        self.reset(self._ref_map, start_idx=idx)
+
+    def update(self, alignment: AlignResult | None) -> ProgressEstimate | None:
+        if alignment is None or self._ref_map is None or not self._ref_map.tokens:
+            return self._last_snapshot
+
+        self._last_alignment = alignment
+
+        event_time = float(alignment.emitted_at_sec)
+        if event_time <= 0.0:
+            event_time = self._last_event_at_sec
+
+        candidate_idx = int(alignment.candidate_ref_idx)
+        committed_idx = int(alignment.committed_ref_idx)
+        current_estimated_idx = int(round(self._estimated_idx_f))
+        target_idx = float(max(candidate_idx, committed_idx, current_estimated_idx))
+
+        if alignment.stable:
+            weight = 0.88
+        elif alignment.confidence >= 0.90:
+            weight = 0.72
+        elif alignment.confidence >= 0.78:
+            weight = 0.50
+        else:
+            weight = 0.26
+
+        if candidate_idx < current_estimated_idx:
+            target_idx = float(current_estimated_idx)
+            weight = min(weight, 0.12)
+
+        updated_idx = max(
+            self._estimated_idx_f,
+            (1.0 - weight) * self._estimated_idx_f + weight * target_idx,
+        )
+
+        if alignment.local_match_ratio >= 0.70 and candidate_idx > current_estimated_idx:
+            updated_idx = max(updated_idx, float(current_estimated_idx) + 0.60)
+
+        estimated_idx = max(0, min(int(round(updated_idx)), len(self._ref_map.tokens) - 1))
+        self._estimated_idx_f = float(estimated_idx)
+
+        progressed = estimated_idx > current_estimated_idx
+        if progressed:
+            if self._last_progress_at_sec > 0.0 and event_time > self._last_progress_at_sec:
+                dt = max(1e-6, event_time - self._last_progress_at_sec)
+                self._last_velocity = (estimated_idx - self._last_estimated_idx_at_progress) / dt
+            self._last_progress_at_sec = event_time
+            self._last_estimated_idx_at_progress = float(estimated_idx)
+
+        self._last_source_candidate_idx = candidate_idx
+        self._last_event_at_sec = event_time
+        self._last_snapshot = self._render_snapshot(now_sec=event_time)
+        return self._last_snapshot
+
+    def snapshot(self, now_sec: float) -> ProgressEstimate | None:
+        if self._ref_map is None or not self._ref_map.tokens:
+            return None
+        if self._last_alignment is None and self._last_snapshot is None:
+            return None
+        self._last_snapshot = self._render_snapshot(now_sec=now_sec)
+        return self._last_snapshot
+
+    def _render_snapshot(self, now_sec: float) -> ProgressEstimate:
+        assert self._ref_map is not None
+        alignment = self._last_alignment
+
+        estimated_idx = max(0, min(int(round(self._estimated_idx_f)), len(self._ref_map.tokens) - 1))
+        estimated_ref_time_sec = float(self._ref_map.tokens[estimated_idx].t_start)
+
+        if self._last_progress_at_sec > 0.0 and now_sec >= self._last_progress_at_sec:
+            last_progress_age = now_sec - self._last_progress_at_sec
+        else:
+            last_progress_age = 9999.0
+
+        recently_progressed = last_progress_age <= self.recent_progress_sec
+
+        active_speaking = False
+        if alignment is not None:
+            forward_delta = alignment.candidate_ref_idx - estimated_idx
+            event_fresh = (
+                (now_sec - self._last_event_at_sec) <= self.speaking_event_fresh_sec
+                if self._last_event_at_sec > 0.0 and now_sec >= self._last_event_at_sec
+                else False
+            )
+
+            if recently_progressed:
+                active_speaking = True
+            elif (
+                event_fresh
+                and alignment.stable
+                and alignment.confidence >= self.active_speaking_confidence
+                and forward_delta >= 0
+            ):
+                active_speaking = True
+            elif (
+                event_fresh
+                and alignment.confidence >= max(self.active_speaking_confidence, 0.76)
+                and alignment.local_match_ratio >= self.local_match_for_speaking
+                and alignment.candidate_ref_idx > alignment.committed_ref_idx
+            ):
+                active_speaking = True
+
+        return ProgressEstimate(
+            estimated_ref_idx=estimated_idx,
+            estimated_ref_time_sec=estimated_ref_time_sec,
+            source_candidate_ref_idx=(
+                int(alignment.candidate_ref_idx) if alignment is not None else int(self._last_source_candidate_idx)
+            ),
+            source_committed_ref_idx=(
+                int(alignment.committed_ref_idx) if alignment is not None else estimated_idx
+            ),
+            confidence=float(alignment.confidence) if alignment is not None else 0.0,
+            stable=bool(alignment.stable) if alignment is not None else False,
+            event_emitted_at_sec=float(self._last_event_at_sec),
+            last_progress_at_sec=float(self._last_progress_at_sec),
+            progress_velocity_idx_per_sec=float(self._last_velocity),
+            recently_progressed=recently_progressed,
+            last_progress_age_sec=float(last_progress_age),
+            active_speaking=active_speaking,
+            phase_hint="follow" if active_speaking or recently_progressed else "wait",
+        )
+```
+
+---
 ### 文件: `shadowing_app/src/shadowing/realtime/runtime.py`
 
 ```python
@@ -3581,6 +4931,597 @@ class ShadowingRuntime:
             self.orchestrator.start_session(lesson_id)
         finally:
             self.orchestrator.stop_session()
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/telemetry/event_logger.py`
+
+```python
+from __future__ import annotations
+
+import json
+import threading
+from pathlib import Path
+from typing import Any
+
+
+class EventLogger:
+    def __init__(self, session_dir: str, enabled: bool = True) -> None:
+        self.session_dir = Path(session_dir)
+        self.enabled = bool(enabled)
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.events_path = self.session_dir / "events.jsonl"
+        self._lock = threading.Lock()
+
+    def log(self, event_type: str, payload: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+
+        record = {
+            "event_type": str(event_type),
+            "payload": payload,
+        }
+
+        line = json.dumps(record, ensure_ascii=False)
+        with self._lock:
+            with self.events_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/telemetry/metrics.py`
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class SessionMetricsSummary:
+    first_signal_active_time_sec: float | None
+    first_asr_partial_time_sec: float | None
+    first_reliable_progress_time_sec: float | None
+    startup_false_hold_count: int
+    hold_count: int
+    resume_count: int
+    soft_duck_count: int
+    seek_count: int
+    lost_count: int
+    reacquire_count: int
+    max_tracking_quality: float
+    mean_tracking_quality: float
+    total_progress_updates: int
+
+
+class MetricsAggregator:
+    def __init__(self) -> None:
+        self.session_started_at_sec = 0.0
+
+        self.first_signal_active_time_sec: float | None = None
+        self.first_asr_partial_time_sec: float | None = None
+        self.first_reliable_progress_time_sec: float | None = None
+
+        self.startup_false_hold_count = 0
+        self.hold_count = 0
+        self.resume_count = 0
+        self.soft_duck_count = 0
+        self.seek_count = 0
+        self.lost_count = 0
+        self.reacquire_count = 0
+
+        self.max_tracking_quality = 0.0
+        self._tracking_quality_sum = 0.0
+        self.total_progress_updates = 0
+
+    def mark_session_started(self, now_sec: float) -> None:
+        if self.session_started_at_sec <= 0.0:
+            self.session_started_at_sec = float(now_sec)
+
+    def observe_signal_active(self, now_sec: float) -> None:
+        if self.first_signal_active_time_sec is None and self.session_started_at_sec > 0.0:
+            self.first_signal_active_time_sec = max(0.0, now_sec - self.session_started_at_sec)
+
+    def observe_asr_partial(self, now_sec: float) -> None:
+        if self.first_asr_partial_time_sec is None and self.session_started_at_sec > 0.0:
+            self.first_asr_partial_time_sec = max(0.0, now_sec - self.session_started_at_sec)
+
+    def observe_progress(self, now_sec: float, tracking_quality: float, is_reliable: bool) -> None:
+        self.total_progress_updates += 1
+        self.max_tracking_quality = max(self.max_tracking_quality, float(tracking_quality))
+        self._tracking_quality_sum += float(tracking_quality)
+
+        if is_reliable and self.first_reliable_progress_time_sec is None and self.session_started_at_sec > 0.0:
+            self.first_reliable_progress_time_sec = max(0.0, now_sec - self.session_started_at_sec)
+
+    def observe_action(self, action: str, reason: str, now_sec: float) -> None:
+        if action == "hold":
+            self.hold_count += 1
+            if self.session_started_at_sec > 0.0 and (now_sec - self.session_started_at_sec) <= 5.0:
+                if reason in ("no_progress_timeout", "reference_too_far_ahead"):
+                    self.startup_false_hold_count += 1
+        elif action == "resume":
+            self.resume_count += 1
+        elif action == "soft_duck":
+            self.soft_duck_count += 1
+        elif action == "seek":
+            self.seek_count += 1
+
+    def observe_tracking_mode(self, mode: str) -> None:
+        if mode == "lost":
+            self.lost_count += 1
+        elif mode == "reacquiring":
+            self.reacquire_count += 1
+
+    def summary(self) -> SessionMetricsSummary:
+        mean_tracking_quality = (
+            self._tracking_quality_sum / self.total_progress_updates
+            if self.total_progress_updates > 0
+            else 0.0
+        )
+        return SessionMetricsSummary(
+            first_signal_active_time_sec=self.first_signal_active_time_sec,
+            first_asr_partial_time_sec=self.first_asr_partial_time_sec,
+            first_reliable_progress_time_sec=self.first_reliable_progress_time_sec,
+            startup_false_hold_count=self.startup_false_hold_count,
+            hold_count=self.hold_count,
+            resume_count=self.resume_count,
+            soft_duck_count=self.soft_duck_count,
+            seek_count=self.seek_count,
+            lost_count=self.lost_count,
+            reacquire_count=self.reacquire_count,
+            max_tracking_quality=self.max_tracking_quality,
+            mean_tracking_quality=float(mean_tracking_quality),
+            total_progress_updates=self.total_progress_updates,
+        )
+
+    def summary_dict(self) -> dict:
+        s = self.summary()
+        return {
+            "first_signal_active_time_sec": s.first_signal_active_time_sec,
+            "first_asr_partial_time_sec": s.first_asr_partial_time_sec,
+            "first_reliable_progress_time_sec": s.first_reliable_progress_time_sec,
+            "startup_false_hold_count": s.startup_false_hold_count,
+            "hold_count": s.hold_count,
+            "resume_count": s.resume_count,
+            "soft_duck_count": s.soft_duck_count,
+            "seek_count": s.seek_count,
+            "lost_count": s.lost_count,
+            "reacquire_count": s.reacquire_count,
+            "max_tracking_quality": s.max_tracking_quality,
+            "mean_tracking_quality": s.mean_tracking_quality,
+            "total_progress_updates": s.total_progress_updates,
+        }
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/telemetry/replay_loader.py`
+
+```python
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
+
+@dataclass(slots=True)
+class ReplayEvent:
+    event_type: str
+    payload: dict
+
+
+class ReplayLoader:
+    def __init__(self, events_file: str) -> None:
+        self.events_file = Path(events_file)
+
+    def __iter__(self) -> Iterator[ReplayEvent]:
+        with self.events_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                yield ReplayEvent(
+                    event_type=str(data.get("event_type", "")),
+                    payload=dict(data.get("payload", {})),
+                )
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/tracking/anchor_manager.py`
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from shadowing.types import TrackingSnapshot
+
+
+@dataclass(slots=True)
+class Anchor:
+    ref_idx: int
+    emitted_at_sec: float
+    quality_score: float
+    matched_text: str = ""
+
+
+class AnchorManager:
+    def __init__(
+        self,
+        strong_anchor_quality: float = 0.78,
+        weak_anchor_quality: float = 0.64,
+        max_anchor_gap: int = 24,
+    ) -> None:
+        self.strong_anchor_quality = float(strong_anchor_quality)
+        self.weak_anchor_quality = float(weak_anchor_quality)
+        self.max_anchor_gap = int(max_anchor_gap)
+
+        self._strong_anchor: Anchor | None = None
+        self._weak_anchor: Anchor | None = None
+
+    def reset(self) -> None:
+        self._strong_anchor = None
+        self._weak_anchor = None
+
+    def update(self, snapshot: TrackingSnapshot) -> None:
+        q = snapshot.tracking_quality.overall_score
+        text = snapshot.matched_text or ""
+
+        if snapshot.stable and q >= self.strong_anchor_quality:
+            self._strong_anchor = Anchor(
+                ref_idx=int(snapshot.candidate_ref_idx),
+                emitted_at_sec=float(snapshot.emitted_at_sec),
+                quality_score=float(q),
+                matched_text=text,
+            )
+            self._weak_anchor = Anchor(
+                ref_idx=int(snapshot.candidate_ref_idx),
+                emitted_at_sec=float(snapshot.emitted_at_sec),
+                quality_score=float(q),
+                matched_text=text,
+            )
+            return
+
+        if q >= self.weak_anchor_quality:
+            if self._strong_anchor is None:
+                self._weak_anchor = Anchor(
+                    ref_idx=int(snapshot.candidate_ref_idx),
+                    emitted_at_sec=float(snapshot.emitted_at_sec),
+                    quality_score=float(q),
+                    matched_text=text,
+                )
+                return
+
+            if abs(snapshot.candidate_ref_idx - self._strong_anchor.ref_idx) <= self.max_anchor_gap:
+                self._weak_anchor = Anchor(
+                    ref_idx=int(snapshot.candidate_ref_idx),
+                    emitted_at_sec=float(snapshot.emitted_at_sec),
+                    quality_score=float(q),
+                    matched_text=text,
+                )
+
+    def current_anchor_idx(self) -> int:
+        if self._strong_anchor is not None:
+            return self._strong_anchor.ref_idx
+        if self._weak_anchor is not None:
+            return self._weak_anchor.ref_idx
+        return 0
+
+    def strong_anchor(self) -> Anchor | None:
+        return self._strong_anchor
+
+    def weak_anchor(self) -> Anchor | None:
+        return self._weak_anchor
+
+    def anchor_consistency(self, candidate_idx: int) -> float:
+        anchor_idx = self.current_anchor_idx()
+        dist = abs(int(candidate_idx) - int(anchor_idx))
+        return 1.0 / (1.0 + (dist / 14.0))
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/tracking/loss_detector.py`
+
+```python
+from __future__ import annotations
+
+from collections import deque
+from statistics import pstdev
+
+from shadowing.types import TrackingMode, TrackingSnapshot
+
+
+class LossDetector:
+    def __init__(
+        self,
+        jitter_window: int = 6,
+        weak_quality_threshold: float = 0.56,
+        lost_quality_threshold: float = 0.40,
+        max_jitter_sigma: float = 8.0,
+        lost_run_threshold: int = 4,
+    ) -> None:
+        self.jitter_window = int(jitter_window)
+        self.weak_quality_threshold = float(weak_quality_threshold)
+        self.lost_quality_threshold = float(lost_quality_threshold)
+        self.max_jitter_sigma = float(max_jitter_sigma)
+        self.lost_run_threshold = int(lost_run_threshold)
+
+        self._recent_candidates: deque[int] = deque(maxlen=self.jitter_window)
+        self._low_quality_run = 0
+        self._good_quality_run = 0
+        self._last_reliable_at_sec = 0.0
+
+    def reset(self) -> None:
+        self._recent_candidates.clear()
+        self._low_quality_run = 0
+        self._good_quality_run = 0
+        self._last_reliable_at_sec = 0.0
+
+    def update(
+        self,
+        snapshot: TrackingSnapshot,
+        overall_score: float,
+        is_reliable: bool,
+    ) -> tuple[TrackingMode, float]:
+        candidate_idx = int(snapshot.candidate_ref_idx)
+
+        series = list(self._recent_candidates) + [candidate_idx]
+        if len(series) <= 1:
+            temporal_consistency = 0.72
+        else:
+            sigma = pstdev(series)
+            temporal_consistency = max(0.0, 1.0 - min(1.0, sigma / self.max_jitter_sigma))
+
+        if is_reliable:
+            self._last_reliable_at_sec = float(snapshot.emitted_at_sec)
+            self._good_quality_run += 1
+            self._low_quality_run = 0
+        else:
+            self._low_quality_run += 1
+            self._good_quality_run = 0
+
+        if is_reliable and overall_score >= 0.78 and self._good_quality_run >= 1:
+            mode = TrackingMode.LOCKED
+        elif overall_score >= self.weak_quality_threshold and temporal_consistency >= 0.28:
+            mode = TrackingMode.WEAK_LOCKED
+        elif (
+            self._last_reliable_at_sec > 0.0
+            and (snapshot.emitted_at_sec - self._last_reliable_at_sec) <= 2.0
+        ):
+            mode = TrackingMode.REACQUIRING
+        elif overall_score < self.lost_quality_threshold and self._low_quality_run >= self.lost_run_threshold:
+            mode = TrackingMode.LOST
+        else:
+            mode = TrackingMode.REACQUIRING
+
+        self._recent_candidates.append(candidate_idx)
+        return mode, float(temporal_consistency)
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/tracking/reacquirer.py`
+
+```python
+from __future__ import annotations
+
+from shadowing.tracking.anchor_manager import AnchorManager
+from shadowing.types import TrackingMode, TrackingSnapshot
+
+
+class Reacquirer:
+    def __init__(
+        self,
+        max_reanchor_distance: int = 18,
+        min_quality_for_reanchor: float = 0.66,
+    ) -> None:
+        self.max_reanchor_distance = int(max_reanchor_distance)
+        self.min_quality_for_reanchor = float(min_quality_for_reanchor)
+
+    def maybe_reanchor(
+        self,
+        snapshot: TrackingSnapshot,
+        anchor_manager: AnchorManager,
+    ) -> TrackingSnapshot:
+        if snapshot.tracking_mode not in (TrackingMode.REACQUIRING, TrackingMode.LOST):
+            return snapshot
+
+        strong = anchor_manager.strong_anchor()
+        weak = anchor_manager.weak_anchor()
+        anchor = strong if strong is not None else weak
+        if anchor is None:
+            return snapshot
+
+        if snapshot.tracking_quality.overall_score < self.min_quality_for_reanchor:
+            return snapshot
+
+        if abs(snapshot.candidate_ref_idx - anchor.ref_idx) > self.max_reanchor_distance:
+            return snapshot
+
+        repaired_mode = TrackingMode.WEAK_LOCKED
+        repaired_quality = snapshot.tracking_quality
+        repaired_quality.mode = repaired_mode
+        repaired_quality.is_reliable = repaired_quality.overall_score >= 0.60
+
+        return TrackingSnapshot(
+            candidate_ref_idx=int(snapshot.candidate_ref_idx),
+            committed_ref_idx=max(int(snapshot.committed_ref_idx), int(anchor.ref_idx)),
+            candidate_ref_time_sec=float(snapshot.candidate_ref_time_sec),
+            confidence=float(snapshot.confidence),
+            stable=bool(snapshot.stable),
+            local_match_ratio=float(snapshot.local_match_ratio),
+            repeat_penalty=float(snapshot.repeat_penalty),
+            monotonic_consistency=float(snapshot.monotonic_consistency),
+            anchor_consistency=float(snapshot.anchor_consistency),
+            emitted_at_sec=float(snapshot.emitted_at_sec),
+            tracking_mode=repaired_mode,
+            tracking_quality=repaired_quality,
+            matched_text=snapshot.matched_text,
+        )
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/tracking/tracking_engine.py`
+
+```python
+from __future__ import annotations
+
+from shadowing.interfaces.aligner import Aligner
+from shadowing.tracking.anchor_manager import AnchorManager
+from shadowing.tracking.loss_detector import LossDetector
+from shadowing.tracking.reacquirer import Reacquirer
+from shadowing.types import ReferenceMap, AsrEvent, TrackingMode, TrackingQuality, TrackingSnapshot
+
+
+class TrackingEngine:
+    def __init__(self, aligner: Aligner, debug: bool = False) -> None:
+        self.aligner = aligner
+        self.debug = bool(debug)
+
+        self.ref_map: ReferenceMap | None = None
+        self.anchor_manager = AnchorManager()
+        self.loss_detector = LossDetector()
+        self.reacquirer = Reacquirer()
+
+        self._last_candidate_idx = 0
+        self._last_snapshot: TrackingSnapshot | None = None
+
+    def reset(self, reference_map: ReferenceMap) -> None:
+        self.ref_map = reference_map
+        self._last_candidate_idx = 0
+        self._last_snapshot = None
+        self.anchor_manager.reset()
+        self.loss_detector.reset()
+        self.aligner.reset(reference_map)
+
+    def on_playback_generation_changed(self, generation: int) -> None:
+        self.aligner.on_playback_generation_changed(generation)
+        self.loss_detector.reset()
+
+    def update(self, event: AsrEvent) -> TrackingSnapshot | None:
+        if self.ref_map is None:
+            return None
+
+        alignment = self.aligner.update(event)
+        if alignment is None:
+            return self._last_snapshot
+
+        candidate_idx = int(alignment.candidate_ref_idx)
+        committed_idx = int(alignment.committed_ref_idx)
+
+        monotonic_consistency = self._compute_monotonic_consistency(candidate_idx)
+        anchor_consistency = self.anchor_manager.anchor_consistency(candidate_idx)
+
+        observation_score = (
+            0.58 * alignment.confidence
+            + 0.24 * alignment.local_match_ratio
+            + 0.12 * (1.0 - alignment.repeat_penalty)
+            + 0.06 * (1.0 if alignment.stable else 0.0)
+        )
+        observation_score = max(0.0, min(1.0, observation_score))
+
+        seed_quality = (
+            0.62 * observation_score
+            + 0.22 * anchor_consistency
+            + 0.16 * monotonic_consistency
+        )
+        seed_quality = max(0.0, min(1.0, seed_quality))
+        is_reliable = seed_quality >= 0.66 and alignment.confidence >= 0.62
+
+        provisional_quality = TrackingQuality(
+            overall_score=float(seed_quality),
+            observation_score=float(observation_score),
+            temporal_consistency_score=0.72,
+            anchor_score=float(anchor_consistency),
+            mode=TrackingMode.BOOTSTRAP,
+            is_reliable=bool(is_reliable),
+        )
+
+        snapshot = TrackingSnapshot(
+            candidate_ref_idx=candidate_idx,
+            committed_ref_idx=committed_idx,
+            candidate_ref_time_sec=float(alignment.ref_time_sec),
+            confidence=float(alignment.confidence),
+            stable=bool(alignment.stable),
+            local_match_ratio=float(alignment.local_match_ratio),
+            repeat_penalty=float(alignment.repeat_penalty),
+            monotonic_consistency=float(monotonic_consistency),
+            anchor_consistency=float(anchor_consistency),
+            emitted_at_sec=float(alignment.emitted_at_sec),
+            tracking_mode=TrackingMode.BOOTSTRAP,
+            tracking_quality=provisional_quality,
+            matched_text=alignment.matched_text,
+        )
+
+        mode, temporal_consistency = self.loss_detector.update(
+            snapshot=snapshot,
+            overall_score=seed_quality,
+            is_reliable=is_reliable,
+        )
+
+        overall_score = (
+            0.48 * observation_score
+            + 0.22 * temporal_consistency
+            + 0.18 * anchor_consistency
+            + 0.12 * monotonic_consistency
+        )
+        overall_score = max(0.0, min(1.0, overall_score))
+
+        quality = TrackingQuality(
+            overall_score=float(overall_score),
+            observation_score=float(observation_score),
+            temporal_consistency_score=float(temporal_consistency),
+            anchor_score=float(anchor_consistency),
+            mode=mode,
+            is_reliable=bool(overall_score >= 0.66 and alignment.confidence >= 0.62),
+        )
+
+        snapshot = TrackingSnapshot(
+            candidate_ref_idx=candidate_idx,
+            committed_ref_idx=committed_idx,
+            candidate_ref_time_sec=float(alignment.ref_time_sec),
+            confidence=float(alignment.confidence),
+            stable=bool(alignment.stable),
+            local_match_ratio=float(alignment.local_match_ratio),
+            repeat_penalty=float(alignment.repeat_penalty),
+            monotonic_consistency=float(monotonic_consistency),
+            anchor_consistency=float(anchor_consistency),
+            emitted_at_sec=float(alignment.emitted_at_sec),
+            tracking_mode=mode,
+            tracking_quality=quality,
+            matched_text=alignment.matched_text,
+        )
+
+        snapshot = self.reacquirer.maybe_reanchor(snapshot, self.anchor_manager)
+        self.anchor_manager.update(snapshot)
+
+        self._last_candidate_idx = candidate_idx
+        self._last_snapshot = snapshot
+
+        if self.debug:
+            print(
+                "[TRACK] "
+                f"mode={snapshot.tracking_mode.value} "
+                f"cand={snapshot.candidate_ref_idx} "
+                f"committed={snapshot.committed_ref_idx} "
+                f"overall={snapshot.tracking_quality.overall_score:.3f} "
+                f"obs={snapshot.tracking_quality.observation_score:.3f} "
+                f"temp={snapshot.tracking_quality.temporal_consistency_score:.3f} "
+                f"anchor={snapshot.tracking_quality.anchor_score:.3f}"
+            )
+
+        return snapshot
+
+    def snapshot(self) -> TrackingSnapshot | None:
+        return self._last_snapshot
+
+    def _compute_monotonic_consistency(self, candidate_idx: int) -> float:
+        delta = candidate_idx - self._last_candidate_idx
+        if delta >= 0:
+            return 1.0
+        return max(0.0, 1.0 - min(1.0, abs(delta) / 8.0))
 ```
 
 ---
@@ -3607,6 +5548,7 @@ class PlaybackState(str, Enum):
 
 class ControlAction(str, Enum):
     NOOP = "noop"
+    SOFT_DUCK = "soft_duck"
     HOLD = "hold"
     RESUME = "resume"
     SEEK = "seek"
@@ -3626,6 +5568,26 @@ class PlayerCommandType(str, Enum):
     SEEK = "seek"
     STOP = "stop"
     SET_GAIN = "set_gain"
+
+
+class TrackingMode(str, Enum):
+    BOOTSTRAP = "bootstrap"
+    LOCKED = "locked"
+    WEAK_LOCKED = "weak_locked"
+    REACQUIRING = "reacquiring"
+    LOST = "lost"
+
+
+class UserReadState(str, Enum):
+    NOT_STARTED = "not_started"
+    WARMING_UP = "warming_up"
+    FOLLOWING = "following"
+    HESITATING = "hesitating"
+    PAUSED = "paused"
+    REPEATING = "repeating"
+    SKIPPING = "skipping"
+    REJOINING = "rejoining"
+    LOST = "lost"
 
 
 @dataclass(slots=True)
@@ -3743,6 +5705,72 @@ class AlignResult:
     debug_backward_run: int = 0
     debug_matched_count: int = 0
     debug_hyp_length: int = 0
+    local_match_ratio: float = 0.0
+    repeat_penalty: float = 0.0
+    emitted_at_sec: float = 0.0
+
+
+@dataclass(slots=True)
+class SignalQuality:
+    observed_at_sec: float
+    rms: float
+    peak: float
+    vad_active: bool
+    speaking_likelihood: float
+    silence_run_sec: float
+    clipping_ratio: float
+    dropout_detected: bool
+    quality_score: float
+
+
+@dataclass(slots=True)
+class TrackingQuality:
+    overall_score: float
+    observation_score: float
+    temporal_consistency_score: float
+    anchor_score: float
+    mode: TrackingMode
+    is_reliable: bool
+
+
+@dataclass(slots=True)
+class TrackingSnapshot:
+    candidate_ref_idx: int
+    committed_ref_idx: int
+    candidate_ref_time_sec: float
+    confidence: float
+    stable: bool
+    local_match_ratio: float
+    repeat_penalty: float
+    monotonic_consistency: float
+    anchor_consistency: float
+    emitted_at_sec: float
+    tracking_mode: TrackingMode
+    tracking_quality: TrackingQuality
+    matched_text: str = ""
+
+
+@dataclass(slots=True)
+class ProgressEstimate:
+    estimated_ref_idx: int
+    estimated_ref_time_sec: float
+    progress_velocity_idx_per_sec: float
+
+    event_emitted_at_sec: float
+    last_progress_at_sec: float
+    progress_age_sec: float
+
+    source_candidate_ref_idx: int
+    source_committed_ref_idx: int
+
+    tracking_mode: TrackingMode
+    tracking_quality: float
+    stable: bool
+    confidence: float
+
+    active_speaking: bool
+    recently_progressed: bool
+    user_state: UserReadState
 
 
 @dataclass(slots=True)
@@ -3753,6 +5781,31 @@ class ControlDecision:
     lead_sec: Optional[float] = None
     target_gain: Optional[float] = None
     replay_lockin: bool = False
+    confidence: float = 0.0
+    aggressiveness: str = "low"
+
+
+@dataclass(slots=True)
+class DeviceProfileSnapshot:
+    input_device_id: str
+    output_device_id: str
+    input_kind: str
+    output_kind: str
+    input_sample_rate: int
+    output_sample_rate: int
+    estimated_input_latency_ms: float
+    estimated_output_latency_ms: float
+    noise_floor_rms: float
+    input_gain_hint: str
+    reliability_tier: str
+
+
+@dataclass(slots=True)
+class LatencyCalibrationSnapshot:
+    estimated_input_latency_ms: float
+    estimated_output_latency_ms: float
+    confidence: float
+    calibrated: bool
 ```
 
 ---
@@ -3940,6 +5993,67 @@ if __name__ == "__main__":
 ```
 
 ---
+### 文件: `shadowing_app/tools/replay_session.py`
+
+```python
+from __future__ import annotations
+
+import _bootstrap  # noqa: F401
+import argparse
+from collections import Counter
+
+from shadowing.telemetry.replay_loader import ReplayLoader
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Replay and summarize a recorded runtime session events.jsonl")
+    parser.add_argument("--events-file", type=str, required=True)
+    args = parser.parse_args()
+
+    loader = ReplayLoader(args.events_file)
+
+    counts = Counter()
+    last_tracking_mode = None
+    last_user_state = None
+    max_tracking_quality = 0.0
+    max_signal = 0.0
+
+    for ev in loader:
+        counts[ev.event_type] += 1
+
+        if ev.event_type == "tracking_snapshot":
+            mode = ev.payload.get("tracking_mode")
+            tq = float(ev.payload.get("tracking_quality", {}).get("overall_score", 0.0))
+            max_tracking_quality = max(max_tracking_quality, tq)
+            last_tracking_mode = mode
+
+        elif ev.event_type == "progress_snapshot":
+            last_user_state = ev.payload.get("user_state")
+
+        elif ev.event_type == "signal_snapshot":
+            max_signal = max(max_signal, float(ev.payload.get("speaking_likelihood", 0.0)))
+
+        elif ev.event_type == "session_summary":
+            print("=== Session Summary (recorded) ===")
+            print(ev.payload)
+
+    print()
+    print("=== Replay Counters ===")
+    for k in sorted(counts):
+        print(f"{k}: {counts[k]}")
+
+    print()
+    print(f"Last tracking mode: {last_tracking_mode}")
+    print(f"Last user state: {last_user_state}")
+    print(f"Max tracking quality: {max_tracking_quality:.3f}")
+    print(f"Max speaking likelihood: {max_signal:.3f}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
 ### 文件: `shadowing_app/tools/run_shadowing.py`
 
 ```python
@@ -4109,6 +6223,7 @@ def build_config(
             "clause_boundary_bonus": 0.15,
             "cross_clause_backward_extra_penalty": 0.20,
             "debug": False,
+            "max_hyp_tokens": 16,
         },
         "control": {
             "target_lead_sec": 0.15,
@@ -4119,10 +6234,24 @@ def build_config(
             "seek_cooldown_sec": 1.20,
             "gain_following": 0.55,
             "gain_transition": 0.80,
+            "gain_soft_duck": 0.42,
             "recover_after_seek_sec": 0.60,
             "startup_grace_sec": startup_grace_sec,
             "low_confidence_hold_sec": low_confidence_hold_sec,
             "disable_seek": False,
+            "bootstrapping_sec": 1.80,
+            "guide_play_sec": 2.20,
+            "no_progress_hold_min_play_sec": 4.00,
+            "speaking_recent_sec": 0.90,
+            "progress_stale_sec": 1.10,
+            "hold_trend_sec": 0.75,
+            "hold_extra_lead_sec": 0.18,
+            "low_confidence_continue_sec": 1.40,
+            "tracking_quality_hold_min": 0.60,
+            "tracking_quality_seek_min": 0.72,
+            "resume_from_hold_event_fresh_sec": 0.45,
+            "resume_from_hold_speaking_lead_slack_sec": 0.45,
+            "reacquire_soft_duck_sec": 2.00,
         },
         "runtime": {
             "pure_playback": pure_playback,
@@ -4130,11 +6259,14 @@ def build_config(
             "audio_queue_maxsize": audio_queue_maxsize,
             "asr_event_queue_maxsize": asr_event_queue_maxsize,
             "loop_interval_sec": 0.03,
+            "telemetry_enabled": True,
+            "session_artifacts_dir": "artifacts/runtime_sessions",
         },
         "debug": {
             "enabled": False,
             "adapter_debug": False,
             "aligner_debug": False,
+            "tracking_debug": False,
         },
     }
 
@@ -4164,6 +6296,7 @@ def main() -> None:
     parser.add_argument("--pure-playback", action="store_true")
     parser.add_argument("--adapter-debug", action="store_true")
     parser.add_argument("--aligner-debug", action="store_true")
+    parser.add_argument("--tracking-debug", action="store_true")
     parser.add_argument("--disable-seek", action="store_true")
     parser.add_argument("--bypass-partial-adapter", action="store_true")
 
@@ -4273,9 +6406,10 @@ def main() -> None:
     )
 
     config["control"]["disable_seek"] = bool(args.disable_seek or args.asr == "fake")
-    config["debug"]["enabled"] = bool(args.adapter_debug or args.aligner_debug)
+    config["debug"]["enabled"] = bool(args.adapter_debug or args.aligner_debug or args.tracking_debug)
     config["debug"]["adapter_debug"] = bool(args.adapter_debug)
     config["debug"]["aligner_debug"] = bool(args.aligner_debug)
+    config["debug"]["tracking_debug"] = bool(args.tracking_debug)
     config["alignment"]["debug"] = bool(args.aligner_debug)
 
     runtime = build_runtime(config)
@@ -4285,6 +6419,7 @@ def main() -> None:
         runtime.run(lesson_id)
     except KeyboardInterrupt:
         print("\nStopped by user.")
+
 
 if __name__ == "__main__":
     main()

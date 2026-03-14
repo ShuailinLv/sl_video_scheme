@@ -16,6 +16,9 @@ class PlaybackClock:
     def __init__(self, bluetooth_output_offset_sec: float = 0.0) -> None:
         self.bluetooth_output_offset_sec = float(bluetooth_output_offset_sec)
 
+    def set_output_offset_sec(self, offset_sec: float) -> None:
+        self.bluetooth_output_offset_sec = max(0.0, float(offset_sec))
+
     def compute(
         self,
         output_buffer_dac_time_sec: float,

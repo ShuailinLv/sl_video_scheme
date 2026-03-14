@@ -122,6 +122,7 @@ def build_runtime(config: dict) -> ShadowingRuntime:
             align_cfg.get("cross_clause_backward_extra_penalty", 0.20)
         ),
         debug=bool(align_cfg.get("debug", False)),
+        max_hyp_tokens=int(align_cfg.get("max_hyp_tokens", 16)),
     )
 
     control_cfg = config.get("control", {})
@@ -134,9 +135,25 @@ def build_runtime(config: dict) -> ShadowingRuntime:
         seek_cooldown_sec=float(control_cfg.get("seek_cooldown_sec", 1.20)),
         gain_following=float(control_cfg.get("gain_following", 0.55)),
         gain_transition=float(control_cfg.get("gain_transition", 0.80)),
+        gain_soft_duck=float(control_cfg.get("gain_soft_duck", 0.42)),
         recover_after_seek_sec=float(control_cfg.get("recover_after_seek_sec", 0.60)),
         startup_grace_sec=float(control_cfg.get("startup_grace_sec", 0.80)),
         low_confidence_hold_sec=float(control_cfg.get("low_confidence_hold_sec", 0.60)),
+        bootstrapping_sec=float(control_cfg.get("bootstrapping_sec", 1.80)),
+        guide_play_sec=float(control_cfg.get("guide_play_sec", 2.20)),
+        no_progress_hold_min_play_sec=float(control_cfg.get("no_progress_hold_min_play_sec", 4.00)),
+        speaking_recent_sec=float(control_cfg.get("speaking_recent_sec", 0.90)),
+        progress_stale_sec=float(control_cfg.get("progress_stale_sec", 1.10)),
+        hold_trend_sec=float(control_cfg.get("hold_trend_sec", 0.75)),
+        hold_extra_lead_sec=float(control_cfg.get("hold_extra_lead_sec", 0.18)),
+        low_confidence_continue_sec=float(control_cfg.get("low_confidence_continue_sec", 1.40)),
+        tracking_quality_hold_min=float(control_cfg.get("tracking_quality_hold_min", 0.60)),
+        tracking_quality_seek_min=float(control_cfg.get("tracking_quality_seek_min", 0.72)),
+        resume_from_hold_event_fresh_sec=float(control_cfg.get("resume_from_hold_event_fresh_sec", 0.45)),
+        resume_from_hold_speaking_lead_slack_sec=float(
+            control_cfg.get("resume_from_hold_speaking_lead_slack_sec", 0.45)
+        ),
+        reacquire_soft_duck_sec=float(control_cfg.get("reacquire_soft_duck_sec", 2.00)),
     )
 
     controller = StateMachineController(
