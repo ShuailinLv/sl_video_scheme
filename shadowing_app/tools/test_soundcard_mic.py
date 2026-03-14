@@ -12,8 +12,8 @@ def main():
         for i, mic in enumerate(mics):
             print(f"  [{i}] {mic.name!r}")
 
-        mic = mics[0]   # 先测你的内置麦阵列
-        print(f"\nusing: {mic.name!r}")
+        mic = mics[0]
+        print(f"\\nusing: {mic.name!r}")
 
         with mic.recorder(samplerate=48000, channels=1) as rec:
             print("start recording... speak now")

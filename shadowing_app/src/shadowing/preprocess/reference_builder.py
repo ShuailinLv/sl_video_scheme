@@ -1,26 +1,16 @@
 from __future__ import annotations
 
-from shadowing.types import ReferenceMap, RefToken
+from shadowing.types import RefToken, ReferenceMap
 
 
 class ReferenceBuilder:
-    """
-    把 provider 返回的字符级时间戳转成统一内部结构。
-    会过滤掉不参与对齐的字符：
-    - 空白
-    - 换行
-    - 常见中英文标点
-    """
-
-    _DROP_CHARS = set(
-        [
-            " ", "\t", "\n", "\r", "\u3000",
-            "，", "。", "！", "？", "；", "：", "、",
-            ",", ".", "!", "?", ";", ":", "\"", "'", "“", "”", "‘", "’",
-            "（", "）", "(", ")", "[", "]", "【", "】", "<", ">", "《", "》",
-            "-", "—", "…", "|", "/", "\\",
-        ]
-    )
+    _DROP_CHARS = {
+        " ", "\t", "\n", "\r", "\u3000",
+        "，", "。", "！", "？", "；", "：", "、",
+        ",", ".", "!", "?", ";", ":", '"', "'", "“", "”", "‘", "’",
+        "（", "）", "(", ")", "[", "]", "【", "】", "<", ">", "《", "》",
+        "-", "—", "…", "|", "/", "\\",
+    }
 
     def build(
         self,
@@ -31,36 +21,29 @@ class ReferenceBuilder:
         ends: list[float],
         sentence_ids: list[int],
         clause_ids: list[int],
+        total_duration_sec: float,
     ) -> ReferenceMap:
         tokens: list[RefToken] = []
-
-        filtered_idx = 0
+        next_idx = 0
         for ch, py, ts, te, sid, cid in zip(
             chars, pinyins, starts, ends, sentence_ids, clause_ids, strict=True
         ):
-            if not ch:
+            if not ch or ch in self._DROP_CHARS or not ch.strip():
                 continue
-            if ch in self._DROP_CHARS:
-                continue
-            if ch.strip() == "":
-                continue
-
             tokens.append(
                 RefToken(
-                    idx=filtered_idx,
+                    idx=next_idx,
                     char=ch,
                     pinyin=py,
-                    t_start=ts,
-                    t_end=te,
-                    sentence_id=sid,
-                    clause_id=cid,
+                    t_start=float(ts),
+                    t_end=float(te),
+                    sentence_id=int(sid),
+                    clause_id=int(cid),
                 )
             )
-            filtered_idx += 1
-
-        total_duration = ends[-1] if ends else 0.0
+            next_idx += 1
         return ReferenceMap(
             lesson_id=lesson_id,
             tokens=tokens,
-            total_duration_sec=total_duration,
+            total_duration_sec=float(total_duration_sec),
         )

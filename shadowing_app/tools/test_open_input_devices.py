@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import _bootstrap  # noqa: F401
 
@@ -18,7 +17,7 @@ def main() -> None:
         name = str(dev["name"])
         max_in = int(dev["max_input_channels"])
         default_sr = int(float(dev["default_samplerate"]))
-        print(f"\n[{ordinal}] raw={raw_idx} name={name!r} max_in={max_in} default_sr={default_sr}")
+        print(f"\\n[{ordinal}] raw={raw_idx} name={name!r} max_in={max_in} default_sr={default_sr}")
 
         candidate_sample_rates = []
         for sr in [48000, 44100, default_sr]:

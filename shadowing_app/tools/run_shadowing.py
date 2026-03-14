@@ -1,6 +1,6 @@
 from __future__ import annotations
-import _bootstrap  # noqa: F401
 
+import _bootstrap  # noqa: F401
 import argparse
 import json
 import os
@@ -8,15 +8,12 @@ import re
 from pathlib import Path
 
 from shadowing.bootstrap import build_runtime
-from shadowing.realtime.asr.fake_asr_provider import FakeASRProvider
-
-
-DEFAULT_TEXT_FILE = r"D:\sl_video_scheme\shadowing_app\assets\raw_texts\演讲稿3.txt"
+from shadowing.realtime.capture.device_utils import pick_working_input_config
 
 
 def slugify_filename_stem(stem: str) -> str:
     stem = stem.strip()
-    stem = re.sub(r'[\\/:\*\?"<>\|]+', "_", stem)
+    stem = re.sub(r'[\\/:*?"<>|]+', "_", stem)
     stem = re.sub(r"\s+", "_", stem)
     stem = stem.strip("._")
     return stem or "lesson"
@@ -28,56 +25,18 @@ def validate_lesson_assets(lesson_dir: Path) -> None:
     chunks_dir = lesson_dir / "chunks"
 
     missing: list[str] = []
-    if not manifest.exists():
-        missing.append(str(manifest))
-    if not ref_map.exists():
-        missing.append(str(ref_map))
-    if not chunks_dir.exists():
-        missing.append(str(chunks_dir))
+    for p in (manifest, ref_map, chunks_dir):
+        if not p.exists():
+            missing.append(str(p))
 
     if missing:
-        msg = "\n".join(missing)
         raise FileNotFoundError(
-            "Lesson assets not found. Please run preprocess first.\n"
-            f"Missing:\n{msg}"
+            "Lesson assets not found. Please run preprocess first.\n" + "\n".join(missing)
         )
 
 
 def load_manifest(lesson_dir: Path) -> dict:
-    manifest_path = lesson_dir / "lesson_manifest.json"
-    return json.loads(manifest_path.read_text(encoding="utf-8"))
-
-
-def resolve_recording_config(
-    manual_device: int | None,
-    manual_samplerate: int | None,
-) -> dict:
-    """
-    录音设备选择策略：
-    1. 如果用户显式传了 --input-device，则优先使用该设备
-    2. 否则走自动探测 pick_working_input_config()
-    """
-    from shadowing.realtime.capture.device_utils import pick_working_input_config
-
-    if manual_device is not None:
-        return {
-            "device": manual_device,
-            "samplerate": int(manual_samplerate or 48000),
-            "channels": 1,
-            "dtype": "float32",
-        }
-
-    rec_cfg = pick_working_input_config()
-    if rec_cfg is None:
-        raise RuntimeError(
-            "No working input device config found. "
-            "Try specifying --input-device manually, e.g. --input-device 9"
-        )
-
-    if manual_samplerate is not None:
-        rec_cfg["samplerate"] = int(manual_samplerate)
-
-    return rec_cfg
+    return json.loads((lesson_dir / "lesson_manifest.json").read_text(encoding="utf-8"))
 
 
 def collect_sherpa_paths() -> dict:
@@ -92,11 +51,17 @@ def collect_sherpa_paths() -> dict:
 def validate_sherpa_paths(paths: dict) -> None:
     missing_keys: list[str] = []
     missing_files: list[str] = []
+    env_map = {
+        "tokens": "SHERPA_TOKENS",
+        "encoder": "SHERPA_ENCODER",
+        "decoder": "SHERPA_DECODER",
+        "joiner": "SHERPA_JOINER",
+    }
 
     for key in ("tokens", "encoder", "decoder", "joiner"):
         value = (paths.get(key) or "").strip()
         if not value:
-            missing_keys.append(key)
+            missing_keys.append(env_map[key])
             continue
         if not Path(value).expanduser().exists():
             missing_files.append(f"{key}: {value}")
@@ -104,55 +69,66 @@ def validate_sherpa_paths(paths: dict) -> None:
     if missing_keys or missing_files:
         parts: list[str] = []
         if missing_keys:
-            parts.append(
-                "Missing sherpa env vars: "
-                + ", ".join(
-                    {
-                        "tokens": "SHERPA_TOKENS",
-                        "encoder": "SHERPA_ENCODER",
-                        "decoder": "SHERPA_DECODER",
-                        "joiner": "SHERPA_JOINER",
-                    }[k]
-                    for k in missing_keys
-                )
-            )
+            parts.append("Missing sherpa env vars: " + ", ".join(missing_keys))
         if missing_files:
             parts.append("Non-existent sherpa files:\n" + "\n".join(missing_files))
-
-        raise FileNotFoundError(
-            "Sherpa model configuration is invalid.\n" + "\n".join(parts)
-        )
+        raise FileNotFoundError("Sherpa model configuration is invalid.\n" + "\n".join(parts))
 
 
 def build_config(
     lesson_base_dir: str,
-    input_device: int | None,
+    input_device: int | str | None,
     input_samplerate: int,
     asr_mode: str,
     bluetooth_offset_sec: float,
-    debug: bool,
     playback_sample_rate: int,
-    pure_playback: bool,
-    ducking_only: bool,
-    disable_seek: bool,
-    disable_hold: bool,
     sherpa_paths: dict,
+    pure_playback: bool,
+    lesson_text_for_fake: str,
+    startup_grace_sec: float,
+    low_confidence_hold_sec: float,
+    use_partial_adapter: bool,
+    audio_queue_maxsize: int,
+    asr_event_queue_maxsize: int,
+    output_device: int | None,
+    playback_latency: str,
+    playback_blocksize: int,
+    capture_backend: str,
+    capture_latency: str,
+    capture_blocksize: int,
+    capture_include_loopback: bool,
+    capture_debug_level_meter: bool,
+    capture_debug_level_every_n_blocks: int,
+    asr_debug_feed: bool,
+    asr_debug_feed_every_n_chunks: int,
 ) -> dict:
     return {
         "lesson_base_dir": lesson_base_dir,
         "playback": {
             "sample_rate": playback_sample_rate,
-            "device": None,
+            "channels": 1,
+            "device": output_device,
             "bluetooth_output_offset_sec": bluetooth_offset_sec,
+            "latency": playback_latency,
+            "blocksize": playback_blocksize,
         },
         "capture": {
+            "backend": capture_backend,
             "device_sample_rate": input_samplerate,
             "target_sample_rate": 16000,
+            "channels": 1,
             "device": input_device,
-            "prefer_soundcard_on_windows": True,
+            "dtype": "float32",
+            "blocksize": capture_blocksize,
+            "block_frames": capture_blocksize if capture_blocksize > 0 else 1440,
+            "latency": capture_latency,
+            "include_loopback": capture_include_loopback,
+            "debug_level_meter": capture_debug_level_meter,
+            "debug_level_every_n_blocks": capture_debug_level_every_n_blocks,
         },
         "asr": {
             "mode": asr_mode,
+            "sample_rate": 16000,
             "hotwords": "",
             "tokens": sherpa_paths["tokens"],
             "encoder": sherpa_paths["encoder"],
@@ -166,95 +142,103 @@ def build_config(
             "rule1_min_trailing_silence": 10.0,
             "rule2_min_trailing_silence": 10.0,
             "rule3_min_utterance_length": 60.0,
+            "emit_partial_interval_sec": 0.08,
+            "enable_endpoint": True,
+            "debug_feed": asr_debug_feed,
+            "debug_feed_every_n_chunks": asr_debug_feed_every_n_chunks,
+            "reference_text": lesson_text_for_fake if asr_mode == "fake" else "",
+            "chars_per_sec": 4.0,
+            "emit_final_on_endpoint": True,
+            "bytes_per_sample": 2,
+            "channels": 1,
+            "vad_rms_threshold": 0.01,
+            "vad_min_active_ms": 30.0,
+            "scripted_steps": [],
         },
-        "debug": {
-            "enabled": debug,
-            "heartbeat_sec": 1.0,
-            "print_asr": True,
-            "print_alignment": True,
-            "print_decision": True,
-            "print_player_status": True,
-            "print_reference_head": True,
+        "alignment": {
+            "window_back": 8,
+            "window_ahead": 40,
+            "stable_frames": 2,
+            "min_confidence": 0.60,
+            "backward_lock_frames": 3,
+            "clause_boundary_bonus": 0.15,
+            "cross_clause_backward_extra_penalty": 0.20,
+            "debug": False,
+        },
+        "control": {
+            "target_lead_sec": 0.15,
+            "hold_if_lead_sec": 0.90,
+            "resume_if_lead_sec": 0.28,
+            "seek_if_lag_sec": -1.80,
+            "min_confidence": 0.75,
+            "seek_cooldown_sec": 1.20,
+            "gain_following": 0.55,
+            "gain_transition": 0.80,
+            "recover_after_seek_sec": 0.60,
+            "startup_grace_sec": startup_grace_sec,
+            "low_confidence_hold_sec": low_confidence_hold_sec,
+            "disable_seek": False,
         },
         "runtime": {
             "pure_playback": pure_playback,
+            "use_partial_adapter": use_partial_adapter,
+            "audio_queue_maxsize": audio_queue_maxsize,
+            "asr_event_queue_maxsize": asr_event_queue_maxsize,
+            "loop_interval_sec": 0.03,
         },
-        "control": {
-            "ducking_only": ducking_only,
-            "disable_seek": disable_seek,
-            "disable_hold": disable_hold,
+        "debug": {
+            "enabled": False,
+            "adapter_debug": False,
+            "aligner_debug": False,
         },
     }
 
 
+def _parse_input_device_arg(raw_value: str | None) -> int | str | None:
+    if raw_value is None:
+        return None
+    raw = str(raw_value).strip()
+    if raw == "":
+        return None
+    if raw.isdigit():
+        return int(raw)
+    return raw
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Run the shadowing app for a local txt speech lesson."
-    )
-    parser.add_argument(
-        "--text-file",
-        type=str,
-        default=DEFAULT_TEXT_FILE,
-        help="Path to the original txt file. Lesson id is derived from the file name.",
-    )
-    parser.add_argument(
-        "--lesson-base-dir",
-        type=str,
-        default="assets/lessons",
-        help="Base dir where preprocessed lesson assets are stored.",
-    )
-    parser.add_argument(
-        "--asr",
-        type=str,
-        default="fake",
-        choices=["fake", "sherpa"],
-        help="ASR mode.",
-    )
-    parser.add_argument(
-        "--bluetooth-offset-sec",
-        type=float,
-        default=0.18,
-        help="Estimated Bluetooth playback offset.",
-    )
-    parser.add_argument(
-        "--input-device",
-        type=int,
-        default=None,
-        help="Manually specify recording input device index. "
-             "Recommended on Windows when auto-picked device fails.",
-    )
-    parser.add_argument(
-        "--input-samplerate",
-        type=int,
-        default=None,
-        help="Override recording input sample rate. "
-             "Useful if a device fails at its default rate.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable runtime debug logs.",
-    )
-    parser.add_argument(
-        "--pure-playback",
-        action="store_true",
-        help="Pure playback debug mode: disable controller intervention and force gain=1.0.",
-    )
-    parser.add_argument(
-        "--ducking-only",
-        action="store_true",
-        help="Only apply ducking/gain control. Disable resume/hold/seek actions.",
-    )
-    parser.add_argument(
-        "--disable-seek",
-        action="store_true",
-        help="Disable SEEK decisions.",
-    )
-    parser.add_argument(
-        "--disable-hold",
-        action="store_true",
-        help="Disable HOLD decisions.",
-    )
+    parser = argparse.ArgumentParser(description="Run the shadowing app for a local txt speech lesson.")
+    parser.add_argument("--text-file", type=str, required=True)
+    parser.add_argument("--lesson-base-dir", type=str, default="assets/lessons")
+    parser.add_argument("--asr", type=str, default="fake", choices=["fake", "sherpa"])
+    parser.add_argument("--bluetooth-offset-sec", type=float, default=0.18)
+
+    parser.add_argument("--input-device", type=str, default=None)
+    parser.add_argument("--input-samplerate", type=int, default=None)
+    parser.add_argument("--output-device", type=int, default=None)
+
+    parser.add_argument("--pure-playback", action="store_true")
+    parser.add_argument("--adapter-debug", action="store_true")
+    parser.add_argument("--aligner-debug", action="store_true")
+    parser.add_argument("--disable-seek", action="store_true")
+    parser.add_argument("--bypass-partial-adapter", action="store_true")
+
+    parser.add_argument("--audio-queue-maxsize", type=int, default=150)
+    parser.add_argument("--asr-event-queue-maxsize", type=int, default=64)
+    parser.add_argument("--startup-grace-sec", type=float, default=0.80)
+    parser.add_argument("--low-confidence-hold-sec", type=float, default=0.60)
+
+    parser.add_argument("--playback-latency", type=str, default="high")
+    parser.add_argument("--playback-blocksize", type=int, default=2048)
+
+    parser.add_argument("--capture-backend", type=str, default="sounddevice", choices=["sounddevice", "soundcard"])
+    parser.add_argument("--capture-latency", type=str, default="low")
+    parser.add_argument("--capture-blocksize", type=int, default=0)
+    parser.add_argument("--capture-include-loopback", action="store_true")
+    parser.add_argument("--capture-debug-level-meter", action="store_true")
+    parser.add_argument("--capture-debug-level-every", type=int, default=20)
+
+    parser.add_argument("--asr-debug-feed", action="store_true")
+    parser.add_argument("--asr-debug-feed-every", type=int, default=20)
 
     args = parser.parse_args()
 
@@ -262,80 +246,100 @@ def main() -> None:
     if not text_path.exists():
         raise FileNotFoundError(f"Text file not found: {text_path}")
 
+    lesson_text = text_path.read_text(encoding="utf-8").strip()
+    if not lesson_text:
+        raise ValueError(f"Text file is empty: {text_path}")
+
     lesson_id = slugify_filename_stem(text_path.stem)
+
     lesson_base_dir = Path(args.lesson_base_dir).resolve()
     lesson_dir = lesson_base_dir / lesson_id
-
     validate_lesson_assets(lesson_dir)
+
     manifest = load_manifest(lesson_dir)
     playback_sample_rate = int(manifest["sample_rate_out"])
 
-    rec_cfg = resolve_recording_config(
-        manual_device=args.input_device,
-        manual_samplerate=args.input_samplerate,
-    )
+    parsed_input_device = _parse_input_device_arg(args.input_device)
+
+    if args.capture_backend == "sounddevice":
+        rec_cfg = pick_working_input_config(
+            preferred_device=parsed_input_device if isinstance(parsed_input_device, int) else None
+        ) or {
+            "device": parsed_input_device,
+            "samplerate": args.input_samplerate or 48000,
+        }
+        if args.input_samplerate is not None:
+            rec_cfg["samplerate"] = args.input_samplerate
+        effective_input_device: int | str | None = rec_cfg["device"]
+        effective_input_samplerate = int(rec_cfg["samplerate"])
+    else:
+        effective_input_device = parsed_input_device
+        effective_input_samplerate = int(args.input_samplerate or 48000)
 
     sherpa_paths = collect_sherpa_paths()
-
-    # 纯播放模式不需要 recorder / sherpa 真的工作
     if args.asr == "sherpa" and not args.pure_playback:
         validate_sherpa_paths(sherpa_paths)
 
-    config = build_config(
-        lesson_base_dir=str(lesson_base_dir),
-        input_device=rec_cfg["device"],
-        input_samplerate=int(rec_cfg["samplerate"]),
-        asr_mode=args.asr,
-        bluetooth_offset_sec=args.bluetooth_offset_sec,
-        debug=args.debug,
-        playback_sample_rate=playback_sample_rate,
-        pure_playback=args.pure_playback,
-        ducking_only=args.ducking_only,
-        disable_seek=args.disable_seek,
-        disable_hold=args.disable_hold,
-        sherpa_paths=sherpa_paths,
+    if args.capture_backend == "soundcard" and isinstance(parsed_input_device, int):
+        print(
+            "[RUN-NOTE] soundcard backend uses soundcard microphone list index, "
+            "not sounddevice raw device index."
+        )
+
+    print(
+        f"[RUN-CONFIG] lesson_id={lesson_id} "
+        f"capture_backend={args.capture_backend} "
+        f"input_device={effective_input_device!r} "
+        f"input_samplerate={effective_input_samplerate} "
+        f"output_device={args.output_device!r} "
+        f"playback_sr={playback_sample_rate} "
+        f"playback_latency={args.playback_latency} "
+        f"playback_blocksize={int(args.playback_blocksize)} "
+        f"capture_latency={args.capture_latency} "
+        f"capture_blocksize={int(args.capture_blocksize)}"
     )
 
-    print("=== Run config ===")
-    print(f"text file       : {text_path}")
-    print(f"lesson id       : {lesson_id}")
-    print(f"lesson dir      : {lesson_dir}")
-    print(f"input device    : {rec_cfg['device']}")
-    print(f"input sr        : {rec_cfg['samplerate']}")
-    print(f"playback sr     : {playback_sample_rate}")
-    print(f"asr mode        : {args.asr}")
-    print(f"bt offset sec   : {args.bluetooth_offset_sec}")
-    print(f"debug           : {args.debug}")
-    print(f"pure playback   : {args.pure_playback}")
-    print(f"ducking only    : {args.ducking_only}")
-    print(f"disable seek    : {args.disable_seek}")
-    print(f"disable hold    : {args.disable_hold}")
-    print()
+    config = build_config(
+        lesson_base_dir=str(lesson_base_dir),
+        input_device=effective_input_device,
+        input_samplerate=effective_input_samplerate,
+        asr_mode=args.asr,
+        bluetooth_offset_sec=args.bluetooth_offset_sec,
+        playback_sample_rate=playback_sample_rate,
+        sherpa_paths=sherpa_paths,
+        pure_playback=args.pure_playback,
+        lesson_text_for_fake=lesson_text,
+        startup_grace_sec=float(args.startup_grace_sec),
+        low_confidence_hold_sec=float(args.low_confidence_hold_sec),
+        use_partial_adapter=not bool(args.bypass_partial_adapter),
+        audio_queue_maxsize=int(args.audio_queue_maxsize),
+        asr_event_queue_maxsize=int(args.asr_event_queue_maxsize),
+        output_device=args.output_device,
+        playback_latency=args.playback_latency,
+        playback_blocksize=int(args.playback_blocksize),
+        capture_backend=args.capture_backend,
+        capture_latency=args.capture_latency,
+        capture_blocksize=int(args.capture_blocksize),
+        capture_include_loopback=bool(args.capture_include_loopback),
+        capture_debug_level_meter=bool(args.capture_debug_level_meter),
+        capture_debug_level_every_n_blocks=int(args.capture_debug_level_every),
+        asr_debug_feed=bool(args.asr_debug_feed),
+        asr_debug_feed_every_n_chunks=int(args.asr_debug_feed_every),
+    )
+
+    config["control"]["disable_seek"] = bool(args.disable_seek or args.asr == "fake")
+    config["debug"]["enabled"] = bool(args.adapter_debug or args.aligner_debug)
+    config["debug"]["adapter_debug"] = bool(args.adapter_debug)
+    config["debug"]["aligner_debug"] = bool(args.aligner_debug)
+    config["alignment"]["debug"] = bool(args.aligner_debug)
 
     runtime = build_runtime(config)
 
-    if args.asr == "fake" and not args.pure_playback:
-        lesson_text = text_path.read_text(encoding="utf-8").strip()
-        runtime.orchestrator.asr = FakeASRProvider.from_reference_text(
-            reference_text=lesson_text,
-            chars_per_step=4,
-            step_interval_sec=0.25,
-            lag_sec=0.4,
-            tail_final=True,
-        )
-
-    if hasattr(runtime.orchestrator, "configure_debug"):
-        runtime.orchestrator.configure_debug(config["debug"])
-
-    print("Starting shadowing runtime...")
-    print("Press Ctrl+C to stop.")
-    print()
-
+    print("Starting shadowing runtime. Press Ctrl+C to stop.")
     try:
         runtime.run(lesson_id)
     except KeyboardInterrupt:
         print("\nStopped by user.")
-
 
 if __name__ == "__main__":
     main()

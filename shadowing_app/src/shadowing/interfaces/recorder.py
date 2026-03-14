@@ -6,13 +6,10 @@ from collections.abc import Callable
 
 class Recorder(ABC):
     @abstractmethod
-    def start(self, on_audio_frame: Callable[[bytes], None]) -> None:
-        raise NotImplementedError
+    def start(self, on_audio_frame: Callable[[bytes], None]) -> None: ...
 
     @abstractmethod
-    def stop(self) -> None:
-        raise NotImplementedError
+    def stop(self) -> None: ...
 
     @abstractmethod
-    def close(self) -> None:
-        raise NotImplementedError
+    def close(self) -> None: ...

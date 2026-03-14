@@ -1,11 +1,10 @@
 import _bootstrap  # noqa: F401
 
 from shadowing.realtime.capture.device_utils import (
-    print_input_devices,
     get_default_input_device_index,
     pick_working_input_config,
+    print_input_devices,
 )
-
 
 
 def main() -> None:

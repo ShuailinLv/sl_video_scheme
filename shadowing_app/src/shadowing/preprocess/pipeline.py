@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-from shadowing.interfaces.tts import TTSProvider
 from shadowing.interfaces.repository import LessonRepository
+from shadowing.interfaces.tts import TTSProvider
 
 
 class LessonPreprocessPipeline:
-    def __init__(
-        self,
-        tts_provider: TTSProvider,
-        repo: LessonRepository,
-    ) -> None:
+    def __init__(self, tts_provider: TTSProvider, repo: LessonRepository) -> None:
         self.tts_provider = tts_provider
         self.repo = repo
 

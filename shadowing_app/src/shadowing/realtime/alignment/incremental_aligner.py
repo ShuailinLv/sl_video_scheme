@@ -1,96 +1,89 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from math import exp
 
 from shadowing.interfaces.aligner import Aligner
-from shadowing.types import AsrEvent, AsrEventType, AlignResult
+from shadowing.realtime.alignment.scoring import AlignmentScorer
+from shadowing.realtime.alignment.window_selector import WindowSelector
+from shadowing.types import (
+    AlignResult,
+    AsrEvent,
+    AsrEventType,
+    CandidateAlignment,
+    HypToken,
+    ReferenceMap,
+)
 
 
-@dataclass
+@dataclass(slots=True)
 class _RefTokenView:
     idx: int
     char: str
     pinyin: str
-    t0: float
+    t_start: float
+    t_end: float
+    sentence_id: int
+    clause_id: int
+
+
+@dataclass(slots=True)
+class _CommitState:
+    committed_idx: int = 0
+    stable_run: int = 0
+    backward_run: int = 0
+    last_candidate_idx: int = 0
+    generation: int = 0
+    recovering_after_seek: bool = False
 
 
 class IncrementalAligner(Aligner):
-    """
-    面向真人 partial 的增量对齐器。
-
-    特点：
-    - 支持轻微漏字 / 吞字
-    - candidate 单调前进时可推动 committed
-    - 支持 replay / rewind 搜索
-    - 支持 replay lock-in：第二遍从头读时，允许 committed 切换到 replay 会话
-    """
-
     def __init__(
         self,
-        search_backoff_tokens: int = 12,
-        search_ahead_tokens: int = 48,
-        stable_min_advance: int = 2,
-        fuzzy_missing_tolerance: int = 2,
-        replay_head_tokens: int = 48,
-        replay_trigger_max_chars: int = 12,
-        replay_min_prefix_chars: int = 2,
-        replay_min_committed_idx: int = 8,
-        replay_lockin_min_run: int = 3,
-        replay_lockin_confidence: float = 0.90,
+        window_back: int = 8,
+        window_ahead: int = 40,
+        stable_frames: int = 2,
+        min_confidence: float = 0.60,
+        backward_lock_frames: int = 3,
+        clause_boundary_bonus: float = 0.15,
+        cross_clause_backward_extra_penalty: float = 0.20,
+        debug: bool = False,
     ) -> None:
-        self.search_backoff_tokens = int(search_backoff_tokens)
-        self.search_ahead_tokens = int(search_ahead_tokens)
-        self.stable_min_advance = int(stable_min_advance)
-        self.fuzzy_missing_tolerance = int(fuzzy_missing_tolerance)
+        self.window_selector = WindowSelector(look_back=window_back, look_ahead=window_ahead)
+        self.scorer = AlignmentScorer()
+        self.stable_frames = int(stable_frames)
+        self.min_confidence = float(min_confidence)
+        self.backward_lock_frames = int(backward_lock_frames)
+        self.clause_boundary_bonus = float(clause_boundary_bonus)
+        self.cross_clause_backward_extra_penalty = float(cross_clause_backward_extra_penalty)
+        self.debug = bool(debug)
 
-        self.replay_head_tokens = int(replay_head_tokens)
-        self.replay_trigger_max_chars = int(replay_trigger_max_chars)
-        self.replay_min_prefix_chars = int(replay_min_prefix_chars)
-
-        self.replay_min_committed_idx = int(replay_min_committed_idx)
-        self.replay_lockin_min_run = int(replay_lockin_min_run)
-        self.replay_lockin_confidence = float(replay_lockin_confidence)
-
-        self.ref_map = None
+        self.ref_map: ReferenceMap | None = None
         self.ref_tokens: list[_RefTokenView] = []
+        self.state = _CommitState()
 
-        self._committed_idx = 0
-        self._candidate_idx = 0
-        self._last_candidate_idx = 0
-        self._last_candidate_run = 0
-
-        self._head_norm = ""
-
-        # replay 状态
-        self._replay_active = False
-        self._replay_run_len = 0
-        self._replay_last_candidate = -1
-
-    def reset(self, ref_map) -> None:
-        self.ref_map = ref_map
-        self.ref_tokens = []
-
-        for i, tok in enumerate(ref_map.tokens):
-            self.ref_tokens.append(
-                _RefTokenView(
-                    idx=i,
-                    char=str(getattr(tok, "char", "")),
-                    pinyin=str(getattr(tok, "pinyin", "")),
-                    t0=self._extract_token_time(tok, fallback_index=i),
-                )
+    def reset(self, reference_map: ReferenceMap) -> None:
+        self.ref_map = reference_map
+        self.ref_tokens = [
+            _RefTokenView(
+                idx=t.idx,
+                char=t.char,
+                pinyin=t.pinyin,
+                t_start=t.t_start,
+                t_end=t.t_end,
+                sentence_id=t.sentence_id,
+                clause_id=t.clause_id,
             )
+            for t in reference_map.tokens
+        ]
+        self.state = _CommitState()
 
-        self._committed_idx = 0
-        self._candidate_idx = 0
-        self._last_candidate_idx = 0
-        self._last_candidate_run = 0
-
-        self._replay_active = False
-        self._replay_run_len = 0
-        self._replay_last_candidate = -1
-
-        self._head_norm = "".join(t.char for t in self.ref_tokens[: self.replay_head_tokens])
+    def on_playback_generation_changed(self, generation: int) -> None:
+        self.state.generation = int(generation)
+        self.state.stable_run = 0
+        self.state.backward_run = 0
+        self.state.last_candidate_idx = self.state.committed_idx
+        self.state.recovering_after_seek = True
 
     def update(self, event: AsrEvent) -> AlignResult | None:
         if self.ref_map is None or not self.ref_tokens:
@@ -99,247 +92,232 @@ class IncrementalAligner(Aligner):
         if event.event_type not in (AsrEventType.PARTIAL, AsrEventType.FINAL):
             return None
 
-        norm = event.normalized_text or ""
-        py = event.pinyin_seq or []
+        if len(event.chars) != len(event.pinyin_seq):
+            min_len = min(len(event.chars), len(event.pinyin_seq))
+            chars = event.chars[:min_len]
+            pinyin_seq = event.pinyin_seq[:min_len]
+        else:
+            chars = event.chars
+            pinyin_seq = event.pinyin_seq
 
-        if not norm and not py:
+        if not chars:
             return None
 
-        cand_idx, confidence, matched_text, replay_mode = self._locate_candidate(norm, py)
+        hyp_tokens = [HypToken(char=c, pinyin=py) for c, py in zip(chars, pinyin_seq, strict=True)]
+        window_tokens, window_start, window_end = self.window_selector.select(
+            self.ref_map, self.state.committed_idx
+        )
+        candidate = self._align_window(
+            hyp_tokens=hyp_tokens,
+            ref_tokens=window_tokens,
+            ref_offset=window_start,
+        )
+        stable = self._observe_candidate(candidate, event.event_type)
 
-        stable = False
+        ref_time = self.ref_tokens[candidate.ref_end_idx].t_start
+        matched_text = "".join(
+            self.ref_tokens[i].char
+            for i in candidate.matched_ref_indices
+            if 0 <= i < len(self.ref_tokens)
+        )
+        matched_pinyin = [
+            self.ref_tokens[i].pinyin
+            for i in candidate.matched_ref_indices
+            if 0 <= i < len(self.ref_tokens)
+        ]
 
-        # FINAL：只做前向提交，不做 replay 回退切换
-        if event.event_type == AsrEventType.FINAL:
-            self._clear_replay_if_needed(finalizing=True)
-            if cand_idx >= self._committed_idx:
-                self._committed_idx = cand_idx
-                stable = True
-
-        else:
-            # 先处理 replay 会话
-            if replay_mode and cand_idx < self._committed_idx:
-                self._update_replay_state(cand_idx, confidence)
-
-                if self._should_lockin_replay(cand_idx, confidence):
-                    self._replay_active = True
-                    self._committed_idx = cand_idx
-                    stable = True
-            else:
-                # 一旦又回到 committed 后方，退出 replay 会话
-                if cand_idx >= self._committed_idx:
-                    self._clear_replay_if_needed(finalizing=False)
-
-                if cand_idx > self._last_candidate_idx:
-                    self._last_candidate_run += 1
-                elif cand_idx == self._last_candidate_idx:
-                    self._last_candidate_run += 1
-                else:
-                    self._last_candidate_run = 0
-
-                if cand_idx >= self._committed_idx:
-                    if confidence >= 0.70 and (cand_idx - self._committed_idx) >= self.stable_min_advance:
-                        self._committed_idx = cand_idx
-                        stable = True
-                    elif confidence >= 0.90 and cand_idx > self._committed_idx:
-                        self._committed_idx = cand_idx
-                        stable = True
-                    elif self._last_candidate_run >= 2 and confidence >= 0.80 and cand_idx >= self._committed_idx:
-                        self._committed_idx = cand_idx
-                        stable = True
-
-        self._candidate_idx = cand_idx
-        self._last_candidate_idx = cand_idx
-
-        ref_time_sec = self._token_time(cand_idx)
+        if self.debug:
+            print(
+                "[ALIGN] "
+                f"committed={self.state.committed_idx} "
+                f"candidate={candidate.ref_end_idx} "
+                f"score={candidate.score:.3f} "
+                f"conf={candidate.confidence:.3f} "
+                f"stable={stable} "
+                f"backward={candidate.backward_jump} "
+                f"matched_n={len(candidate.matched_ref_indices)} "
+                f"hyp_n={len(hyp_tokens)} "
+                f"mode={candidate.mode}"
+            )
 
         return AlignResult(
-            committed_ref_idx=self._committed_idx,
-            candidate_ref_idx=self._candidate_idx,
-            ref_time_sec=ref_time_sec,
-            confidence=confidence,
+            committed_ref_idx=self.state.committed_idx,
+            candidate_ref_idx=candidate.ref_end_idx,
+            ref_time_sec=ref_time,
+            confidence=candidate.confidence,
             stable=stable,
             matched_text=matched_text,
+            matched_pinyin=matched_pinyin,
+            window_start_idx=window_start,
+            window_end_idx=max(window_start, window_end - 1),
+            alignment_mode=candidate.mode,
+            backward_jump_detected=candidate.backward_jump,
+            debug_score=candidate.score,
+            debug_stable_run=self.state.stable_run,
+            debug_backward_run=self.state.backward_run,
+            debug_matched_count=len(candidate.matched_ref_indices),
+            debug_hyp_length=len(hyp_tokens),
         )
 
-    def _locate_candidate(self, norm: str, py: Sequence[str]) -> tuple[int, float, str, bool]:
-        replay_mode = self._should_replay_search(norm, py)
+    def _observe_candidate(self, candidate: CandidateAlignment, event_type: AsrEventType) -> bool:
+        stable = False
 
-        if replay_mode:
-            start = 0
-            end = min(len(self.ref_tokens) - 1, self.replay_head_tokens)
-        else:
-            start = max(0, self._committed_idx - self.search_backoff_tokens)
-            end = min(len(self.ref_tokens) - 1, self._committed_idx + self.search_ahead_tokens)
-
-        best_idx = self._committed_idx
-        best_score = -1.0
-        best_text = ""
-
-        for i in range(start, end + 1):
-            score, matched = self._score_at(i, norm, py)
-            if score > best_score:
-                best_score = score
-                best_idx = i
-                best_text = matched
-
-        conf = max(0.0, min(1.0, best_score))
-        return best_idx, conf, best_text, replay_mode
-
-    def _should_replay_search(self, norm: str, py: Sequence[str]) -> bool:
-        """
-        当当前 partial 很短，并且明显像参考开头时，
-        触发 replay / rewind 搜索。
-        """
-        if not norm:
-            return False
-
-        if self._committed_idx < self.replay_min_committed_idx:
-            return False
-
-        if len(norm) > self.replay_trigger_max_chars:
-            return False
-
-        head_prefix = self._head_norm[: max(self.replay_min_prefix_chars, min(len(norm), 8))]
-        if head_prefix and norm.startswith(head_prefix[: min(len(head_prefix), len(norm))]):
-            return True
-
-        score = self._ordered_subsequence_score(norm, self._head_norm[: max(len(norm) + 4, 8)])
-        return score >= 0.75
-
-    def _update_replay_state(self, cand_idx: int, confidence: float) -> None:
-        if cand_idx < 0:
-            self._replay_run_len = 0
-            self._replay_last_candidate = -1
-            return
-
-        if confidence < self.replay_lockin_confidence:
-            self._replay_run_len = 0
-            self._replay_last_candidate = cand_idx
-            return
-
-        if self._replay_last_candidate < 0:
-            self._replay_run_len = 1
-        elif cand_idx > self._replay_last_candidate:
-            self._replay_run_len += 1
-        elif cand_idx == self._replay_last_candidate:
-            self._replay_run_len += 1
-        else:
-            self._replay_run_len = 1
-
-        self._replay_last_candidate = cand_idx
-
-    def _should_lockin_replay(self, cand_idx: int, confidence: float) -> bool:
-        if cand_idx < 0:
-            return False
-        if cand_idx >= self._committed_idx:
-            return False
-        if confidence < self.replay_lockin_confidence:
-            return False
-        if self._replay_run_len < self.replay_lockin_min_run:
-            return False
-        return True
-
-    def _clear_replay_if_needed(self, finalizing: bool) -> None:
-        self._replay_active = False
-        self._replay_run_len = 0
-        self._replay_last_candidate = -1
-        if finalizing:
-            self._last_candidate_run = 0
-
-    def _score_at(self, end_idx: int, norm: str, py: Sequence[str]) -> tuple[float, str]:
-        if end_idx < 0 or end_idx >= len(self.ref_tokens):
-            return 0.0, ""
-
-        norm_len = len(norm)
-        py_len = len(py)
-
-        ref_window_len = max(norm_len, py_len, 1) + self.fuzzy_missing_tolerance
-        start_idx = max(0, end_idx - ref_window_len + 1)
-        ref_slice = self.ref_tokens[start_idx : end_idx + 1]
-
-        ref_chars = "".join(tok.char for tok in ref_slice)
-        ref_py = [tok.pinyin for tok in ref_slice]
-
-        char_score, matched_chars = self._char_fuzzy_score(norm, ref_chars)
-        py_score = self._pinyin_fuzzy_score(py, ref_py)
-
-        if norm and py:
-            score = 0.75 * char_score + 0.25 * py_score
-        elif norm:
-            score = char_score
-        else:
-            score = py_score
-
-        return score, matched_chars
-
-    def _char_fuzzy_score(self, user_norm: str, ref_chars: str) -> tuple[float, str]:
-        if not user_norm or not ref_chars:
-            return 0.0, ""
-
-        best_score = 0.0
-        best_match = ""
-
-        min_len = max(1, len(user_norm) - self.fuzzy_missing_tolerance)
-        max_len = min(len(ref_chars), len(user_norm) + self.fuzzy_missing_tolerance)
-
-        for L in range(min_len, max_len + 1):
-            cand = ref_chars[-L:]
-            score = self._ordered_subsequence_score(user_norm, cand)
-            if score > best_score:
-                best_score = score
-                best_match = cand
-
-        return best_score, best_match
-
-    def _pinyin_fuzzy_score(self, user_py: Sequence[str], ref_py: Sequence[str]) -> float:
-        if not user_py or not ref_py:
-            return 0.0
-
-        min_len = max(1, len(user_py) - self.fuzzy_missing_tolerance)
-        max_len = min(len(ref_py), len(user_py) + self.fuzzy_missing_tolerance)
-
-        best_score = 0.0
-        for L in range(min_len, max_len + 1):
-            cand = ref_py[-L:]
-            score = self._ordered_subsequence_score(list(user_py), list(cand))
-            if score > best_score:
-                best_score = score
-
-        return best_score
-
-    def _ordered_subsequence_score(self, a, b) -> float:
-        if not a or not b:
-            return 0.0
-
-        i = 0
-        j = 0
-        matched = 0
-
-        while i < len(a) and j < len(b):
-            if a[i] == b[j]:
-                matched += 1
-                i += 1
-                j += 1
+        if self.state.recovering_after_seek:
+            if not candidate.backward_jump and candidate.confidence >= self.min_confidence:
+                self.state.recovering_after_seek = False
             else:
-                j += 1
+                return False
 
-        return matched / max(1, len(a))
+        if candidate.backward_jump:
+            self.state.backward_run += 1
+        else:
+            self.state.backward_run = 0
 
-    def _token_time(self, idx: int) -> float:
-        idx = max(0, min(idx, len(self.ref_tokens) - 1))
-        return self.ref_tokens[idx].t0
+        if candidate.ref_end_idx == self.state.last_candidate_idx:
+            self.state.stable_run += 1
+        else:
+            self.state.stable_run = 1
 
-    def _extract_token_time(self, tok, fallback_index: int = 0) -> float:
-        """
-        兼容不同 RefToken 字段名；如果没有时间字段，就用 index 兜底，
-        至少保证 t_user 单调递增，而不是一直 0.0。
-        """
-        for name in ("t0", "start_sec", "time_sec", "t_ref_sec", "start", "ts"):
-            if hasattr(tok, name):
-                try:
-                    return float(getattr(tok, name))
-                except Exception:
-                    pass
+        self.state.last_candidate_idx = candidate.ref_end_idx
 
-        return float(fallback_index) * 0.08
+        if event_type == AsrEventType.FINAL:
+            if candidate.backward_jump:
+                if candidate.confidence >= 0.90 and self.state.backward_run >= self.backward_lock_frames:
+                    self.state.committed_idx = candidate.ref_end_idx
+                    self.state.stable_run = 0
+                    self.state.backward_run = 0
+                    return True
+                return False
+
+            if candidate.confidence >= self.min_confidence and candidate.ref_end_idx >= self.state.committed_idx:
+                self.state.committed_idx = candidate.ref_end_idx
+                self.state.stable_run = 0
+                self.state.backward_run = 0
+                return True
+            return False
+
+        if candidate.backward_jump:
+            if candidate.confidence >= 0.90 and self.state.backward_run >= self.backward_lock_frames:
+                self.state.committed_idx = candidate.ref_end_idx
+                stable = True
+            return stable
+
+        if candidate.confidence < self.min_confidence:
+            return False
+
+        if candidate.ref_end_idx < self.state.committed_idx:
+            return False
+
+        if self.state.stable_run >= self.stable_frames:
+            self.state.committed_idx = candidate.ref_end_idx
+            stable = True
+
+        return stable
+
+    def _align_window(
+        self,
+        hyp_tokens: list[HypToken],
+        ref_tokens: list[_RefTokenView],
+        ref_offset: int,
+    ) -> CandidateAlignment:
+        m = len(hyp_tokens)
+        n = len(ref_tokens)
+
+        if m == 0 or n == 0:
+            committed = self.state.committed_idx
+            return CandidateAlignment(
+                ref_start_idx=committed,
+                ref_end_idx=committed,
+                score=0.0,
+                confidence=0.0,
+            )
+
+        dp = [[0.0] * (n + 1) for _ in range(m + 1)]
+        trace = [["S"] * (n + 1) for _ in range(m + 1)]
+
+        for i in range(1, m + 1):
+            dp[i][0] = dp[i - 1][0] + self.scorer.insertion_penalty()
+            trace[i][0] = "I"
+
+        current_clause = (
+            self.ref_tokens[min(self.state.committed_idx, len(self.ref_tokens) - 1)].clause_id
+            if self.ref_tokens
+            else 0
+        )
+
+        for j in range(1, n + 1):
+            penalty = self.scorer.deletion_penalty()
+            global_idx = ref_offset + (j - 1)
+
+            if global_idx < self.state.committed_idx:
+                penalty += self.scorer.backward_penalty()
+                if self.ref_tokens[global_idx].clause_id != current_clause:
+                    penalty -= self.cross_clause_backward_extra_penalty
+
+            dp[0][j] = dp[0][j - 1] + penalty
+            trace[0][j] = "D"
+
+        best_j = 1
+        best_score = float("-inf")
+
+        for i in range(1, m + 1):
+            hyp = hyp_tokens[i - 1]
+            for j in range(1, n + 1):
+                ref = ref_tokens[j - 1]
+
+                match_score = self.scorer.score_token_pair(ref.char, ref.pinyin, hyp.char, hyp.pinyin)
+                if ref.idx == self.state.committed_idx + 1:
+                    match_score += self.clause_boundary_bonus * 0.25
+
+                diag = dp[i - 1][j - 1] + match_score
+                ins = dp[i - 1][j] + self.scorer.insertion_penalty()
+
+                delete_penalty = self.scorer.deletion_penalty()
+                if ref.idx < self.state.committed_idx:
+                    delete_penalty += self.scorer.backward_penalty()
+                    if ref.clause_id != current_clause:
+                        delete_penalty -= self.cross_clause_backward_extra_penalty
+
+                dele = dp[i][j - 1] + delete_penalty
+
+                best = max(diag, ins, dele)
+                dp[i][j] = best
+                trace[i][j] = "M" if best == diag else ("I" if best == ins else "D")
+
+                if i == m and best > best_score:
+                    best_score = best
+                    best_j = j
+
+        matched_indices: list[int] = []
+        i = m
+        j = best_j
+        while i > 0 and j > 0:
+            op = trace[i][j]
+            if op == "M":
+                matched_indices.append(ref_offset + j - 1)
+                i -= 1
+                j -= 1
+            elif op == "I":
+                i -= 1
+            else:
+                j -= 1
+
+        matched_indices.reverse()
+
+        ref_end_idx = ref_offset + best_j - 1
+        ref_end_idx = max(0, min(ref_end_idx, len(self.ref_tokens) - 1))
+        ref_start_idx = matched_indices[0] if matched_indices else max(ref_offset, ref_end_idx)
+        backward_jump = ref_end_idx < self.state.committed_idx
+        norm_score = best_score / max(1, len(hyp_tokens))
+        confidence = 1.0 / (1.0 + exp(-1.25 * norm_score))
+        mode = "backward" if backward_jump else "normal"
+
+        return CandidateAlignment(
+            ref_start_idx=ref_start_idx,
+            ref_end_idx=ref_end_idx,
+            score=best_score,
+            confidence=max(0.0, min(1.0, confidence)),
+            matched_ref_indices=matched_indices,
+            backward_jump=backward_jump,
+            mode=mode,
+        )

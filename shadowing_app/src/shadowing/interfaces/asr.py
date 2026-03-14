@@ -1,26 +1,22 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from shadowing.types import AsrEvent
+
+from shadowing.types import RawAsrEvent
 
 
 class ASRProvider(ABC):
     @abstractmethod
-    def start(self) -> None:
-        raise NotImplementedError
+    def start(self) -> None: ...
 
     @abstractmethod
-    def feed_pcm16(self, pcm_bytes: bytes) -> None:
-        raise NotImplementedError
+    def feed_pcm16(self, pcm_bytes: bytes) -> None: ...
 
     @abstractmethod
-    def poll_events(self) -> list[AsrEvent]:
-        raise NotImplementedError
+    def poll_raw_events(self) -> list[RawAsrEvent]: ...
 
     @abstractmethod
-    def reset(self) -> None:
-        raise NotImplementedError
+    def reset(self) -> None: ...
 
     @abstractmethod
-    def close(self) -> None:
-        raise NotImplementedError
+    def close(self) -> None: ...

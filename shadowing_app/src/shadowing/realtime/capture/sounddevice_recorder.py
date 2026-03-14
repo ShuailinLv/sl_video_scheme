@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import threading
-from typing import Callable, Any
+from typing import Any, Callable
 
 import numpy as np
 import sounddevice as sd
 
 from shadowing.interfaces.recorder import Recorder
+from shadowing.realtime.capture.resampler import AudioResampler
 
 
 class SoundDeviceRecorder(Recorder):
@@ -19,122 +19,46 @@ class SoundDeviceRecorder(Recorder):
         dtype: str = "float32",
         blocksize: int = 0,
         latency: str | float = "low",
-        probe_duration_sec: float = 0.45,
-        probe_rms_threshold: float = 1e-4,
-        probe_peak_threshold: float = 8e-4,
     ) -> None:
         self.sample_rate_in = int(sample_rate_in)
         self.target_sample_rate = int(target_sample_rate)
         self.channels = int(channels)
         self.device = device
         self.dtype = dtype
-        self.blocksize = blocksize
+        self.blocksize = int(blocksize)
         self.latency = latency
-
-        self.probe_duration_sec = float(probe_duration_sec)
-        self.probe_rms_threshold = float(probe_rms_threshold)
-        self.probe_peak_threshold = float(probe_peak_threshold)
-
         self._stream: sd.InputStream | None = None
         self._callback: Callable[[bytes], None] | None = None
-
-        self._opened_channels: int | None = None
         self._opened_samplerate: int | None = None
-        self._resolved_input_device: int | None = None
+        self._opened_channels: int | None = None
+        self._resampler: AudioResampler | None = None
 
     def start(self, on_audio_frame: Callable[[bytes], None]) -> None:
         if self._stream is not None:
             return
-
         self._callback = on_audio_frame
-
-        input_device_index = self._resolve_input_device(self.device)
-        self._resolved_input_device = input_device_index
-
-        dev_info = sd.query_devices(input_device_index, "input")
+        device = self._resolve_input_device(self.device)
+        dev_info = sd.query_devices(device, "input")
         max_in = int(dev_info["max_input_channels"])
-        default_sr = int(float(dev_info["default_samplerate"]))
-        device_name = str(dev_info["name"])
+        if max_in < 1:
+            raise RuntimeError(f"Invalid input device: {dev_info}")
 
-        candidate_sample_rates: list[int] = []
-        for sr in [self.sample_rate_in, default_sr, 48000, 44100]:
-            if sr > 0 and sr not in candidate_sample_rates:
-                candidate_sample_rates.append(sr)
+        opened_channels = max(1, min(self.channels, max_in))
+        sr = self._pick_openable_samplerate(device, dev_info, opened_channels)
+        self._opened_samplerate = sr
+        self._opened_channels = opened_channels
+        self._resampler = AudioResampler(src_rate=sr, dst_rate=self.target_sample_rate)
 
-        candidate_channels: list[int] = []
-        for ch in [2, 1, max_in, self.channels]:
-            if ch > 0 and ch <= max_in and ch not in candidate_channels:
-                candidate_channels.append(ch)
-
-        last_error: Exception | None = None
-        best_silent_candidate: tuple[int, int, float, float] | None = None
-
-        for sr in candidate_sample_rates:
-            for ch in candidate_channels:
-                try:
-                    print(
-                        f"[REC] probing raw_device={input_device_index} "
-                        f"name={device_name!r} samplerate={sr} channels={ch} dtype={self.dtype}"
-                    )
-
-                    ok, rms, peak = self._probe_candidate(
-                        device=input_device_index,
-                        samplerate=sr,
-                        channels=ch,
-                    )
-
-                    print(
-                        f"[REC] probe_result raw_device={input_device_index} "
-                        f"samplerate={sr} channels={ch} "
-                        f"rms={rms:.6f} peak={peak:.6f} ok={ok}"
-                    )
-
-                    if ok:
-                        self._stream = sd.InputStream(
-                            samplerate=sr,
-                            blocksize=self.blocksize,
-                            device=input_device_index,
-                            channels=ch,
-                            dtype=self.dtype,
-                            latency=self.latency,
-                            callback=self._audio_callback,
-                        )
-                        self._stream.start()
-
-                        self._opened_channels = ch
-                        self._opened_samplerate = sr
-
-                        print(
-                            f"[REC] opened raw_device={input_device_index} "
-                            f"name={device_name!r} samplerate={sr} channels={ch}"
-                        )
-                        return
-
-                    if best_silent_candidate is None or peak > best_silent_candidate[3]:
-                        best_silent_candidate = (sr, ch, rms, peak)
-
-                except Exception as e:
-                    last_error = e
-                    self._stream = None
-                    print(
-                        f"[REC] probe/open failed raw_device={input_device_index} "
-                        f"samplerate={sr} channels={ch} -> {e}"
-                    )
-
-        extra = ""
-        if best_silent_candidate is not None:
-            sr, ch, rms, peak = best_silent_candidate
-            extra = (
-                f" Best silent candidate: samplerate={sr}, channels={ch}, "
-                f"rms={rms:.6f}, peak={peak:.6f}."
-            )
-
-        raise RuntimeError(
-            "Failed to find a recording config with real input signal. "
-            f"raw_device={input_device_index}, name={device_name!r}, "
-            f"max_input_channels={max_in}, default_samplerate={default_sr}. "
-            f"Last error: {last_error}.{extra}"
+        self._stream = sd.InputStream(
+            samplerate=sr,
+            blocksize=self.blocksize,
+            device=device,
+            channels=opened_channels,
+            dtype=self.dtype,
+            latency=self.latency,
+            callback=self._audio_callback,
         )
+        self._stream.start()
 
     def stop(self) -> None:
         if self._stream is not None:
@@ -150,169 +74,37 @@ class SoundDeviceRecorder(Recorder):
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         if self._callback is None:
             return
-
         if status:
             print(f"[REC] callback status: {status}")
-
         audio = np.asarray(indata, dtype=np.float32)
-
         if audio.ndim == 1:
-            audio = audio[:, None]
+            mono = audio
+        else:
+            mono = np.mean(audio, axis=1).astype(np.float32, copy=False)
+        if self._resampler is None:
+            raise RuntimeError("Recorder resampler is not initialized.")
+        self._callback(self._resampler.process_float_mono(mono))
 
-        if audio.shape[1] > 1:
-            audio = np.mean(audio, axis=1, keepdims=True)
-
-        mono = np.squeeze(audio, axis=1).astype(np.float32, copy=False)
-
-        src_sr = self._opened_samplerate or self.sample_rate_in
-        if src_sr != self.target_sample_rate:
-            mono = self._resample_linear(mono, src_sr, self.target_sample_rate)
-
-        pcm16 = np.clip(mono, -1.0, 1.0)
-        pcm16 = (pcm16 * 32767.0).astype(np.int16)
-
-        self._callback(pcm16.tobytes())
-
-    def _probe_candidate(
-        self,
-        device: int,
-        samplerate: int,
-        channels: int,
-    ) -> tuple[bool, float, float]:
-        captured: list[np.ndarray] = []
-        done = threading.Event()
-
-        def _probe_callback(indata, frames, time_info, status) -> None:
-            if status:
-                print(f"[REC] probe callback status: {status}")
-
-            x = np.asarray(indata, dtype=np.float32)
-
-            if x.ndim == 1:
-                x = x[:, None]
-
-            if x.shape[1] > 1:
-                x = np.mean(x, axis=1, keepdims=True)
-
-            mono = np.squeeze(x, axis=1).astype(np.float32, copy=False)
-            captured.append(mono.copy())
-
-            total_samples = sum(arr.size for arr in captured)
-            if total_samples >= int(samplerate * self.probe_duration_sec):
-                done.set()
-
-        stream: sd.InputStream | None = None
-        try:
-            stream = sd.InputStream(
-                samplerate=samplerate,
-                blocksize=self.blocksize,
-                device=device,
-                channels=channels,
-                dtype=self.dtype,
-                latency=self.latency,
-                callback=_probe_callback,
-            )
-            stream.start()
-            done.wait(timeout=max(0.8, self.probe_duration_sec + 0.4))
-        finally:
-            if stream is not None:
-                try:
-                    stream.stop()
-                finally:
-                    stream.close()
-
-        if not captured:
-            return False, 0.0, 0.0
-
-        mono = np.concatenate(captured, axis=0)
-        if mono.size == 0:
-            return False, 0.0, 0.0
-
-        rms = float(np.sqrt(np.mean(np.square(mono))))
-        peak = float(np.max(np.abs(mono)))
-
-        ok = (rms >= self.probe_rms_threshold) or (peak >= self.probe_peak_threshold)
-        return ok, rms, peak
-
-    def _resolve_input_device(self, device: int | str | None) -> int:
-        all_devices = sd.query_devices()
-        input_devices = [
-            (idx, dev)
-            for idx, dev in enumerate(all_devices)
-            if int(dev["max_input_channels"]) > 0
-        ]
-
-        self._print_input_device_map(input_devices)
-
+    def _resolve_input_device(self, device: int | str | None) -> int | str | None:
         if device is None:
-            default_input, _default_output = sd.default.device
-            if default_input is None or default_input < 0:
-                raise RuntimeError("No default input device available.")
-            dev = all_devices[default_input]
-            if int(dev["max_input_channels"]) <= 0:
-                raise RuntimeError(f"Default input device is not valid: {dev}")
-            print(f"[REC] using default input raw_device={default_input} name={dev['name']!r}")
-            return int(default_input)
-
+            return None
         if isinstance(device, int):
-            if 0 <= device < len(all_devices):
-                dev = all_devices[device]
-                if int(dev["max_input_channels"]) > 0:
-                    print(f"[REC] using raw input device index={device} name={dev['name']!r}")
-                    return int(device)
-
-            if 0 <= device < len(input_devices):
-                raw_idx, dev = input_devices[device]
-                print(
-                    f"[REC] input device {device} is not a valid raw input index; "
-                    f"fallback to input-list ordinal -> raw_device={raw_idx}, name={dev['name']!r}"
-                )
-                return int(raw_idx)
-
-            raise ValueError(
-                f"Input device {device} is neither a valid raw input device index "
-                f"nor a valid ordinal in the filtered input-device list."
-            )
-
+            return device
         target = str(device).strip().lower()
-        candidates: list[tuple[int, Any]] = []
-        for idx, dev in input_devices:
-            name = str(dev["name"]).lower()
-            if target == name or target in name:
-                candidates.append((idx, dev))
+        for idx, dev in enumerate(sd.query_devices()):
+            if int(dev["max_input_channels"]) > 0 and target in str(dev["name"]).lower():
+                return idx
+        raise ValueError(f"No matching input device found for {device!r}")
 
-        if not candidates:
-            raise ValueError(f"No matching input device found for: {device!r}")
-
-        raw_idx, dev = candidates[0]
-        print(f"[REC] matched input device name {device!r} -> raw_device={raw_idx}, name={dev['name']!r}")
-        return int(raw_idx)
-
-    @staticmethod
-    def _print_input_device_map(input_devices: list[tuple[int, Any]]) -> None:
-        print("[REC] available input devices (ordinal -> raw index):")
-        for ordinal, (raw_idx, dev) in enumerate(input_devices):
-            print(
-                f"  [{ordinal}] raw={raw_idx} "
-                f"name={dev['name']!r} "
-                f"max_in={int(dev['max_input_channels'])} "
-                f"default_sr={int(float(dev['default_samplerate']))}"
-            )
-
-    @staticmethod
-    def _resample_linear(
-        x: np.ndarray,
-        src_sr: int,
-        dst_sr: int,
-    ) -> np.ndarray:
-        if src_sr == dst_sr or x.size == 0:
-            return x.astype(np.float32, copy=False)
-
-        duration = x.shape[0] / float(src_sr)
-        dst_n = max(1, int(round(duration * dst_sr)))
-
-        src_idx = np.linspace(0, x.shape[0] - 1, num=x.shape[0], dtype=np.float32)
-        dst_idx = np.linspace(0, x.shape[0] - 1, num=dst_n, dtype=np.float32)
-
-        y = np.interp(dst_idx, src_idx, x).astype(np.float32)
-        return y
+    def _pick_openable_samplerate(self, device: int | str | None, dev_info: Any, opened_channels: int) -> int:
+        candidates: list[int] = []
+        for sr in [self.sample_rate_in, int(float(dev_info["default_samplerate"])), 48000, 44100, 16000]:
+            if sr > 0 and sr not in candidates:
+                candidates.append(sr)
+        for sr in candidates:
+            try:
+                sd.check_input_settings(device=device, samplerate=sr, channels=opened_channels, dtype=self.dtype)
+                return sr
+            except Exception:
+                continue
+        raise RuntimeError(f"Failed to find openable samplerate for input device: {dev_info}")

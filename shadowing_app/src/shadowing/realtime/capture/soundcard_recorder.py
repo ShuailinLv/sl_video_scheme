@@ -2,45 +2,33 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 import pythoncom
 import soundcard as sc
 
 from shadowing.interfaces.recorder import Recorder
+from shadowing.realtime.capture.resampler import AudioResampler
 
 
 class SoundCardRecorder(Recorder):
-    """
-    Windows 优先录音实现，基于 soundcard(WASAPI)。
-
-    特点：
-    - 兼容现有 Recorder 接口
-    - 支持指定设备 index 或设备名子串
-    - 后台线程持续拉取音频
-    - 自动下混到 mono
-    - 自动重采样到 target_sample_rate
-    - 输出 little-endian int16 PCM bytes，兼容现有 ASRProvider.feed_pcm16()
-    - 带轻量级电平调试打印，便于判断麦克风是否真正录到声音
-    """
-
     def __init__(
         self,
         sample_rate_in: int,
         target_sample_rate: int,
         channels: int = 1,
         device: int | str | None = None,
-        block_frames: int = 1024,
+        block_frames: int = 1440,
         include_loopback: bool = False,
-        debug_level_meter: bool = True,
+        debug_level_meter: bool = False,
         debug_level_every_n_blocks: int = 20,
     ) -> None:
         self.sample_rate_in = int(sample_rate_in)
         self.target_sample_rate = int(target_sample_rate)
         self.channels = int(channels)
         self.device = device
-        self.block_frames = int(block_frames)
+        self.block_frames = max(128, int(block_frames))
         self.include_loopback = bool(include_loopback)
 
         self.debug_level_meter = bool(debug_level_meter)
@@ -54,6 +42,7 @@ class SoundCardRecorder(Recorder):
         self._opened_channels: int | None = None
         self._opened_samplerate: int | None = None
         self._debug_counter = 0
+        self._resampler: AudioResampler | None = None
 
     def start(self, on_audio_frame: Callable[[bytes], None]) -> None:
         if self._running:
@@ -71,16 +60,24 @@ class SoundCardRecorder(Recorder):
                     f"[REC-SC] trying mic={self._mic.name!r} "
                     f"samplerate={sr} channels={ch}"
                 )
-
-                # 这里只做轻量试开，确保该组合可用
                 with self._mic.recorder(samplerate=sr, channels=ch) as rec:
-                    _ = rec.record(numframes=min(self.block_frames, 256))
+                    pilot = rec.record(numframes=min(self.block_frames, 256))
 
-                self._opened_samplerate = sr
-                self._opened_channels = ch
+                pilot_audio = np.asarray(pilot, dtype=np.float32).reshape(-1)
+                pilot_rms = float(np.sqrt(np.mean(np.square(pilot_audio)))) if pilot_audio.size else 0.0
+                pilot_peak = float(np.max(np.abs(pilot_audio))) if pilot_audio.size else 0.0
+
+                self._opened_samplerate = int(sr)
+                self._opened_channels = int(ch)
+                self._resampler = AudioResampler(
+                    src_rate=self._opened_samplerate,
+                    dst_rate=self.target_sample_rate,
+                )
+
                 print(
                     f"[REC-SC] opened mic={self._mic.name!r} "
-                    f"samplerate={sr} channels={ch}"
+                    f"samplerate={self._opened_samplerate} channels={self._opened_channels} "
+                    f"pilot_rms={pilot_rms:.5f} pilot_peak={pilot_peak:.5f}"
                 )
                 last_error = None
                 break
@@ -118,9 +115,14 @@ class SoundCardRecorder(Recorder):
         assert self._opened_samplerate is not None
         assert self._opened_channels is not None
 
-        # 关键修复：后台线程初始化 COM，避免 WASAPI 在线程里报 0x800401f0
         pythoncom.CoInitialize()
         try:
+            print(
+                f"[REC-SC] capture_loop started mic={self._mic.name!r} "
+                f"samplerate={self._opened_samplerate} channels={self._opened_channels} "
+                f"block_frames={self.block_frames}"
+            )
+
             with self._mic.recorder(
                 samplerate=self._opened_samplerate,
                 channels=self._opened_channels,
@@ -134,31 +136,29 @@ class SoundCardRecorder(Recorder):
 
                     audio = np.asarray(data, dtype=np.float32)
 
-                    # shape 统一为 [frames, channels]
                     if audio.ndim == 1:
                         audio = audio[:, None]
 
-                    # 多声道下混为 mono
                     if audio.shape[1] > 1:
                         audio = np.mean(audio, axis=1, keepdims=True)
 
                     mono = np.squeeze(audio, axis=1).astype(np.float32, copy=False)
 
+                    self._debug_counter += 1
                     if self.debug_level_meter:
-                        self._debug_counter += 1
-                        if self._debug_counter % self.debug_level_every_n_blocks == 0:
+                        if self._debug_counter <= 3 or self._debug_counter % self.debug_level_every_n_blocks == 0:
                             rms = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
                             peak = float(np.max(np.abs(mono))) if mono.size else 0.0
-                            print(f"[REC-SC] rms={rms:.5f} peak={peak:.5f}")
+                            print(
+                                f"[REC-SC] rms={rms:.5f} peak={peak:.5f} "
+                                f"frames={mono.shape[0]}"
+                            )
 
-                    src_sr = self._opened_samplerate
-                    if src_sr != self.target_sample_rate:
-                        mono = self._resample_linear(mono, src_sr, self.target_sample_rate)
+                    if self._resampler is None:
+                        raise RuntimeError("SoundCardRecorder resampler is not initialized.")
 
-                    pcm16 = np.clip(mono, -1.0, 1.0)
-                    pcm16 = (pcm16 * 32767.0).astype(np.int16)
-
-                    self._callback(pcm16.tobytes())
+                    pcm16_bytes = self._resampler.process_float_mono(mono)
+                    self._callback(pcm16_bytes)
         except Exception as e:
             print(f"[REC-SC] capture loop stopped due to error: {e}")
         finally:
@@ -169,12 +169,12 @@ class SoundCardRecorder(Recorder):
         candidates: list[tuple[int, int]] = []
 
         candidate_srs: list[int] = []
-        for sr in [self.sample_rate_in, 48000, 44100]:
+        for sr in [self.sample_rate_in, 48000, 44100, 16000]:
             if sr > 0 and sr not in candidate_srs:
                 candidate_srs.append(sr)
 
         candidate_channels: list[int] = []
-        for ch in [1, 2, self.channels]:
+        for ch in [1, self.channels, 2]:
             if ch > 0 and ch not in candidate_channels:
                 candidate_channels.append(ch)
 
@@ -202,28 +202,33 @@ class SoundCardRecorder(Recorder):
 
         if isinstance(device, int):
             if 0 <= device < len(mics):
-                print(f"[REC-SC] using microphone index={device}: {mics[device].name!r}")
+                print(f"[REC-SC] using soundcard microphone index={device}: {mics[device].name!r}")
                 return mics[device]
-            raise ValueError(f"Microphone index out of range for soundcard: {device}")
+            raise ValueError(
+                f"Soundcard microphone index out of range: {device}. "
+                f"Valid range is 0..{len(mics) - 1}. "
+                "Note: soundcard backend uses its own microphone list index, not sounddevice raw device index."
+            )
 
         key = str(device).strip().lower()
+
+        if key.isdigit():
+            idx = int(key)
+            if 0 <= idx < len(mics):
+                print(f"[REC-SC] using soundcard microphone index={idx}: {mics[idx].name!r}")
+                return mics[idx]
+            raise ValueError(
+                f"Soundcard microphone index out of range: {idx}. "
+                f"Valid range is 0..{len(mics) - 1}. "
+                "Note: soundcard backend uses its own microphone list index, not sounddevice raw device index."
+            )
+
         for mic in mics:
             if key in mic.name.lower():
                 print(f"[REC-SC] matched microphone {device!r} -> {mic.name!r}")
                 return mic
 
-        raise ValueError(f"No matching microphone found for {device!r}")
-
-    @staticmethod
-    def _resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-        if src_sr == dst_sr or x.size == 0:
-            return x.astype(np.float32, copy=False)
-
-        duration = x.shape[0] / float(src_sr)
-        dst_n = max(1, int(round(duration * dst_sr)))
-
-        src_idx = np.linspace(0, x.shape[0] - 1, num=x.shape[0], dtype=np.float32)
-        dst_idx = np.linspace(0, x.shape[0] - 1, num=dst_n, dtype=np.float32)
-
-        y = np.interp(dst_idx, src_idx, x).astype(np.float32)
-        return y
+        raise ValueError(
+            f"No matching microphone found for {device!r}. "
+            "For soundcard backend, pass either a soundcard microphone list index or a device name substring."
+        )

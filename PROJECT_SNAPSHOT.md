@@ -7,25 +7,17 @@
 
 ```python
 from __future__ import annotations
-
 from shadowing.interfaces.analytics import AnalyticsProvider
 
-
-class SessionAnalyticsPipeline:
-    def __init__(self, provider: AnalyticsProvider) -> None:
+class SessionAnalyticsPipeline:    
+    def __init__(self, provider: AnalyticsProvider) -> None:        
         self.provider = provider
-
-    def run(
-        self,
-        lesson_text: str,
-        user_audio_path: str,
-        output_dir: str,
-    ) -> dict:
-        return self.provider.analyze_session(
-            lesson_text=lesson_text,
-            audio_path=user_audio_path,
-            output_dir=output_dir,
-        )
+    def run(self, lesson_text: str, user_audio_path: str, output_dir: str) -> dict:        
+        return self.provider.analyze_session(            
+                lesson_text=lesson_text,            
+                audio_path=user_audio_path,            
+                output_dir=output_dir,
+                        )
 ```
 
 ---
@@ -41,13 +33,8 @@ class ElevenLabsScribeProvider(AnalyticsProvider):
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
 
-    def analyze_session(
-        self,
-        lesson_text: str,
-        audio_path: str,
-        output_dir: str,
-    ) -> dict:
-        raise NotImplementedError
+    def analyze_session(self, lesson_text: str, audio_path: str, output_dir: str) -> dict:
+        raise NotImplementedError("Wire your preferred ElevenLabs Scribe batch endpoint here.")
 ```
 
 ---
@@ -56,65 +43,151 @@ class ElevenLabsScribeProvider(AnalyticsProvider):
 ```python
 from __future__ import annotations
 
-import platform
-
 from shadowing.infrastructure.lesson_repo import FileLessonRepository
-from shadowing.realtime.playback.sounddevice_player import SoundDevicePlayer
-from shadowing.realtime.capture.sounddevice_recorder import SoundDeviceRecorder
-from shadowing.realtime.capture.soundcard_recorder import SoundCardRecorder
-from shadowing.realtime.asr.sherpa_streaming_provider import SherpaStreamingProvider
 from shadowing.realtime.alignment.incremental_aligner import IncrementalAligner
-from shadowing.realtime.control.adaptive_controller import AdaptiveController
+from shadowing.realtime.asr.fake_asr_provider import FakeASRProvider, FakeAsrConfig, FakeAsrStep
+from shadowing.realtime.asr.sherpa_streaming_provider import SherpaStreamingProvider
+from shadowing.realtime.capture.soundcard_recorder import SoundCardRecorder
+from shadowing.realtime.capture.sounddevice_recorder import SoundDeviceRecorder
+from shadowing.realtime.control.policy import ControlPolicy
+from shadowing.realtime.control.state_machine_controller import StateMachineController
 from shadowing.realtime.orchestrator import ShadowingOrchestrator
+from shadowing.realtime.playback.sounddevice_player import PlaybackConfig, SoundDevicePlayer
 from shadowing.realtime.runtime import ShadowingRuntime
+from shadowing.types import AsrEventType
+
+
+def _build_fake_asr_config(asr_cfg: dict) -> FakeAsrConfig:
+    scripted_steps_raw = asr_cfg.get("scripted_steps", [])
+    scripted_steps: list[FakeAsrStep] = []
+
+    for item in scripted_steps_raw:
+        if isinstance(item, FakeAsrStep):
+            scripted_steps.append(item)
+            continue
+
+        if not isinstance(item, dict):
+            raise ValueError(f"Invalid fake ASR scripted step: {item!r}")
+
+        event_type_raw = str(item.get("event_type", "partial")).lower()
+        if event_type_raw == "final":
+            event_type = AsrEventType.FINAL
+        else:
+            event_type = AsrEventType.PARTIAL
+
+        scripted_steps.append(
+            FakeAsrStep(
+                offset_sec=float(item.get("offset_sec", 0.0)),
+                text=str(item.get("text", "")),
+                event_type=event_type,
+            )
+        )
+
+    return FakeAsrConfig(
+        scripted_steps=scripted_steps,
+        reference_text=str(asr_cfg.get("reference_text", "")),
+        chars_per_sec=float(asr_cfg.get("chars_per_sec", 4.0)),
+        emit_partial_interval_sec=float(asr_cfg.get("emit_partial_interval_sec", 0.10)),
+        emit_final_on_endpoint=bool(asr_cfg.get("emit_final_on_endpoint", True)),
+        sample_rate=int(asr_cfg.get("sample_rate", 16000)),
+        bytes_per_sample=int(asr_cfg.get("bytes_per_sample", 2)),
+        channels=int(asr_cfg.get("channels", 1)),
+        vad_rms_threshold=float(asr_cfg.get("vad_rms_threshold", 0.01)),
+        vad_min_active_ms=float(asr_cfg.get("vad_min_active_ms", 30.0)),
+    )
 
 
 def build_runtime(config: dict) -> ShadowingRuntime:
     repo = FileLessonRepository(config["lesson_base_dir"])
 
+    playback_cfg = config["playback"]
     player = SoundDevicePlayer(
-        sample_rate=config["playback"]["sample_rate"],
-        channels=1,
-        device=config["playback"].get("device"),
-        bluetooth_output_offset_sec=config["playback"].get(
-            "bluetooth_output_offset_sec", 0.0
-        ),
+        PlaybackConfig(
+            sample_rate=int(playback_cfg["sample_rate"]),
+            channels=int(playback_cfg.get("channels", 1)),
+            device=playback_cfg.get("device"),
+            latency=playback_cfg.get("latency", "low"),
+            blocksize=int(playback_cfg.get("blocksize", 0)),
+            bluetooth_output_offset_sec=float(playback_cfg.get("bluetooth_output_offset_sec", 0.0)),
+        )
     )
 
     capture_cfg = config["capture"]
-    use_soundcard_on_windows = False # bool(capture_cfg.get("prefer_soundcard_on_windows", True)    )
+    capture_backend = str(capture_cfg.get("backend", "sounddevice")).strip().lower()
 
-    if platform.system().lower() == "windows" and use_soundcard_on_windows:
+    if capture_backend == "soundcard":
         recorder = SoundCardRecorder(
-            sample_rate_in=capture_cfg["device_sample_rate"],
-            target_sample_rate=capture_cfg["target_sample_rate"],
-            channels=1,
+            sample_rate_in=int(capture_cfg["device_sample_rate"]),
+            target_sample_rate=int(capture_cfg["target_sample_rate"]),
+            channels=int(capture_cfg.get("channels", 1)),
             device=capture_cfg.get("device"),
-            block_frames=int(capture_cfg.get("block_frames", 1024)),
+            block_frames=int(capture_cfg.get("block_frames", capture_cfg.get("blocksize", 1440))),
             include_loopback=bool(capture_cfg.get("include_loopback", False)),
+            debug_level_meter=bool(capture_cfg.get("debug_level_meter", False)),
+            debug_level_every_n_blocks=int(capture_cfg.get("debug_level_every_n_blocks", 20)),
         )
     else:
         recorder = SoundDeviceRecorder(
-            sample_rate_in=capture_cfg["device_sample_rate"],
-            target_sample_rate=capture_cfg["target_sample_rate"],
-            channels=1,
+            sample_rate_in=int(capture_cfg["device_sample_rate"]),
+            target_sample_rate=int(capture_cfg["target_sample_rate"]),
+            channels=int(capture_cfg.get("channels", 1)),
             device=capture_cfg.get("device"),
+            dtype=capture_cfg.get("dtype", "float32"),
+            blocksize=int(capture_cfg.get("blocksize", 0)),
+            latency=capture_cfg.get("latency", "low"),
         )
 
-    asr = SherpaStreamingProvider(
-        model_config=config["asr"],
-        hotwords=config["asr"].get("hotwords", ""),
-    )
+    asr_cfg = config["asr"]
+    asr_mode = str(asr_cfg.get("mode", "sherpa")).lower()
 
-    aligner = IncrementalAligner()
+    if asr_mode == "fake":
+        asr = FakeASRProvider(_build_fake_asr_config(asr_cfg))
+    else:
+        asr = SherpaStreamingProvider(
+            model_config=asr_cfg,
+            hotwords=str(asr_cfg.get("hotwords", "")),
+            sample_rate=int(asr_cfg.get("sample_rate", 16000)),
+            emit_partial_interval_sec=float(asr_cfg.get("emit_partial_interval_sec", 0.08)),
+            enable_endpoint=bool(asr_cfg.get("enable_endpoint", True)),
+            debug_feed=bool(asr_cfg.get("debug_feed", False)),
+            debug_feed_every_n_chunks=int(asr_cfg.get("debug_feed_every_n_chunks", 20)),
+        )
+
+    align_cfg = config.get("alignment", {})
+    aligner = IncrementalAligner(
+        window_back=int(align_cfg.get("window_back", 8)),
+        window_ahead=int(align_cfg.get("window_ahead", 40)),
+        stable_frames=int(align_cfg.get("stable_frames", 2)),
+        min_confidence=float(align_cfg.get("min_confidence", 0.60)),
+        backward_lock_frames=int(align_cfg.get("backward_lock_frames", 3)),
+        clause_boundary_bonus=float(align_cfg.get("clause_boundary_bonus", 0.15)),
+        cross_clause_backward_extra_penalty=float(
+            align_cfg.get("cross_clause_backward_extra_penalty", 0.20)
+        ),
+        debug=bool(align_cfg.get("debug", False)),
+    )
 
     control_cfg = config.get("control", {})
-    controller = AdaptiveController(
-        ducking_only=bool(control_cfg.get("ducking_only", False)),
-        disable_seek=bool(control_cfg.get("disable_seek", False)),
-        disable_hold=bool(control_cfg.get("disable_hold", False)),
+    policy = ControlPolicy(
+        target_lead_sec=float(control_cfg.get("target_lead_sec", 0.15)),
+        hold_if_lead_sec=float(control_cfg.get("hold_if_lead_sec", 0.90)),
+        resume_if_lead_sec=float(control_cfg.get("resume_if_lead_sec", 0.28)),
+        seek_if_lag_sec=float(control_cfg.get("seek_if_lag_sec", -1.80)),
+        min_confidence=float(control_cfg.get("min_confidence", 0.75)),
+        seek_cooldown_sec=float(control_cfg.get("seek_cooldown_sec", 1.20)),
+        gain_following=float(control_cfg.get("gain_following", 0.55)),
+        gain_transition=float(control_cfg.get("gain_transition", 0.80)),
+        recover_after_seek_sec=float(control_cfg.get("recover_after_seek_sec", 0.60)),
+        startup_grace_sec=float(control_cfg.get("startup_grace_sec", 0.80)),
+        low_confidence_hold_sec=float(control_cfg.get("low_confidence_hold_sec", 0.60)),
     )
 
+    controller = StateMachineController(
+        policy=policy,
+        disable_seek=bool(control_cfg.get("disable_seek", False)),
+    )
+
+    runtime_cfg = config.get("runtime", {})
     orchestrator = ShadowingOrchestrator(
         repo=repo,
         player=player,
@@ -122,83 +195,17 @@ def build_runtime(config: dict) -> ShadowingRuntime:
         asr=asr,
         aligner=aligner,
         controller=controller,
+        audio_queue_maxsize=int(runtime_cfg.get("audio_queue_maxsize", 150)),
+        asr_event_queue_maxsize=int(runtime_cfg.get("asr_event_queue_maxsize", 64)),
+        loop_interval_sec=float(runtime_cfg.get("loop_interval_sec", 0.03)),
     )
 
-    if "runtime" in config and hasattr(orchestrator, "configure_runtime"):
+    if "runtime" in config:
         orchestrator.configure_runtime(config["runtime"])
+    if "debug" in config:
+        orchestrator.configure_debug(config["debug"])
 
     return ShadowingRuntime(orchestrator)
-```
-
----
-### 文件: `shadowing_app/src/shadowing/domain/commands.py`
-
-```python
-from __future__ import annotations
-
-from dataclasses import dataclass
-
-
-@dataclass(slots=True)
-class StartSession:
-    lesson_id: str
-
-
-@dataclass(slots=True)
-class StopSession:
-    reason: str = "user_requested"
-
-
-@dataclass(slots=True)
-class HoldPlayback:
-    reason: str
-
-
-@dataclass(slots=True)
-class ResumePlayback:
-    reason: str
-
-
-@dataclass(slots=True)
-class SeekPlayback:
-    target_time_sec: float
-    reason: str
-```
-
----
-### 文件: `shadowing_app/src/shadowing/domain/events.py`
-
-```python
-from __future__ import annotations
-
-from dataclasses import dataclass
-
-
-@dataclass(slots=True)
-class SessionStarted:
-    lesson_id: str
-
-
-@dataclass(slots=True)
-class SessionStopped:
-    lesson_id: str
-    reason: str
-
-
-@dataclass(slots=True)
-class PlaybackHeld:
-    reason: str
-
-
-@dataclass(slots=True)
-class PlaybackResumed:
-    reason: str
-
-
-@dataclass(slots=True)
-class PlaybackSeeked:
-    target_time_sec: float
-    reason: str
 ```
 
 ---
@@ -211,6 +218,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
 
 from shadowing.interfaces.repository import LessonRepository
@@ -224,9 +232,7 @@ class FileLessonRepository(LessonRepository):
     def save_manifest(self, manifest: LessonManifest) -> None:
         lesson_dir = self.base_dir / manifest.lesson_id
         lesson_dir.mkdir(parents=True, exist_ok=True)
-
-        path = lesson_dir / "lesson_manifest.json"
-        path.write_text(
+        (lesson_dir / "lesson_manifest.json").write_text(
             json.dumps(asdict(manifest), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -234,63 +240,66 @@ class FileLessonRepository(LessonRepository):
     def load_manifest(self, lesson_id: str) -> LessonManifest:
         path = self.base_dir / lesson_id / "lesson_manifest.json"
         data = json.loads(path.read_text(encoding="utf-8"))
+        data.setdefault("schema_version", 1)
+        data.setdefault("provider_name", "elevenlabs")
+        data.setdefault("output_format", "unknown")
         return LessonManifest(**data)
 
     def save_reference_map(self, lesson_id: str, ref_map: ReferenceMap) -> str:
         lesson_dir = self.base_dir / lesson_id
         lesson_dir.mkdir(parents=True, exist_ok=True)
-
         path = lesson_dir / "reference_map.json"
-        path.write_text(
-            json.dumps(asdict(ref_map), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        path.write_text(json.dumps(asdict(ref_map), ensure_ascii=False, indent=2), encoding="utf-8")
         return str(path)
 
     def load_reference_map(self, lesson_id: str) -> ReferenceMap:
         path = self.base_dir / lesson_id / "reference_map.json"
         data = json.loads(path.read_text(encoding="utf-8"))
-
         tokens = [RefToken(**token_data) for token_data in data["tokens"]]
         return ReferenceMap(
             lesson_id=data["lesson_id"],
             tokens=tokens,
-            total_duration_sec=data["total_duration_sec"],
+            total_duration_sec=float(data["total_duration_sec"]),
         )
 
     def load_audio_chunks(self, lesson_id: str) -> list[AudioChunk]:
         manifest = self.load_manifest(lesson_id)
-
         chunks: list[AudioChunk] = []
         current_start_time = 0.0
+        expected_sr: int | None = None
 
         for idx, chunk_path_str in enumerate(manifest.chunk_paths):
             chunk_path = Path(chunk_path_str)
-
             if not chunk_path.is_absolute():
                 chunk_path = (self.base_dir / lesson_id / chunk_path).resolve()
 
             samples, sr = sf.read(str(chunk_path), dtype="float32", always_2d=False)
+            sr = int(sr)
 
-            if samples.ndim == 1:
+            if expected_sr is None:
+                expected_sr = sr
+            elif expected_sr != sr:
+                raise ValueError(f"Inconsistent chunk sample rate in lesson {lesson_id}: {expected_sr} vs {sr}")
+
+            arr = np.asarray(samples, dtype=np.float32)
+            if arr.ndim == 1:
                 channels = 1
-                duration_sec = len(samples) / sr
+                duration_sec = arr.shape[0] / sr
             else:
-                channels = samples.shape[1]
-                duration_sec = samples.shape[0] / sr
+                channels = int(arr.shape[1])
+                duration_sec = arr.shape[0] / sr
 
             chunks.append(
                 AudioChunk(
                     chunk_id=idx,
                     sample_rate=sr,
                     channels=channels,
-                    samples=samples,
-                    duration_sec=duration_sec,
-                    start_time_sec=current_start_time,
+                    samples=arr,
+                    duration_sec=float(duration_sec),
+                    start_time_sec=float(current_start_time),
                     path=str(chunk_path),
                 )
             )
-
             current_start_time += duration_sec
 
         return chunks
@@ -303,17 +312,19 @@ class FileLessonRepository(LessonRepository):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+
 from shadowing.types import AsrEvent, AlignResult, ReferenceMap
 
 
 class Aligner(ABC):
     @abstractmethod
-    def reset(self, reference_map: ReferenceMap) -> None:
-        raise NotImplementedError
+    def reset(self, reference_map: ReferenceMap) -> None: ...
 
     @abstractmethod
-    def update(self, event: AsrEvent) -> AlignResult | None:
-        raise NotImplementedError
+    def update(self, event: AsrEvent) -> AlignResult | None: ...
+
+    @abstractmethod
+    def on_playback_generation_changed(self, generation: int) -> None: ...
 ```
 
 ---
@@ -327,13 +338,7 @@ from abc import ABC, abstractmethod
 
 class AnalyticsProvider(ABC):
     @abstractmethod
-    def analyze_session(
-        self,
-        lesson_text: str,
-        audio_path: str,
-        output_dir: str,
-    ) -> dict:
-        raise NotImplementedError
+    def analyze_session(self, lesson_text: str, audio_path: str, output_dir: str) -> dict: ...
 ```
 
 ---
@@ -343,29 +348,25 @@ class AnalyticsProvider(ABC):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from shadowing.types import AsrEvent
+
+from shadowing.types import RawAsrEvent
 
 
 class ASRProvider(ABC):
     @abstractmethod
-    def start(self) -> None:
-        raise NotImplementedError
+    def start(self) -> None: ...
 
     @abstractmethod
-    def feed_pcm16(self, pcm_bytes: bytes) -> None:
-        raise NotImplementedError
+    def feed_pcm16(self, pcm_bytes: bytes) -> None: ...
 
     @abstractmethod
-    def poll_events(self) -> list[AsrEvent]:
-        raise NotImplementedError
+    def poll_raw_events(self) -> list[RawAsrEvent]: ...
 
     @abstractmethod
-    def reset(self) -> None:
-        raise NotImplementedError
+    def reset(self) -> None: ...
 
     @abstractmethod
-    def close(self) -> None:
-        raise NotImplementedError
+    def close(self) -> None: ...
 ```
 
 ---
@@ -375,17 +376,13 @@ class ASRProvider(ABC):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+
 from shadowing.types import AlignResult, ControlDecision, PlaybackStatus
 
 
 class Controller(ABC):
     @abstractmethod
-    def decide(
-        self,
-        playback: PlaybackStatus,
-        alignment: AlignResult | None,
-    ) -> ControlDecision:
-        raise NotImplementedError
+    def decide(self, playback: PlaybackStatus, alignment: AlignResult | None) -> ControlDecision: ...
 ```
 
 ---
@@ -395,33 +392,28 @@ class Controller(ABC):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+
 from shadowing.types import AudioChunk, PlaybackStatus, PlayerCommand
 
 
 class Player(ABC):
     @abstractmethod
-    def load_chunks(self, chunks: list[AudioChunk]) -> None:
-        raise NotImplementedError
+    def load_chunks(self, chunks: list[AudioChunk]) -> None: ...
 
     @abstractmethod
-    def start(self) -> None:
-        raise NotImplementedError
+    def start(self) -> None: ...
 
     @abstractmethod
-    def submit_command(self, command: PlayerCommand) -> None:
-        raise NotImplementedError
+    def submit_command(self, command: PlayerCommand) -> None: ...
 
     @abstractmethod
-    def get_status(self) -> PlaybackStatus:
-        raise NotImplementedError
+    def get_status(self) -> PlaybackStatus: ...
 
     @abstractmethod
-    def stop(self) -> None:
-        raise NotImplementedError
+    def stop(self) -> None: ...
 
     @abstractmethod
-    def close(self) -> None:
-        raise NotImplementedError
+    def close(self) -> None: ...
 ```
 
 ---
@@ -436,16 +428,13 @@ from collections.abc import Callable
 
 class Recorder(ABC):
     @abstractmethod
-    def start(self, on_audio_frame: Callable[[bytes], None]) -> None:
-        raise NotImplementedError
+    def start(self, on_audio_frame: Callable[[bytes], None]) -> None: ...
 
     @abstractmethod
-    def stop(self) -> None:
-        raise NotImplementedError
+    def stop(self) -> None: ...
 
     @abstractmethod
-    def close(self) -> None:
-        raise NotImplementedError
+    def close(self) -> None: ...
 ```
 
 ---
@@ -455,29 +444,25 @@ class Recorder(ABC):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from shadowing.types import LessonManifest, ReferenceMap, AudioChunk
+
+from shadowing.types import AudioChunk, LessonManifest, ReferenceMap
 
 
 class LessonRepository(ABC):
     @abstractmethod
-    def save_manifest(self, manifest: LessonManifest) -> None:
-        raise NotImplementedError
+    def save_manifest(self, manifest: LessonManifest) -> None: ...
 
     @abstractmethod
-    def load_manifest(self, lesson_id: str) -> LessonManifest:
-        raise NotImplementedError
+    def load_manifest(self, lesson_id: str) -> LessonManifest: ...
 
     @abstractmethod
-    def save_reference_map(self, lesson_id: str, ref_map: ReferenceMap) -> str:
-        raise NotImplementedError
+    def save_reference_map(self, lesson_id: str, ref_map: ReferenceMap) -> str: ...
 
     @abstractmethod
-    def load_reference_map(self, lesson_id: str) -> ReferenceMap:
-        raise NotImplementedError
+    def load_reference_map(self, lesson_id: str) -> ReferenceMap: ...
 
     @abstractmethod
-    def load_audio_chunks(self, lesson_id: str) -> list[AudioChunk]:
-        raise NotImplementedError
+    def load_audio_chunks(self, lesson_id: str) -> list[AudioChunk]: ...
 ```
 
 ---
@@ -487,18 +472,13 @@ class LessonRepository(ABC):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+
 from shadowing.types import LessonManifest, ReferenceMap
 
 
 class TTSProvider(ABC):
     @abstractmethod
-    def synthesize_lesson(
-        self,
-        lesson_id: str,
-        text: str,
-        output_dir: str,
-    ) -> tuple[LessonManifest, ReferenceMap]:
-        raise NotImplementedError
+    def synthesize_lesson(self, lesson_id: str, text: str, output_dir: str) -> tuple[LessonManifest, ReferenceMap]: ...
 ```
 
 ---
@@ -507,11 +487,43 @@ class TTSProvider(ABC):
 ```python
 from __future__ import annotations
 
+import re
+
 
 class ClauseChunker:
+    def __init__(self, max_clause_chars: int = 120) -> None:
+        self.max_clause_chars = int(max_clause_chars)
 
     def split_text(self, text: str) -> list[str]:
-        raise NotImplementedError
+        text = text.strip()
+        if not text:
+            return []
+
+        parts = re.split(r"(?<=[。！？!?])", text)
+        parts = [p.strip() for p in parts if p.strip()]
+
+        clauses: list[str] = []
+        for part in parts:
+            if len(part) <= self.max_clause_chars:
+                clauses.append(part)
+                continue
+
+            subparts = re.split(r"(?<=[，、；,;])", part)
+            buf = ""
+            for sp in subparts:
+                sp = sp.strip()
+                if not sp:
+                    continue
+                if len(buf) + len(sp) <= self.max_clause_chars:
+                    buf += sp
+                else:
+                    if buf:
+                        clauses.append(buf)
+                    buf = sp
+            if buf:
+                clauses.append(buf)
+
+        return clauses
 ```
 
 ---
@@ -520,16 +532,12 @@ class ClauseChunker:
 ```python
 from __future__ import annotations
 
-from shadowing.interfaces.tts import TTSProvider
 from shadowing.interfaces.repository import LessonRepository
+from shadowing.interfaces.tts import TTSProvider
 
 
 class LessonPreprocessPipeline:
-    def __init__(
-        self,
-        tts_provider: TTSProvider,
-        repo: LessonRepository,
-    ) -> None:
+    def __init__(self, tts_provider: TTSProvider, repo: LessonRepository) -> None:
         self.tts_provider = tts_provider
         self.repo = repo
 
@@ -550,33 +558,36 @@ class LessonPreprocessPipeline:
 from __future__ import annotations
 
 import base64
+import io
 import re
 from pathlib import Path
 
 import httpx
+import numpy as np
+import soundfile as sf
 from pypinyin import lazy_pinyin
 
 from shadowing.interfaces.tts import TTSProvider
+from shadowing.preprocess.chunker import ClauseChunker
 from shadowing.preprocess.reference_builder import ReferenceBuilder
 from shadowing.types import LessonManifest, ReferenceMap
 
 
 class ElevenLabsTTSProvider(TTSProvider):
-
     def __init__(
         self,
         api_key: str,
         voice_id: str,
         model_id: str,
-        output_format: str = "mp3_44100_128",
+        output_format: str = "pcm_44100",
         timeout_sec: float = 120.0,
     ) -> None:
         self.api_key = api_key
         self.voice_id = voice_id
         self.model_id = model_id
         self.output_format = output_format
-        self.timeout_sec = timeout_sec
-
+        self.timeout_sec = float(timeout_sec)
+        self.chunker = ClauseChunker(max_clause_chars=120)
         self.reference_builder = ReferenceBuilder()
 
     def synthesize_lesson(
@@ -591,7 +602,7 @@ class ElevenLabsTTSProvider(TTSProvider):
         chunks_dir = output_path / "chunks"
         chunks_dir.mkdir(parents=True, exist_ok=True)
 
-        clauses = self._split_text(text)
+        clauses = self.chunker.split_text(text)
         if not clauses:
             raise ValueError("No valid clauses found after splitting input text.")
 
@@ -604,16 +615,36 @@ class ElevenLabsTTSProvider(TTSProvider):
 
         chunk_paths: list[str] = []
         global_time_offset = 0.0
+        total_audio_duration = 0.0
+        sample_rate_out: int | None = None
         sentence_id = 0
+        previous_text = ""
 
         with httpx.Client(timeout=self.timeout_sec) as client:
             for clause_id, clause_text in enumerate(clauses):
-                resp = self._request_tts_with_timestamps(client, clause_text)
-                audio_bytes = base64.b64decode(resp["audio_base64"])
+                next_text = clauses[clause_id + 1] if clause_id + 1 < len(clauses) else ""
 
-                chunk_file = chunks_dir / f"{clause_id:04d}.mp3"
-                chunk_file.write_bytes(audio_bytes)
+                resp = self._request_tts_with_timestamps(
+                    client=client,
+                    text=clause_text,
+                    previous_text=previous_text,
+                    next_text=next_text,
+                )
+
+                audio_bytes = base64.b64decode(resp["audio_base64"])
+                chunk_file, chunk_samplerate, chunk_duration = self._write_chunk_audio(
+                    chunks_dir=chunks_dir,
+                    clause_id=clause_id,
+                    audio_bytes=audio_bytes,
+                )
                 chunk_paths.append(str(chunk_file))
+
+                if sample_rate_out is None:
+                    sample_rate_out = int(chunk_samplerate)
+                elif sample_rate_out != int(chunk_samplerate):
+                    raise ValueError(
+                        f"Inconsistent chunk sample rate: {sample_rate_out} vs {chunk_samplerate}"
+                    )
 
                 alignment = resp.get("alignment") or resp.get("normalized_alignment")
                 if not alignment:
@@ -629,13 +660,7 @@ class ElevenLabsTTSProvider(TTSProvider):
                         f"{len(chars)=}, {len(starts)=}, {len(ends)=}"
                     )
 
-                pinyins = []
-                for ch in chars:
-                    if ch.strip():
-                        py_list = lazy_pinyin(ch)
-                        pinyins.append(py_list[0] if py_list else ch)
-                    else:
-                        pinyins.append("")
+                pinyins = [lazy_pinyin(ch)[0] if ch.strip() else "" for ch in chars]
 
                 for ch, py, ts, te in zip(chars, pinyins, starts, ends, strict=True):
                     all_chars.append(ch)
@@ -645,11 +670,15 @@ class ElevenLabsTTSProvider(TTSProvider):
                     all_sentence_ids.append(sentence_id)
                     all_clause_ids.append(clause_id)
 
-                if ends:
-                    global_time_offset += float(ends[-1])
+                alignment_end_sec = max((float(x) for x in ends), default=0.0)
+                offset_advance_sec = alignment_end_sec if alignment_end_sec > 0.0 else chunk_duration
+                global_time_offset += offset_advance_sec
+                total_audio_duration = global_time_offset
 
                 if clause_text and clause_text[-1] in "。！？!?":
                     sentence_id += 1
+
+                previous_text = clause_text
 
         ref_map = self.reference_builder.build(
             lesson_id=lesson_id,
@@ -659,19 +688,115 @@ class ElevenLabsTTSProvider(TTSProvider):
             ends=all_ends,
             sentence_ids=all_sentence_ids,
             clause_ids=all_clause_ids,
+            total_duration_sec=total_audio_duration,
         )
 
         manifest = LessonManifest(
             lesson_id=lesson_id,
             lesson_text=text,
-            sample_rate_out=44100,
+            sample_rate_out=sample_rate_out or 44100,
             chunk_paths=chunk_paths,
             reference_map_path=str(output_path / "reference_map.json"),
+            provider_name="elevenlabs",
+            output_format=self.output_format,
         )
-
         return manifest, ref_map
 
-    def _request_tts_with_timestamps(self, client: httpx.Client, text: str) -> dict:
+    def _write_chunk_audio(
+        self,
+        chunks_dir: Path,
+        clause_id: int,
+        audio_bytes: bytes,
+    ) -> tuple[Path, int, float]:
+        fmt = self.output_format.strip().lower()
+
+        if fmt.startswith("pcm_"):
+            return self._write_pcm_like_audio(chunks_dir, clause_id, audio_bytes, fmt)
+
+        ext = self._infer_container_extension(fmt)
+        chunk_file = chunks_dir / f"{clause_id:04d}.{ext}"
+        chunk_file.write_bytes(audio_bytes)
+
+        info = sf.info(str(chunk_file))
+        duration_sec = float(info.duration)
+        sample_rate = int(info.samplerate)
+        return chunk_file, sample_rate, duration_sec
+
+    def _write_pcm_like_audio(
+        self,
+        chunks_dir: Path,
+        clause_id: int,
+        audio_bytes: bytes,
+        output_format: str,
+    ) -> tuple[Path, int, float]:
+        sample_rate = self._parse_pcm_sample_rate(output_format)
+        chunk_file = chunks_dir / f"{clause_id:04d}.wav"
+
+        wav_data, wav_sr = self._try_decode_as_container(audio_bytes)
+        if wav_data is not None:
+            wav_sr = int(wav_sr or sample_rate)
+            audio_f32 = self._to_mono_float32(wav_data)
+            sf.write(str(chunk_file), audio_f32, wav_sr, subtype="PCM_16")
+            duration_sec = float(audio_f32.shape[0]) / float(wav_sr)
+            return chunk_file, wav_sr, duration_sec
+
+        if len(audio_bytes) % 2 != 0:
+            head = audio_bytes[:16].hex()
+            raise ValueError(
+                "ElevenLabs returned pcm_* audio payload with odd byte length, "
+                f"cannot parse as int16 PCM. clause_id={clause_id}, "
+                f"bytes={len(audio_bytes)}, head={head}"
+            )
+
+        pcm_i16 = np.frombuffer(audio_bytes, dtype="<i2")
+        if pcm_i16.size == 0:
+            raise ValueError(f"Empty PCM audio returned for clause {clause_id}.")
+
+        audio_f32 = (pcm_i16.astype(np.float32) / 32768.0).astype(np.float32, copy=False)
+        sf.write(str(chunk_file), audio_f32, sample_rate, subtype="PCM_16")
+        duration_sec = float(audio_f32.shape[0]) / float(sample_rate)
+        return chunk_file, sample_rate, duration_sec
+
+    def _try_decode_as_container(self, audio_bytes: bytes) -> tuple[np.ndarray | None, int | None]:
+        try:
+            bio = io.BytesIO(audio_bytes)
+            data, sr = sf.read(bio, dtype="float32", always_2d=False)
+            arr = np.asarray(data, dtype=np.float32)
+            if arr.size == 0:
+                return None, None
+            return arr, int(sr)
+        except Exception:
+            return None, None
+
+    def _to_mono_float32(self, audio: np.ndarray) -> np.ndarray:
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.ndim == 1:
+            return arr
+        return np.mean(arr, axis=1).astype(np.float32, copy=False)
+
+    def _parse_pcm_sample_rate(self, output_format: str) -> int:
+        m = re.fullmatch(r"pcm_(\d+)", output_format.strip().lower())
+        if not m:
+            raise ValueError(f"Unsupported PCM output_format: {output_format}")
+        return int(m.group(1))
+
+    def _infer_container_extension(self, output_format: str) -> str:
+        fmt = output_format.strip().lower()
+        if fmt.startswith("mp3_"):
+            return "mp3"
+        if fmt.startswith("ulaw_"):
+            return "wav"
+        if fmt.startswith("pcm_"):
+            return "wav"
+        return "bin"
+
+    def _request_tts_with_timestamps(
+        self,
+        client: httpx.Client,
+        text: str,
+        previous_text: str = "",
+        next_text: str = "",
+    ) -> dict:
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}/with-timestamps"
         headers = {
             "xi-api-key": self.api_key,
@@ -682,6 +807,11 @@ class ElevenLabsTTSProvider(TTSProvider):
             "model_id": self.model_id,
             "output_format": self.output_format,
         }
+
+        if previous_text:
+            payload["previous_text"] = previous_text
+        if next_text:
+            payload["next_text"] = next_text
 
         response = client.post(url, headers=headers, json=payload)
         try:
@@ -696,37 +826,6 @@ class ElevenLabsTTSProvider(TTSProvider):
             raise RuntimeError(f"ElevenLabs response missing audio_base64: {data}")
 
         return data
-
-    def _split_text(self, text: str) -> list[str]:
-        text = text.strip()
-        if not text:
-            return []
-
-        parts = re.split(r"(?<=[。！？!?])", text)
-        parts = [p.strip() for p in parts if p.strip()]
-
-        clauses: list[str] = []
-        for part in parts:
-            if len(part) <= 120:
-                clauses.append(part)
-                continue
-
-            subparts = re.split(r"(?<=[，、；,;])", part)
-            buf = ""
-            for sp in subparts:
-                sp = sp.strip()
-                if not sp:
-                    continue
-                if len(buf) + len(sp) <= 120:
-                    buf += sp
-                else:
-                    if buf:
-                        clauses.append(buf)
-                    buf = sp
-            if buf:
-                clauses.append(buf)
-
-        return clauses
 ```
 
 ---
@@ -735,20 +834,17 @@ class ElevenLabsTTSProvider(TTSProvider):
 ```python
 from __future__ import annotations
 
-from shadowing.types import ReferenceMap, RefToken
+from shadowing.types import RefToken, ReferenceMap
 
 
 class ReferenceBuilder:
-
-    _DROP_CHARS = set(
-        [
-            " ", "\t", "\n", "\r", "\u3000",
-            "，", "。", "！", "？", "；", "：", "、",
-            ",", ".", "!", "?", ";", ":", "\"", "'", "“", "”", "‘", "’",
-            "（", "）", "(", ")", "[", "]", "【", "】", "<", ">", "《", "》",
-            "-", "—", "…", "|", "/", "\\",
-        ]
-    )
+    _DROP_CHARS = {
+        " ", "\t", "\n", "\r", "\u3000",
+        "，", "。", "！", "？", "；", "：", "、",
+        ",", ".", "!", "?", ";", ":", '"', "'", "“", "”", "‘", "’",
+        "（", "）", "(", ")", "[", "]", "【", "】", "<", ">", "《", "》",
+        "-", "—", "…", "|", "/", "\\",
+    }
 
     def build(
         self,
@@ -759,38 +855,31 @@ class ReferenceBuilder:
         ends: list[float],
         sentence_ids: list[int],
         clause_ids: list[int],
+        total_duration_sec: float,
     ) -> ReferenceMap:
         tokens: list[RefToken] = []
-
-        filtered_idx = 0
+        next_idx = 0
         for ch, py, ts, te, sid, cid in zip(
             chars, pinyins, starts, ends, sentence_ids, clause_ids, strict=True
         ):
-            if not ch:
+            if not ch or ch in self._DROP_CHARS or not ch.strip():
                 continue
-            if ch in self._DROP_CHARS:
-                continue
-            if ch.strip() == "":
-                continue
-
             tokens.append(
                 RefToken(
-                    idx=filtered_idx,
+                    idx=next_idx,
                     char=ch,
                     pinyin=py,
-                    t_start=ts,
-                    t_end=te,
-                    sentence_id=sid,
-                    clause_id=cid,
+                    t_start=float(ts),
+                    t_end=float(te),
+                    sentence_id=int(sid),
+                    clause_id=int(cid),
                 )
             )
-            filtered_idx += 1
-
-        total_duration = ends[-1] if ends else 0.0
+            next_idx += 1
         return ReferenceMap(
             lesson_id=lesson_id,
             tokens=tokens,
-            total_duration_sec=total_duration,
+            total_duration_sec=float(total_duration_sec),
         )
 ```
 
@@ -801,86 +890,89 @@ class ReferenceBuilder:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from math import exp
 
 from shadowing.interfaces.aligner import Aligner
-from shadowing.types import AsrEvent, AsrEventType, AlignResult
+from shadowing.realtime.alignment.scoring import AlignmentScorer
+from shadowing.realtime.alignment.window_selector import WindowSelector
+from shadowing.types import (
+    AlignResult,
+    AsrEvent,
+    AsrEventType,
+    CandidateAlignment,
+    HypToken,
+    ReferenceMap,
+)
 
 
-@dataclass
+@dataclass(slots=True)
 class _RefTokenView:
     idx: int
     char: str
     pinyin: str
-    t0: float
+    t_start: float
+    t_end: float
+    sentence_id: int
+    clause_id: int
+
+
+@dataclass(slots=True)
+class _CommitState:
+    committed_idx: int = 0
+    stable_run: int = 0
+    backward_run: int = 0
+    last_candidate_idx: int = 0
+    generation: int = 0
+    recovering_after_seek: bool = False
 
 
 class IncrementalAligner(Aligner):
-
     def __init__(
         self,
-        search_backoff_tokens: int = 12,
-        search_ahead_tokens: int = 48,
-        stable_min_advance: int = 2,
-        fuzzy_missing_tolerance: int = 2,
-        replay_head_tokens: int = 48,
-        replay_trigger_max_chars: int = 12,
-        replay_min_prefix_chars: int = 2,
-        replay_min_committed_idx: int = 8,
-        replay_lockin_min_run: int = 3,
-        replay_lockin_confidence: float = 0.90,
+        window_back: int = 8,
+        window_ahead: int = 40,
+        stable_frames: int = 2,
+        min_confidence: float = 0.60,
+        backward_lock_frames: int = 3,
+        clause_boundary_bonus: float = 0.15,
+        cross_clause_backward_extra_penalty: float = 0.20,
+        debug: bool = False,
     ) -> None:
-        self.search_backoff_tokens = int(search_backoff_tokens)
-        self.search_ahead_tokens = int(search_ahead_tokens)
-        self.stable_min_advance = int(stable_min_advance)
-        self.fuzzy_missing_tolerance = int(fuzzy_missing_tolerance)
+        self.window_selector = WindowSelector(look_back=window_back, look_ahead=window_ahead)
+        self.scorer = AlignmentScorer()
+        self.stable_frames = int(stable_frames)
+        self.min_confidence = float(min_confidence)
+        self.backward_lock_frames = int(backward_lock_frames)
+        self.clause_boundary_bonus = float(clause_boundary_bonus)
+        self.cross_clause_backward_extra_penalty = float(cross_clause_backward_extra_penalty)
+        self.debug = bool(debug)
 
-        self.replay_head_tokens = int(replay_head_tokens)
-        self.replay_trigger_max_chars = int(replay_trigger_max_chars)
-        self.replay_min_prefix_chars = int(replay_min_prefix_chars)
-
-        self.replay_min_committed_idx = int(replay_min_committed_idx)
-        self.replay_lockin_min_run = int(replay_lockin_min_run)
-        self.replay_lockin_confidence = float(replay_lockin_confidence)
-
-        self.ref_map = None
+        self.ref_map: ReferenceMap | None = None
         self.ref_tokens: list[_RefTokenView] = []
+        self.state = _CommitState()
 
-        self._committed_idx = 0
-        self._candidate_idx = 0
-        self._last_candidate_idx = 0
-        self._last_candidate_run = 0
-
-        self._head_norm = ""
-
-        self._replay_active = False
-        self._replay_run_len = 0
-        self._replay_last_candidate = -1
-
-    def reset(self, ref_map) -> None:
-        self.ref_map = ref_map
-        self.ref_tokens = []
-
-        for i, tok in enumerate(ref_map.tokens):
-            self.ref_tokens.append(
-                _RefTokenView(
-                    idx=i,
-                    char=str(getattr(tok, "char", "")),
-                    pinyin=str(getattr(tok, "pinyin", "")),
-                    t0=self._extract_token_time(tok, fallback_index=i),
-                )
+    def reset(self, reference_map: ReferenceMap) -> None:
+        self.ref_map = reference_map
+        self.ref_tokens = [
+            _RefTokenView(
+                idx=t.idx,
+                char=t.char,
+                pinyin=t.pinyin,
+                t_start=t.t_start,
+                t_end=t.t_end,
+                sentence_id=t.sentence_id,
+                clause_id=t.clause_id,
             )
+            for t in reference_map.tokens
+        ]
+        self.state = _CommitState()
 
-        self._committed_idx = 0
-        self._candidate_idx = 0
-        self._last_candidate_idx = 0
-        self._last_candidate_run = 0
-
-        self._replay_active = False
-        self._replay_run_len = 0
-        self._replay_last_candidate = -1
-
-        self._head_norm = "".join(t.char for t in self.ref_tokens[: self.replay_head_tokens])
+    def on_playback_generation_changed(self, generation: int) -> None:
+        self.state.generation = int(generation)
+        self.state.stable_run = 0
+        self.state.backward_run = 0
+        self.state.last_candidate_idx = self.state.committed_idx
+        self.state.recovering_after_seek = True
 
     def update(self, event: AsrEvent) -> AlignResult | None:
         if self.ref_map is None or not self.ref_tokens:
@@ -889,239 +981,235 @@ class IncrementalAligner(Aligner):
         if event.event_type not in (AsrEventType.PARTIAL, AsrEventType.FINAL):
             return None
 
-        norm = event.normalized_text or ""
-        py = event.pinyin_seq or []
+        if len(event.chars) != len(event.pinyin_seq):
+            min_len = min(len(event.chars), len(event.pinyin_seq))
+            chars = event.chars[:min_len]
+            pinyin_seq = event.pinyin_seq[:min_len]
+        else:
+            chars = event.chars
+            pinyin_seq = event.pinyin_seq
 
-        if not norm and not py:
+        if not chars:
             return None
 
-        cand_idx, confidence, matched_text, replay_mode = self._locate_candidate(norm, py)
+        hyp_tokens = [HypToken(char=c, pinyin=py) for c, py in zip(chars, pinyin_seq, strict=True)]
+        window_tokens, window_start, window_end = self.window_selector.select(
+            self.ref_map, self.state.committed_idx
+        )
+        candidate = self._align_window(
+            hyp_tokens=hyp_tokens,
+            ref_tokens=window_tokens,
+            ref_offset=window_start,
+        )
+        stable = self._observe_candidate(candidate, event.event_type)
 
-        stable = False
+        ref_time = self.ref_tokens[candidate.ref_end_idx].t_start
+        matched_text = "".join(
+            self.ref_tokens[i].char
+            for i in candidate.matched_ref_indices
+            if 0 <= i < len(self.ref_tokens)
+        )
+        matched_pinyin = [
+            self.ref_tokens[i].pinyin
+            for i in candidate.matched_ref_indices
+            if 0 <= i < len(self.ref_tokens)
+        ]
 
-        if event.event_type == AsrEventType.FINAL:
-            self._clear_replay_if_needed(finalizing=True)
-            if cand_idx >= self._committed_idx:
-                self._committed_idx = cand_idx
-                stable = True
-
-        else:
-            if replay_mode and cand_idx < self._committed_idx:
-                self._update_replay_state(cand_idx, confidence)
-
-                if self._should_lockin_replay(cand_idx, confidence):
-                    self._replay_active = True
-                    self._committed_idx = cand_idx
-                    stable = True
-            else:
-                if cand_idx >= self._committed_idx:
-                    self._clear_replay_if_needed(finalizing=False)
-
-                if cand_idx > self._last_candidate_idx:
-                    self._last_candidate_run += 1
-                elif cand_idx == self._last_candidate_idx:
-                    self._last_candidate_run += 1
-                else:
-                    self._last_candidate_run = 0
-
-                if cand_idx >= self._committed_idx:
-                    if confidence >= 0.70 and (cand_idx - self._committed_idx) >= self.stable_min_advance:
-                        self._committed_idx = cand_idx
-                        stable = True
-                    elif confidence >= 0.90 and cand_idx > self._committed_idx:
-                        self._committed_idx = cand_idx
-                        stable = True
-                    elif self._last_candidate_run >= 2 and confidence >= 0.80 and cand_idx >= self._committed_idx:
-                        self._committed_idx = cand_idx
-                        stable = True
-
-        self._candidate_idx = cand_idx
-        self._last_candidate_idx = cand_idx
-
-        ref_time_sec = self._token_time(cand_idx)
+        if self.debug:
+            print(
+                "[ALIGN] "
+                f"committed={self.state.committed_idx} "
+                f"candidate={candidate.ref_end_idx} "
+                f"score={candidate.score:.3f} "
+                f"conf={candidate.confidence:.3f} "
+                f"stable={stable} "
+                f"backward={candidate.backward_jump} "
+                f"matched_n={len(candidate.matched_ref_indices)} "
+                f"hyp_n={len(hyp_tokens)} "
+                f"mode={candidate.mode}"
+            )
 
         return AlignResult(
-            committed_ref_idx=self._committed_idx,
-            candidate_ref_idx=self._candidate_idx,
-            ref_time_sec=ref_time_sec,
-            confidence=confidence,
+            committed_ref_idx=self.state.committed_idx,
+            candidate_ref_idx=candidate.ref_end_idx,
+            ref_time_sec=ref_time,
+            confidence=candidate.confidence,
             stable=stable,
             matched_text=matched_text,
+            matched_pinyin=matched_pinyin,
+            window_start_idx=window_start,
+            window_end_idx=max(window_start, window_end - 1),
+            alignment_mode=candidate.mode,
+            backward_jump_detected=candidate.backward_jump,
+            debug_score=candidate.score,
+            debug_stable_run=self.state.stable_run,
+            debug_backward_run=self.state.backward_run,
+            debug_matched_count=len(candidate.matched_ref_indices),
+            debug_hyp_length=len(hyp_tokens),
         )
 
-    def _locate_candidate(self, norm: str, py: Sequence[str]) -> tuple[int, float, str, bool]:
-        replay_mode = self._should_replay_search(norm, py)
+    def _observe_candidate(self, candidate: CandidateAlignment, event_type: AsrEventType) -> bool:
+        stable = False
 
-        if replay_mode:
-            start = 0
-            end = min(len(self.ref_tokens) - 1, self.replay_head_tokens)
-        else:
-            start = max(0, self._committed_idx - self.search_backoff_tokens)
-            end = min(len(self.ref_tokens) - 1, self._committed_idx + self.search_ahead_tokens)
-
-        best_idx = self._committed_idx
-        best_score = -1.0
-        best_text = ""
-
-        for i in range(start, end + 1):
-            score, matched = self._score_at(i, norm, py)
-            if score > best_score:
-                best_score = score
-                best_idx = i
-                best_text = matched
-
-        conf = max(0.0, min(1.0, best_score))
-        return best_idx, conf, best_text, replay_mode
-
-    def _should_replay_search(self, norm: str, py: Sequence[str]) -> bool:
-        if not norm:
-            return False
-
-        if self._committed_idx < self.replay_min_committed_idx:
-            return False
-
-        if len(norm) > self.replay_trigger_max_chars:
-            return False
-
-        head_prefix = self._head_norm[: max(self.replay_min_prefix_chars, min(len(norm), 8))]
-        if head_prefix and norm.startswith(head_prefix[: min(len(head_prefix), len(norm))]):
-            return True
-
-        score = self._ordered_subsequence_score(norm, self._head_norm[: max(len(norm) + 4, 8)])
-        return score >= 0.75
-
-    def _update_replay_state(self, cand_idx: int, confidence: float) -> None:
-        if cand_idx < 0:
-            self._replay_run_len = 0
-            self._replay_last_candidate = -1
-            return
-
-        if confidence < self.replay_lockin_confidence:
-            self._replay_run_len = 0
-            self._replay_last_candidate = cand_idx
-            return
-
-        if self._replay_last_candidate < 0:
-            self._replay_run_len = 1
-        elif cand_idx > self._replay_last_candidate:
-            self._replay_run_len += 1
-        elif cand_idx == self._replay_last_candidate:
-            self._replay_run_len += 1
-        else:
-            self._replay_run_len = 1
-
-        self._replay_last_candidate = cand_idx
-
-    def _should_lockin_replay(self, cand_idx: int, confidence: float) -> bool:
-        if cand_idx < 0:
-            return False
-        if cand_idx >= self._committed_idx:
-            return False
-        if confidence < self.replay_lockin_confidence:
-            return False
-        if self._replay_run_len < self.replay_lockin_min_run:
-            return False
-        return True
-
-    def _clear_replay_if_needed(self, finalizing: bool) -> None:
-        self._replay_active = False
-        self._replay_run_len = 0
-        self._replay_last_candidate = -1
-        if finalizing:
-            self._last_candidate_run = 0
-
-    def _score_at(self, end_idx: int, norm: str, py: Sequence[str]) -> tuple[float, str]:
-        if end_idx < 0 or end_idx >= len(self.ref_tokens):
-            return 0.0, ""
-
-        norm_len = len(norm)
-        py_len = len(py)
-
-        ref_window_len = max(norm_len, py_len, 1) + self.fuzzy_missing_tolerance
-        start_idx = max(0, end_idx - ref_window_len + 1)
-        ref_slice = self.ref_tokens[start_idx : end_idx + 1]
-
-        ref_chars = "".join(tok.char for tok in ref_slice)
-        ref_py = [tok.pinyin for tok in ref_slice]
-
-        char_score, matched_chars = self._char_fuzzy_score(norm, ref_chars)
-        py_score = self._pinyin_fuzzy_score(py, ref_py)
-
-        if norm and py:
-            score = 0.75 * char_score + 0.25 * py_score
-        elif norm:
-            score = char_score
-        else:
-            score = py_score
-
-        return score, matched_chars
-
-    def _char_fuzzy_score(self, user_norm: str, ref_chars: str) -> tuple[float, str]:
-        if not user_norm or not ref_chars:
-            return 0.0, ""
-
-        best_score = 0.0
-        best_match = ""
-
-        min_len = max(1, len(user_norm) - self.fuzzy_missing_tolerance)
-        max_len = min(len(ref_chars), len(user_norm) + self.fuzzy_missing_tolerance)
-
-        for L in range(min_len, max_len + 1):
-            cand = ref_chars[-L:]
-            score = self._ordered_subsequence_score(user_norm, cand)
-            if score > best_score:
-                best_score = score
-                best_match = cand
-
-        return best_score, best_match
-
-    def _pinyin_fuzzy_score(self, user_py: Sequence[str], ref_py: Sequence[str]) -> float:
-        if not user_py or not ref_py:
-            return 0.0
-
-        min_len = max(1, len(user_py) - self.fuzzy_missing_tolerance)
-        max_len = min(len(ref_py), len(user_py) + self.fuzzy_missing_tolerance)
-
-        best_score = 0.0
-        for L in range(min_len, max_len + 1):
-            cand = ref_py[-L:]
-            score = self._ordered_subsequence_score(list(user_py), list(cand))
-            if score > best_score:
-                best_score = score
-
-        return best_score
-
-    def _ordered_subsequence_score(self, a, b) -> float:
-        if not a or not b:
-            return 0.0
-
-        i = 0
-        j = 0
-        matched = 0
-
-        while i < len(a) and j < len(b):
-            if a[i] == b[j]:
-                matched += 1
-                i += 1
-                j += 1
+        if self.state.recovering_after_seek:
+            if not candidate.backward_jump and candidate.confidence >= self.min_confidence:
+                self.state.recovering_after_seek = False
             else:
-                j += 1
+                return False
 
-        return matched / max(1, len(a))
+        if candidate.backward_jump:
+            self.state.backward_run += 1
+        else:
+            self.state.backward_run = 0
 
-    def _token_time(self, idx: int) -> float:
-        idx = max(0, min(idx, len(self.ref_tokens) - 1))
-        return self.ref_tokens[idx].t0
+        if candidate.ref_end_idx == self.state.last_candidate_idx:
+            self.state.stable_run += 1
+        else:
+            self.state.stable_run = 1
 
-    def _extract_token_time(self, tok, fallback_index: int = 0) -> float:
-        for name in ("t0", "start_sec", "time_sec", "t_ref_sec", "start", "ts"):
-            if hasattr(tok, name):
-                try:
-                    return float(getattr(tok, name))
-                except Exception:
-                    pass
+        self.state.last_candidate_idx = candidate.ref_end_idx
 
-        return float(fallback_index) * 0.08
+        if event_type == AsrEventType.FINAL:
+            if candidate.backward_jump:
+                if candidate.confidence >= 0.90 and self.state.backward_run >= self.backward_lock_frames:
+                    self.state.committed_idx = candidate.ref_end_idx
+                    self.state.stable_run = 0
+                    self.state.backward_run = 0
+                    return True
+                return False
+
+            if candidate.confidence >= self.min_confidence and candidate.ref_end_idx >= self.state.committed_idx:
+                self.state.committed_idx = candidate.ref_end_idx
+                self.state.stable_run = 0
+                self.state.backward_run = 0
+                return True
+            return False
+
+        if candidate.backward_jump:
+            if candidate.confidence >= 0.90 and self.state.backward_run >= self.backward_lock_frames:
+                self.state.committed_idx = candidate.ref_end_idx
+                stable = True
+            return stable
+
+        if candidate.confidence < self.min_confidence:
+            return False
+
+        if candidate.ref_end_idx < self.state.committed_idx:
+            return False
+
+        if self.state.stable_run >= self.stable_frames:
+            self.state.committed_idx = candidate.ref_end_idx
+            stable = True
+
+        return stable
+
+    def _align_window(
+        self,
+        hyp_tokens: list[HypToken],
+        ref_tokens: list[_RefTokenView],
+        ref_offset: int,
+    ) -> CandidateAlignment:
+        m = len(hyp_tokens)
+        n = len(ref_tokens)
+
+        if m == 0 or n == 0:
+            committed = self.state.committed_idx
+            return CandidateAlignment(
+                ref_start_idx=committed,
+                ref_end_idx=committed,
+                score=0.0,
+                confidence=0.0,
+            )
+
+        dp = [[0.0] * (n + 1) for _ in range(m + 1)]
+        trace = [["S"] * (n + 1) for _ in range(m + 1)]
+
+        for i in range(1, m + 1):
+            dp[i][0] = dp[i - 1][0] + self.scorer.insertion_penalty()
+            trace[i][0] = "I"
+
+        current_clause = (
+            self.ref_tokens[min(self.state.committed_idx, len(self.ref_tokens) - 1)].clause_id
+            if self.ref_tokens
+            else 0
+        )
+
+        for j in range(1, n + 1):
+            penalty = self.scorer.deletion_penalty()
+            global_idx = ref_offset + (j - 1)
+
+            if global_idx < self.state.committed_idx:
+                penalty += self.scorer.backward_penalty()
+                if self.ref_tokens[global_idx].clause_id != current_clause:
+                    penalty -= self.cross_clause_backward_extra_penalty
+
+            dp[0][j] = dp[0][j - 1] + penalty
+            trace[0][j] = "D"
+
+        best_j = 1
+        best_score = float("-inf")
+
+        for i in range(1, m + 1):
+            hyp = hyp_tokens[i - 1]
+            for j in range(1, n + 1):
+                ref = ref_tokens[j - 1]
+
+                match_score = self.scorer.score_token_pair(ref.char, ref.pinyin, hyp.char, hyp.pinyin)
+                if ref.idx == self.state.committed_idx + 1:
+                    match_score += self.clause_boundary_bonus * 0.25
+
+                diag = dp[i - 1][j - 1] + match_score
+                ins = dp[i - 1][j] + self.scorer.insertion_penalty()
+
+                delete_penalty = self.scorer.deletion_penalty()
+                if ref.idx < self.state.committed_idx:
+                    delete_penalty += self.scorer.backward_penalty()
+                    if ref.clause_id != current_clause:
+                        delete_penalty -= self.cross_clause_backward_extra_penalty
+
+                dele = dp[i][j - 1] + delete_penalty
+
+                best = max(diag, ins, dele)
+                dp[i][j] = best
+                trace[i][j] = "M" if best == diag else ("I" if best == ins else "D")
+
+                if i == m and best > best_score:
+                    best_score = best
+                    best_j = j
+
+        matched_indices: list[int] = []
+        i = m
+        j = best_j
+        while i > 0 and j > 0:
+            op = trace[i][j]
+            if op == "M":
+                matched_indices.append(ref_offset + j - 1)
+                i -= 1
+                j -= 1
+            elif op == "I":
+                i -= 1
+            else:
+                j -= 1
+
+        matched_indices.reverse()
+
+        ref_end_idx = ref_offset + best_j - 1
+        ref_end_idx = max(0, min(ref_end_idx, len(self.ref_tokens) - 1))
+        ref_start_idx = matched_indices[0] if matched_indices else max(ref_offset, ref_end_idx)
+        backward_jump = ref_end_idx < self.state.committed_idx
+        norm_score = best_score / max(1, len(hyp_tokens))
+        confidence = 1.0 / (1.0 + exp(-1.25 * norm_score))
+        mode = "backward" if backward_jump else "normal"
+
+        return CandidateAlignment(
+            ref_start_idx=ref_start_idx,
+            ref_end_idx=ref_end_idx,
+            score=best_score,
+            confidence=max(0.0, min(1.0, confidence)),
+            matched_ref_indices=matched_indices,
+            backward_jump=backward_jump,
+            mode=mode,
+        )
 ```
 
 ---
@@ -1134,24 +1222,14 @@ from rapidfuzz import fuzz
 
 
 class AlignmentScorer:
-
-    def score_token_pair(
-        self,
-        ref_char: str,
-        ref_py: str,
-        hyp_char: str,
-        hyp_py: str,
-    ) -> float:
+    def score_token_pair(self, ref_char: str, ref_py: str, hyp_char: str, hyp_py: str) -> float:
         if ref_char == hyp_char:
             return 3.0
-
-        if ref_py == hyp_py:
+        if ref_py and ref_py == hyp_py:
             return 2.0
-
-        py_sim = fuzz.ratio(ref_py, hyp_py)
+        py_sim = fuzz.ratio(ref_py, hyp_py) if ref_py and hyp_py else 0.0
         if py_sim >= 80:
             return 1.0
-
         return -1.5
 
     def insertion_penalty(self) -> float:
@@ -1170,17 +1248,17 @@ class AlignmentScorer:
 ```python
 from __future__ import annotations
 
-from shadowing.types import ReferenceMap, RefToken
+from shadowing.types import RefToken, ReferenceMap
 
 
 class WindowSelector:
-    def __init__(self, look_back: int = 3, look_ahead: int = 18) -> None:
-        self.look_back = look_back
-        self.look_ahead = look_ahead
+    def __init__(self, look_back: int = 8, look_ahead: int = 40) -> None:
+        self.look_back = int(look_back)
+        self.look_ahead = int(look_ahead)
 
     def select(self, ref_map: ReferenceMap, committed_idx: int) -> tuple[list[RefToken], int, int]:
         start = max(0, committed_idx - self.look_back)
-        end = min(len(ref_map.tokens), committed_idx + self.look_ahead)
+        end = min(len(ref_map.tokens), committed_idx + self.look_ahead + 1)
         return ref_map.tokens[start:end], start, end
 ```
 
@@ -1194,9 +1272,10 @@ import math
 import time
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from shadowing.interfaces.asr import ASRProvider
-from shadowing.realtime.asr.normalizer import TextNormalizer
-from shadowing.types import AsrEvent, AsrEventType
+from shadowing.types import AsrEventType, RawAsrEvent
 
 
 @dataclass(slots=True)
@@ -1209,30 +1288,26 @@ class FakeAsrStep:
 @dataclass(slots=True)
 class FakeAsrConfig:
     scripted_steps: list[FakeAsrStep] = field(default_factory=list)
-
     reference_text: str = ""
     chars_per_sec: float = 4.0
     emit_partial_interval_sec: float = 0.12
     emit_final_on_endpoint: bool = True
-
     sample_rate: int = 16000
     bytes_per_sample: int = 2
     channels: int = 1
+    vad_rms_threshold: float = 0.01
+    vad_min_active_ms: float = 30.0
 
 
 class FakeASRProvider(ASRProvider):
-
     def __init__(self, config: FakeAsrConfig) -> None:
         self.config = config
-        self.normalizer = TextNormalizer()
-
         self._running = False
         self._start_at = 0.0
-
         self._script_index = 0
         self._last_emit_at = 0.0
-
         self._bytes_received = 0
+        self._speech_bytes_received = 0
         self._last_progress_text = ""
         self._last_final_text = ""
 
@@ -1244,28 +1319,14 @@ class FakeASRProvider(ASRProvider):
         step_interval_sec: float = 0.28,
         lag_sec: float = 0.5,
         tail_final: bool = True,
-        pause_at_step: int | None = None,
-        pause_extra_sec: float = 0.0,
-        jump_to_char: int | None = None,
-        jump_at_step: int | None = None,
     ) -> "FakeASRProvider":
         clean = reference_text.strip()
         steps: list[FakeAsrStep] = []
-
-        if not clean:
-            return cls(FakeAsrConfig(scripted_steps=[]))
-
         t = lag_sec
         cursor = 0
-        step_idx = 0
-
         while cursor < len(clean):
-            if jump_at_step is not None and jump_to_char is not None and step_idx == jump_at_step:
-                cursor = max(0, min(jump_to_char, len(clean)))
-
             cursor = min(cursor + chars_per_step, len(clean))
             text = clean[:cursor]
-
             if text:
                 steps.append(
                     FakeAsrStep(
@@ -1274,14 +1335,7 @@ class FakeASRProvider(ASRProvider):
                         event_type=AsrEventType.PARTIAL,
                     )
                 )
-
             t += step_interval_sec
-
-            if pause_at_step is not None and step_idx == pause_at_step:
-                t += pause_extra_sec
-
-            step_idx += 1
-
         if tail_final:
             steps.append(
                 FakeAsrStep(
@@ -1290,7 +1344,6 @@ class FakeASRProvider(ASRProvider):
                     event_type=AsrEventType.FINAL,
                 )
             )
-
         return cls(FakeAsrConfig(scripted_steps=steps))
 
     def start(self) -> None:
@@ -1299,15 +1352,33 @@ class FakeASRProvider(ASRProvider):
         self._script_index = 0
         self._last_emit_at = 0.0
         self._bytes_received = 0
+        self._speech_bytes_received = 0
         self._last_progress_text = ""
         self._last_final_text = ""
 
     def feed_pcm16(self, pcm_bytes: bytes) -> None:
-        if not self._running:
+        if not self._running or not pcm_bytes:
             return
+
         self._bytes_received += len(pcm_bytes)
 
-    def poll_events(self) -> list[AsrEvent]:
+        audio_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if audio_i16.size == 0:
+            return
+
+        audio_f32 = audio_i16.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(np.square(audio_f32)))) if audio_f32.size else 0.0
+
+        frame_ms = (
+            1000.0
+            * audio_i16.size
+            / max(1, self.config.sample_rate * self.config.channels)
+        )
+
+        if rms >= self.config.vad_rms_threshold and frame_ms >= self.config.vad_min_active_ms:
+            self._speech_bytes_received += len(pcm_bytes)
+
+    def poll_raw_events(self) -> list[RawAsrEvent]:
         if not self._running:
             return []
 
@@ -1325,84 +1396,62 @@ class FakeASRProvider(ASRProvider):
     def close(self) -> None:
         self._running = False
 
-    def _poll_scripted(self) -> list[AsrEvent]:
+    def _poll_scripted(self) -> list[RawAsrEvent]:
         now = time.monotonic()
         elapsed = now - self._start_at
-        events: list[AsrEvent] = []
+        events: list[RawAsrEvent] = []
 
         while self._script_index < len(self.config.scripted_steps):
             step = self.config.scripted_steps[self._script_index]
             if elapsed < step.offset_sec:
                 break
-
-            normalized = self.normalizer.normalize_text(step.text)
-            pinyin_seq = self.normalizer.to_pinyin_seq(step.text)
-
-            if normalized:
-                events.append(
-                    AsrEvent(
-                        event_type=step.event_type,
-                        text=step.text,
-                        normalized_text=normalized,
-                        pinyin_seq=pinyin_seq,
-                        emitted_at_sec=now,
-                    )
+            events.append(
+                RawAsrEvent(
+                    event_type=step.event_type,
+                    text=step.text,
+                    emitted_at_sec=now,
                 )
-
+            )
             self._script_index += 1
 
         return events
 
-    def _poll_progressive(self) -> list[AsrEvent]:
+    def _poll_progressive(self) -> list[RawAsrEvent]:
         now = time.monotonic()
-        events: list[AsrEvent] = []
-
         if (now - self._last_emit_at) < self.config.emit_partial_interval_sec:
-            return events
+            return []
 
-        total_audio_sec = self._bytes_to_seconds(self._bytes_received)
-        n_chars = int(math.floor(total_audio_sec * self.config.chars_per_sec))
+        total_speech_sec = self._bytes_to_seconds(self._speech_bytes_received)
+        n_chars = int(math.floor(total_speech_sec * self.config.chars_per_sec))
         n_chars = max(0, min(n_chars, len(self.config.reference_text)))
 
         current_text = self.config.reference_text[:n_chars]
+        events: list[RawAsrEvent] = []
 
         if current_text and current_text != self._last_progress_text:
-            normalized = self.normalizer.normalize_text(current_text)
-            pinyin_seq = self.normalizer.to_pinyin_seq(current_text)
-
-            if normalized:
-                events.append(
-                    AsrEvent(
-                        event_type=AsrEventType.PARTIAL,
-                        text=current_text,
-                        normalized_text=normalized,
-                        pinyin_seq=pinyin_seq,
-                        emitted_at_sec=now,
-                    )
+            events.append(
+                RawAsrEvent(
+                    event_type=AsrEventType.PARTIAL,
+                    text=current_text,
+                    emitted_at_sec=now,
                 )
-                self._last_progress_text = current_text
-                self._last_emit_at = now
+            )
+            self._last_progress_text = current_text
+            self._last_emit_at = now
 
         if (
             self.config.emit_final_on_endpoint
             and n_chars >= len(self.config.reference_text)
             and self._last_final_text != self.config.reference_text
         ):
-            final_text = self.config.reference_text
-            normalized = self.normalizer.normalize_text(final_text)
-            pinyin_seq = self.normalizer.to_pinyin_seq(final_text)
-
-            if normalized:
-                events.append(
-                    AsrEvent(
-                        event_type=AsrEventType.FINAL,
-                        text=final_text,
-                        normalized_text=normalized,
-                        pinyin_seq=pinyin_seq,
-                        emitted_at_sec=now,
-                    )
+            events.append(
+                RawAsrEvent(
+                    event_type=AsrEventType.FINAL,
+                    text=self.config.reference_text,
+                    emitted_at_sec=now,
                 )
-                self._last_final_text = self.config.reference_text
+            )
+            self._last_final_text = self.config.reference_text
 
         return events
 
@@ -1412,9 +1461,7 @@ class FakeASRProvider(ASRProvider):
             * self.config.bytes_per_sample
             * self.config.channels
         )
-        if bytes_per_sec <= 0:
-            return 0.0
-        return n_bytes / bytes_per_sec
+        return n_bytes / bytes_per_sec if bytes_per_sec > 0 else 0.0
 ```
 
 ---
@@ -1427,24 +1474,159 @@ import re
 
 from pypinyin import lazy_pinyin
 
+from shadowing.types import AsrEvent, RawAsrEvent
+
 
 class TextNormalizer:
     _drop_pattern = re.compile(r"[，。！？；：、“”‘’\"'（）()\[\]【】<>\-—…,.!?;:/\\|`~@#$%^&*_+=\s]+")
+    _digit_map = str.maketrans(
+        {
+            "0": "零",
+            "1": "一",
+            "2": "二",
+            "3": "三",
+            "4": "四",
+            "5": "五",
+            "6": "六",
+            "7": "七",
+            "8": "八",
+            "9": "九",
+        }
+    )
 
     def normalize_text(self, text: str) -> str:
+        text = (text or "").strip().replace("\u3000", " ")
+        text = text.translate(self._digit_map)
+        return self._drop_pattern.sub("", text)
+
+    def to_chars_from_normalized(self, normalized_text: str) -> list[str]:
+        return list(normalized_text) if normalized_text else []
+
+    def to_pinyin_seq_from_normalized(self, normalized_text: str) -> list[str]:
+        return lazy_pinyin(normalized_text) if normalized_text else []
+
+    def normalize_raw_event(self, event: RawAsrEvent) -> AsrEvent | None:
+        normalized = self.normalize_text(event.text)
+        if not normalized:
+            return None
+        return AsrEvent(
+            event_type=event.event_type,
+            text=event.text,
+            normalized_text=normalized,
+            chars=self.to_chars_from_normalized(normalized),
+            pinyin_seq=self.to_pinyin_seq_from_normalized(normalized),
+            emitted_at_sec=event.emitted_at_sec,
+        )
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/realtime/asr/partial_adapter.py`
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from shadowing.types import AsrEventType, RawAsrEvent
+
+
+@dataclass(slots=True)
+class AdapterDebugInfo:
+    branch: str
+    raw_len: int
+    adapted_len: int
+    overlap: int
+
+
+class RawPartialAdapter:
+    def __init__(self, suffix_overlap_max: int = 24, max_tail_chars: int = 20, debug: bool = False) -> None:
+        self.suffix_overlap_max = int(suffix_overlap_max)
+        self.max_tail_chars = int(max_tail_chars)
+        self.debug = bool(debug)
+        self._last_text = ""
+
+    def reset(self) -> None:
+        self._last_text = ""
+
+    def adapt(self, event: RawAsrEvent) -> RawAsrEvent | None:
+        text = (event.text or "").strip()
         if not text:
-            return ""
+            return None
 
-        text = text.strip()
-        text = text.replace("\u3000", " ")
-        text = self._drop_pattern.sub("", text)
-        return text
+        if event.event_type == AsrEventType.FINAL:
+            self._last_text = text
+            if self.debug:
+                self._log(AdapterDebugInfo("final_passthrough", len(text), len(text), 0), text, text)
+            return RawAsrEvent(
+                event_type=event.event_type,
+                text=text,
+                emitted_at_sec=event.emitted_at_sec,
+            )
 
-    def to_pinyin_seq(self, text: str) -> list[str]:
-        norm = self.normalize_text(text)
-        if not norm:
-            return []
-        return lazy_pinyin(norm)
+        if text == self._last_text:
+            return None
+
+        prev = self._last_text
+        self._last_text = text
+
+        if not prev:
+            tail = text[-self.max_tail_chars :]
+            if self.debug:
+                self._log(AdapterDebugInfo("first_tail", len(text), len(tail), 0), text, tail)
+            return RawAsrEvent(
+                event_type=event.event_type,
+                text=tail,
+                emitted_at_sec=event.emitted_at_sec,
+            )
+
+        if text.startswith(prev):
+            delta = text[len(prev) :]
+            if delta:
+                tail = (prev[-min(len(prev), self.suffix_overlap_max) :] + delta)[-self.max_tail_chars :]
+                if self.debug:
+                    self._log(AdapterDebugInfo("prefix_growth", len(text), len(tail), len(prev)), text, tail)
+                return RawAsrEvent(
+                    event_type=event.event_type,
+                    text=tail,
+                    emitted_at_sec=event.emitted_at_sec,
+                )
+
+        overlap = self._max_suffix_prefix_overlap(prev, text)
+        if overlap > 0:
+            delta_tail = text[overlap:]
+            if delta_tail:
+                tail = text[max(0, overlap - self.suffix_overlap_max) :]
+                tail = tail[-self.max_tail_chars :]
+                if self.debug:
+                    self._log(AdapterDebugInfo("overlap_tail", len(text), len(tail), overlap), text, tail)
+                return RawAsrEvent(
+                    event_type=event.event_type,
+                    text=tail,
+                    emitted_at_sec=event.emitted_at_sec,
+                )
+
+        tail = text[-self.max_tail_chars :]
+        if self.debug:
+            self._log(AdapterDebugInfo("fallback_tail", len(text), len(tail), 0), text, tail)
+        return RawAsrEvent(
+            event_type=event.event_type,
+            text=tail,
+            emitted_at_sec=event.emitted_at_sec,
+        )
+
+    def _max_suffix_prefix_overlap(self, prev: str, current: str) -> int:
+        max_len = min(len(prev), len(current), self.suffix_overlap_max)
+        for k in range(max_len, 0, -1):
+            if prev[-k:] == current[:k]:
+                return k
+        return 0
+
+    def _log(self, info: AdapterDebugInfo, raw_text: str, adapted_text: str) -> None:
+        print(
+            "[ADAPT] "
+            f"branch={info.branch} raw_len={info.raw_len} adapted_len={info.adapted_len} overlap={info.overlap} "
+            f"raw={raw_text!r} adapted={adapted_text!r}"
+        )
 ```
 
 ---
@@ -1459,12 +1641,10 @@ from typing import Any
 import numpy as np
 
 from shadowing.interfaces.asr import ASRProvider
-from shadowing.types import AsrEvent, AsrEventType
-from shadowing.realtime.asr.normalizer import TextNormalizer
+from shadowing.types import AsrEventType, RawAsrEvent
 
 
 class SherpaStreamingProvider(ASRProvider):
-
     def __init__(
         self,
         model_config: dict,
@@ -1472,73 +1652,54 @@ class SherpaStreamingProvider(ASRProvider):
         sample_rate: int = 16000,
         emit_partial_interval_sec: float = 0.08,
         enable_endpoint: bool = True,
-        debug_feed: bool = True,
+        debug_feed: bool = False,
         debug_feed_every_n_chunks: int = 20,
     ) -> None:
         self.model_config = model_config
         self.hotwords = hotwords
-        self.reference_text = model_config.get("reference_text", "")
-        self.sample_rate = sample_rate
-        self.emit_partial_interval_sec = emit_partial_interval_sec
-        self.enable_endpoint = enable_endpoint
-
+        self.sample_rate = int(sample_rate)
+        self.emit_partial_interval_sec = float(emit_partial_interval_sec)
+        self.enable_endpoint = bool(enable_endpoint)
         self.debug_feed = bool(debug_feed)
         self.debug_feed_every_n_chunks = max(1, int(debug_feed_every_n_chunks))
-
-        self.normalizer = TextNormalizer()
 
         self._recognizer: Any | None = None
         self._stream: Any | None = None
         self._running = False
-
         self._last_partial_text = ""
         self._last_final_text = ""
         self._last_emit_at = 0.0
-
         self._feed_counter = 0
         self._decode_counter = 0
+        self._endpoint_count = 0
+        self._last_endpoint_at = 0.0
+        self._final_emit_count = 0
 
-        self._last_partial_normalized = ""
-        self._last_emitted_normalized = ""
-
-        self._reference_norm = ""
-        self._anchor_candidates: list[str] = []
-
-        self._last_trim_source_norm = ""
-        self._last_trim_tail_norm = ""
-        self._last_trim_kind = ""
-
-        self._suffix_overlap_max = int(self.model_config.get("suffix_overlap_max", 24))
-        self._tail_trim_min_len = int(self.model_config.get("tail_trim_min_len", 2))
-        self._anchor_min_len = int(self.model_config.get("anchor_min_len", 3))
-        self._anchor_max_len = int(self.model_config.get("anchor_max_len", 6))
+        self._last_partial_log_text = ""
+        self._last_summary_log_at = 0.0
+        self._summary_interval_sec = 2.5
+        self._last_ready_state = False
+        self._last_endpoint_state = False
 
     def start(self) -> None:
         self._recognizer = self._build_recognizer()
         self._stream = self._recognizer.create_stream()
         self._running = True
-
         self._last_partial_text = ""
         self._last_final_text = ""
         self._last_emit_at = 0.0
-
         self._feed_counter = 0
         self._decode_counter = 0
-
-        self._last_partial_normalized = ""
-        self._last_emitted_normalized = ""
-
-        self._last_trim_source_norm = ""
-        self._last_trim_tail_norm = ""
-        self._last_trim_kind = ""
-
-        self._build_reference_anchors()
+        self._endpoint_count = 0
+        self._last_endpoint_at = 0.0
+        self._final_emit_count = 0
+        self._last_partial_log_text = ""
+        self._last_summary_log_at = time.monotonic()
+        self._last_ready_state = False
+        self._last_endpoint_state = False
 
     def feed_pcm16(self, pcm_bytes: bytes) -> None:
-        if not self._running or self._recognizer is None or self._stream is None:
-            return
-
-        if not pcm_bytes:
+        if not self._running or self._recognizer is None or self._stream is None or not pcm_bytes:
             return
 
         audio_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
@@ -1546,302 +1707,188 @@ class SherpaStreamingProvider(ASRProvider):
             return
 
         audio_f32 = audio_i16.astype(np.float32) / 32768.0
-
         self._feed_counter += 1
+
         if self.debug_feed and self._feed_counter % self.debug_feed_every_n_chunks == 0:
             abs_mean = float(np.mean(np.abs(audio_f32))) if audio_f32.size else 0.0
             peak = float(np.max(np.abs(audio_f32))) if audio_f32.size else 0.0
             print(
-                f"[ASR-FEED] chunks={self._feed_counter} "
-                f"samples={audio_f32.size} abs_mean={abs_mean:.5f} peak={peak:.5f}"
+                f"[ASR-FEED] chunks={self._feed_counter} samples={audio_f32.size} "
+                f"abs_mean={abs_mean:.5f} peak={peak:.5f}"
             )
 
         self._stream.accept_waveform(self.sample_rate, audio_f32)
 
+        ready_before = self._recognizer.is_ready(self._stream)
+        if self.debug_feed and ready_before and not self._last_ready_state:
+            print(f"[ASR-READY] stream became ready at feed_chunks={self._feed_counter}")
+        self._last_ready_state = bool(ready_before)
+
         while self._recognizer.is_ready(self._stream):
             self._recognizer.decode_stream(self._stream)
             self._decode_counter += 1
 
-        if self.debug_feed and self._feed_counter % self.debug_feed_every_n_chunks == 0:
-            print(f"[ASR-FEED] decode_counter={self._decode_counter}")
+        self._maybe_log_summary()
 
-    def poll_events(self) -> list[AsrEvent]:
+    def poll_raw_events(self) -> list[RawAsrEvent]:
         if not self._running or self._recognizer is None or self._stream is None:
             return []
 
         now = time.monotonic()
-        events: list[AsrEvent] = []
+        events: list[RawAsrEvent] = []
 
         while self._recognizer.is_ready(self._stream):
             self._recognizer.decode_stream(self._stream)
             self._decode_counter += 1
 
-        raw_partial_text = self._get_partial_text()
-        processed_text = self._postprocess_partial_text(raw_partial_text) if raw_partial_text else ""
+        partial_text = self._get_result_text().strip()
+
+        if self.debug_feed and partial_text and partial_text != self._last_partial_log_text:
+            print(f"[ASR-PARTIAL-RAW] {partial_text!r}")
+            self._last_partial_log_text = partial_text
 
         if (
-            processed_text
-            and processed_text != self._last_partial_text
+            partial_text
+            and partial_text != self._last_partial_text
             and (now - self._last_emit_at) >= self.emit_partial_interval_sec
         ):
-            normalized = self.normalizer.normalize_text(processed_text)
-            pinyin_seq = self.normalizer.to_pinyin_seq(processed_text)
+            events.append(
+                RawAsrEvent(
+                    event_type=AsrEventType.PARTIAL,
+                    text=partial_text,
+                    emitted_at_sec=now,
+                )
+            )
+            self._last_partial_text = partial_text
+            self._last_emit_at = now
 
-            if normalized:
+        endpoint_hit = self.enable_endpoint and self._is_endpoint()
+        if self.debug_feed and endpoint_hit and not self._last_endpoint_state:
+            preview = partial_text[:48]
+            print(
+                f"[ASR-ENDPOINT-HIT] count_next={self._endpoint_count + 1} "
+                f"partial_len={len(partial_text)} preview={preview!r}"
+            )
+        self._last_endpoint_state = bool(endpoint_hit)
+
+        if endpoint_hit:
+            self._endpoint_count += 1
+            self._last_endpoint_at = now
+            final_text = self._get_result_text().strip()
+
+            if self.debug_feed and final_text and final_text != self._last_final_text:
+                print(f"[ASR-FINAL-RAW] {final_text!r}")
+
+            if final_text and final_text != self._last_final_text:
                 events.append(
-                    AsrEvent(
-                        event_type=AsrEventType.PARTIAL,
-                        text=processed_text,
-                        normalized_text=normalized,
-                        pinyin_seq=pinyin_seq,
+                    RawAsrEvent(
+                        event_type=AsrEventType.FINAL,
+                        text=final_text,
                         emitted_at_sec=now,
                     )
                 )
-                self._last_partial_text = processed_text
-                self._last_partial_normalized = normalized
-                self._last_emit_at = now
-
-        if self.enable_endpoint and self._is_endpoint():
-            final_text = self._get_final_text()
-            if final_text and final_text != self._last_final_text:
-                normalized = self.normalizer.normalize_text(final_text)
-                pinyin_seq = self.normalizer.to_pinyin_seq(final_text)
-
-                if normalized:
-                    events.append(
-                        AsrEvent(
-                            event_type=AsrEventType.FINAL,
-                            text=final_text,
-                            normalized_text=normalized,
-                            pinyin_seq=pinyin_seq,
-                            emitted_at_sec=now,
-                        )
-                    )
-                    self._last_final_text = final_text
+                self._last_final_text = final_text
+                self._final_emit_count += 1
 
             self._reset_stream_state_only()
+            self._last_partial_text = ""
+            self._last_partial_log_text = ""
+            self._last_ready_state = False
+            self._last_endpoint_state = False
 
+            if self.debug_feed:
+                print(
+                    f"[ASR-ENDPOINT] count={self._endpoint_count} "
+                    f"final_count={self._final_emit_count} "
+                    f"last_endpoint_at={self._last_endpoint_at:.3f}"
+                )
+
+        self._maybe_log_summary()
         return events
 
     def reset(self) -> None:
         if self._recognizer is None:
             return
-
         self._reset_stream_state_only()
-
         self._last_partial_text = ""
         self._last_final_text = ""
         self._last_emit_at = 0.0
-
         self._feed_counter = 0
         self._decode_counter = 0
-
-        self._last_partial_normalized = ""
-        self._last_emitted_normalized = ""
-
-        self._last_trim_source_norm = ""
-        self._last_trim_tail_norm = ""
-        self._last_trim_kind = ""
-
-        self._build_reference_anchors()
+        self._endpoint_count = 0
+        self._last_endpoint_at = 0.0
+        self._final_emit_count = 0
+        self._last_partial_log_text = ""
+        self._last_summary_log_at = time.monotonic()
+        self._last_ready_state = False
+        self._last_endpoint_state = False
 
     def close(self) -> None:
         self._running = False
         self._stream = None
         self._recognizer = None
 
-    def _build_reference_anchors(self) -> None:
-        self._reference_norm = self.normalizer.normalize_text(self.reference_text or "")
-        self._anchor_candidates = []
-
-        if not self._reference_norm:
-            return
-
-        max_len = min(self._anchor_max_len, len(self._reference_norm))
-        min_len = min(self._anchor_min_len, max_len)
-
-        for n in range(max_len, min_len - 1, -1):
-            anchor = self._reference_norm[:n]
-            if anchor and anchor not in self._anchor_candidates:
-                self._anchor_candidates.append(anchor)
-
-    def _postprocess_partial_text(self, raw_partial_text: str) -> str:
-        current_norm = self.normalizer.normalize_text(raw_partial_text)
-        if not current_norm:
-            return raw_partial_text
-
-        prev_emit_norm = self._last_emitted_normalized
-        prev_partial_norm = self._last_partial_normalized
-
-        if current_norm == prev_partial_norm:
-            return raw_partial_text
-
-        forced_tail = self._extract_forced_last_anchor_tail(current_norm)
-        if forced_tail:
-            return self._commit_trim(
-                kind="forced_anchor_tail",
-                source_norm=current_norm,
-                tail_norm=forced_tail,
-                prev_emit_norm=prev_emit_norm,
-            )
-
-        if prev_emit_norm and current_norm.startswith(prev_emit_norm):
-            appended = current_norm[len(prev_emit_norm):]
-            self._last_emitted_normalized = current_norm
-            return current_norm if appended else raw_partial_text
-
-        overlap = self._max_suffix_prefix_overlap(prev_emit_norm, current_norm)
-        if overlap > 0:
-            new_tail = current_norm[overlap:]
-            if len(new_tail) >= self._tail_trim_min_len:
-                return self._commit_trim(
-                    kind="overlap",
-                    source_norm=current_norm,
-                    tail_norm=new_tail,
-                    prev_emit_norm=prev_emit_norm,
-                    extra=f"overlap={overlap}",
-                )
-
-        self._last_emitted_normalized = current_norm
-        return current_norm
-
-    def _commit_trim(
-        self,
-        kind: str,
-        source_norm: str,
-        tail_norm: str,
-        prev_emit_norm: str,
-        extra: str = "",
-    ) -> str:
-        if (
-            source_norm == self._last_trim_source_norm
-            and tail_norm == self._last_trim_tail_norm
-            and kind == self._last_trim_kind
-        ):
-            self._last_emitted_normalized = tail_norm
-            return tail_norm
-
-        self._last_trim_source_norm = source_norm
-        self._last_trim_tail_norm = tail_norm
-        self._last_trim_kind = kind
-        self._last_emitted_normalized = tail_norm
-
-        msg = (
-            f"[ASR-TRIM] {kind}, "
-            f"prev_emit_norm={prev_emit_norm!r}, "
-            f"current_norm={source_norm!r}, "
-            f"tail={tail_norm!r}"
-        )
-        if extra:
-            msg = f"[ASR-TRIM] {extra}, " + msg[len("[ASR-TRIM] ") :]
-        print(msg)
-        return tail_norm
-
-    def _extract_forced_last_anchor_tail(self, current_norm: str) -> str:
-        if not current_norm or not self._anchor_candidates:
-            return ""
-
-        best_tail = ""
-        best_pos = -1
-
-        for anchor in self._anchor_candidates:
-            first_pos = current_norm.find(anchor)
-            last_pos = current_norm.rfind(anchor)
-            if first_pos == -1 or last_pos == -1:
-                continue
-            if last_pos <= first_pos:
-                continue
-
-            tail = current_norm[last_pos:]
-            if len(tail) < self._tail_trim_min_len:
-                continue
-
-            if last_pos > best_pos:
-                best_pos = last_pos
-                best_tail = tail
-
-        return best_tail
-
-    def _max_suffix_prefix_overlap(self, prev_norm: str, current_norm: str) -> int:
-        if not prev_norm or not current_norm:
-            return 0
-
-        max_len = min(len(prev_norm), len(current_norm), self._suffix_overlap_max)
-        for k in range(max_len, 0, -1):
-            if prev_norm[-k:] == current_norm[:k]:
-                return k
-        return 0
-
-    def _get_partial_text(self) -> str:
+    def _get_result_text(self) -> str:
         result = self._recognizer.get_result(self._stream)
-
         if isinstance(result, str):
-            return result.strip()
-
+            return result
         if hasattr(result, "text"):
-            return (result.text or "").strip()
-
+            return str(result.text or "")
         if isinstance(result, dict):
-            return str(result.get("text", "")).strip()
-
-        return ""
-
-    def _get_final_text(self) -> str:
-        result = self._recognizer.get_result(self._stream)
-
-        if isinstance(result, str):
-            return result.strip()
-
-        if hasattr(result, "text"):
-            return (result.text or "").strip()
-
-        if isinstance(result, dict):
-            return str(result.get("text", "")).strip()
-
+            return str(result.get("text", ""))
         return ""
 
     def _is_endpoint(self) -> bool:
         if self._recognizer is None or self._stream is None:
             return False
-
         if hasattr(self._recognizer, "is_endpoint"):
             try:
                 return bool(self._recognizer.is_endpoint(self._stream))
             except TypeError:
                 return False
-
         return False
 
     def _reset_stream_state_only(self) -> None:
         if self._recognizer is not None:
             self._stream = self._recognizer.create_stream()
 
+    def _maybe_log_summary(self) -> None:
+        if not self.debug_feed:
+            return
+
+        now = time.monotonic()
+        if (now - self._last_summary_log_at) < self._summary_interval_sec:
+            return
+
+        current_text = self._get_result_text().strip() if self._recognizer is not None and self._stream is not None else ""
+        preview = current_text[:32]
+        print(
+            f"[ASR-SUMMARY] feeds={self._feed_counter} decodes={self._decode_counter} "
+            f"partials_len={len(self._last_partial_text)} finals={self._final_emit_count} "
+            f"endpoints={self._endpoint_count} preview={preview!r}"
+        )
+        self._last_summary_log_at = now
+
     def _build_recognizer(self):
         import sherpa_onnx
 
         cfg = self.model_config
-
         tokens = cfg.get("tokens", "")
         encoder = cfg.get("encoder", "")
         decoder = cfg.get("decoder", "")
         joiner = cfg.get("joiner", "")
-
-        missing = []
-        if not tokens:
-            missing.append("tokens")
-        if not encoder:
-            missing.append("encoder")
-        if not decoder:
-            missing.append("decoder")
-        if not joiner:
-            missing.append("joiner")
-
-        if missing:
-            raise ValueError(
-                "Missing sherpa model paths in config: "
-                + ", ".join(missing)
-                + ". Please set SHERPA_TOKENS / SHERPA_ENCODER / SHERPA_DECODER / SHERPA_JOINER."
+        missing = [
+            name
+            for name, value in (
+                ("tokens", tokens),
+                ("encoder", encoder),
+                ("decoder", decoder),
+                ("joiner", joiner),
             )
+            if not value
+        ]
+        if missing:
+            raise ValueError("Missing sherpa model paths in config: " + ", ".join(missing))
 
         base_kwargs = dict(
             tokens=tokens,
@@ -1854,12 +1901,10 @@ class SherpaStreamingProvider(ASRProvider):
             decoding_method=cfg.get("decoding_method", "greedy_search"),
             provider=cfg.get("provider", "cpu"),
         )
-
         hotword_kwargs = dict(
             hotwords=self.hotwords or cfg.get("hotwords", ""),
             hotwords_score=cfg.get("hotwords_score", 1.5),
         )
-
         endpoint_kwargs = dict(
             enable_endpoint_detection=self.enable_endpoint,
             rule1_min_trailing_silence=cfg.get("rule1_min_trailing_silence", 10.0),
@@ -1874,27 +1919,13 @@ class SherpaStreamingProvider(ASRProvider):
                 **endpoint_kwargs,
             )
         except TypeError:
-            pass
-
-        try:
-            return sherpa_onnx.OnlineRecognizer.from_transducer(
-                **base_kwargs,
-                **endpoint_kwargs,
-            )
-        except TypeError:
-            pass
-
-        try:
-            return sherpa_onnx.OnlineRecognizer.from_transducer(
-                **base_kwargs,
-            )
-        except TypeError as e:
-            raise RuntimeError(
-                "Failed to build sherpa recognizer. "
-                "Your installed sherpa-onnx version uses a different "
-                "OnlineRecognizer.from_transducer() signature. "
-                "Please inspect the local sherpa_onnx Python API."
-            ) from e
+            try:
+                return sherpa_onnx.OnlineRecognizer.from_transducer(
+                    **base_kwargs,
+                    **endpoint_kwargs,
+                )
+            except TypeError:
+                return sherpa_onnx.OnlineRecognizer.from_transducer(**base_kwargs)
 ```
 
 ---
@@ -1921,16 +1952,12 @@ class InputDeviceInfo:
 def list_input_devices() -> list[InputDeviceInfo]:
     devices = sd.query_devices()
     hostapis = sd.query_hostapis()
-
     results: list[InputDeviceInfo] = []
     for idx, dev in enumerate(devices):
         max_in = int(dev["max_input_channels"])
         if max_in <= 0:
             continue
-
-        hostapi_idx = int(dev["hostapi"])
-        hostapi_name = hostapis[hostapi_idx]["name"]
-
+        hostapi_name = hostapis[int(dev["hostapi"])]["name"]
         results.append(
             InputDeviceInfo(
                 index=idx,
@@ -1944,18 +1971,9 @@ def list_input_devices() -> list[InputDeviceInfo]:
 
 
 def print_input_devices() -> None:
-    devices = list_input_devices()
-    if not devices:
-        print("No input devices found.")
-        return
-
-    print("Available input devices:")
-    for d in devices:
+    for d in list_input_devices():
         print(
-            f"[{d.index}] {d.name} | "
-            f"hostapi={d.hostapi_name} | "
-            f"max_in={d.max_input_channels} | "
-            f"default_sr={d.default_samplerate}"
+            f"[{d.index}] {d.name} | hostapi={d.hostapi_name} | max_in={d.max_input_channels} | default_sr={d.default_samplerate}"
         )
 
 
@@ -1966,45 +1984,28 @@ def get_default_input_device_index() -> int | None:
     return int(default_input)
 
 
-def choose_input_device(
-    preferred_index: int | None = None,
-    preferred_name_substring: str | None = None,
-) -> int | None:
+def choose_input_device(preferred_index: int | None = None, preferred_name_substring: str | None = None) -> int | None:
     devices = list_input_devices()
     if not devices:
         return None
-
     if preferred_index is not None:
         for d in devices:
             if d.index == preferred_index:
                 return d.index
-
     if preferred_name_substring:
         keyword = preferred_name_substring.lower()
         for d in devices:
             if keyword in d.name.lower():
                 return d.index
-
     default_idx = get_default_input_device_index()
     if default_idx is not None:
         return default_idx
-
     return devices[0].index
 
 
-def check_input_settings(
-    device: int | None,
-    samplerate: int,
-    channels: int = 1,
-    dtype: str = "float32",
-) -> bool:
+def check_input_settings(device: int | None, samplerate: int, channels: int = 1, dtype: str = "float32") -> bool:
     try:
-        sd.check_input_settings(
-            device=device,
-            samplerate=samplerate,
-            channels=channels,
-            dtype=dtype,
-        )
+        sd.check_input_settings(device=device, samplerate=samplerate, channels=channels, dtype=dtype)
         return True
     except Exception:
         return False
@@ -2016,35 +2017,13 @@ def pick_working_input_config(
     channels: int = 1,
     dtype: str = "float32",
 ) -> dict[str, Any] | None:
-    if preferred_rates is None:
-        preferred_rates = [48000, 44100, 16000]
-
+    preferred_rates = preferred_rates or [48000, 44100, 16000]
     device = choose_input_device(preferred_index=preferred_device)
     if device is None:
         return None
-
     for sr in preferred_rates:
         if check_input_settings(device=device, samplerate=sr, channels=channels, dtype=dtype):
-            return {
-                "device": device,
-                "samplerate": sr,
-                "channels": channels,
-                "dtype": dtype,
-            }
-
-    try:
-        dev = sd.query_devices(device)
-        default_sr = int(float(dev["default_samplerate"]))
-        if check_input_settings(device=device, samplerate=default_sr, channels=channels, dtype=dtype):
-            return {
-                "device": device,
-                "samplerate": default_sr,
-                "channels": channels,
-                "dtype": dtype,
-            }
-    except Exception:
-        pass
-
+            return {"device": device, "samplerate": sr, "channels": channels, "dtype": dtype}
     return None
 ```
 
@@ -2061,32 +2040,23 @@ from scipy.signal import resample_poly
 
 
 class AudioResampler:
-
     def __init__(self, src_rate: int, dst_rate: int) -> None:
-        self.src_rate = src_rate
-        self.dst_rate = dst_rate
-
-        g = gcd(src_rate, dst_rate)
-        self.up = dst_rate // g
-        self.down = src_rate // g
+        self.src_rate = int(src_rate)
+        self.dst_rate = int(dst_rate)
+        g = gcd(self.src_rate, self.dst_rate)
+        self.up = self.dst_rate // g
+        self.down = self.src_rate // g
 
     def float_to_pcm16_bytes(self, audio: np.ndarray) -> bytes:
-        if audio.ndim != 1:
-            raise ValueError(f"Expected mono audio with shape (n,), got {audio.shape}")
-
         clipped = np.clip(audio, -1.0, 1.0)
-        pcm16 = (clipped * 32767.0).astype(np.int16)
-        return pcm16.tobytes()
+        return (clipped * 32767.0).astype(np.int16).tobytes()
 
     def process_float_mono(self, audio: np.ndarray) -> bytes:
         if audio.ndim != 1:
             raise ValueError(f"Expected mono audio with shape (n,), got {audio.shape}")
-
         if self.src_rate == self.dst_rate:
             return self.float_to_pcm16_bytes(audio)
-
-        y = resample_poly(audio, self.up, self.down)
-        y = y.astype(np.float32, copy=False)
+        y = resample_poly(audio, self.up, self.down).astype(np.float32, copy=False)
         return self.float_to_pcm16_bytes(y)
 ```
 
@@ -2098,33 +2068,33 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Callable
+from collections.abc import Callable
 
 import numpy as np
 import pythoncom
 import soundcard as sc
 
 from shadowing.interfaces.recorder import Recorder
+from shadowing.realtime.capture.resampler import AudioResampler
 
 
 class SoundCardRecorder(Recorder):
-
     def __init__(
         self,
         sample_rate_in: int,
         target_sample_rate: int,
         channels: int = 1,
         device: int | str | None = None,
-        block_frames: int = 1024,
+        block_frames: int = 1440,
         include_loopback: bool = False,
-        debug_level_meter: bool = True,
+        debug_level_meter: bool = False,
         debug_level_every_n_blocks: int = 20,
     ) -> None:
         self.sample_rate_in = int(sample_rate_in)
         self.target_sample_rate = int(target_sample_rate)
         self.channels = int(channels)
         self.device = device
-        self.block_frames = int(block_frames)
+        self.block_frames = max(128, int(block_frames))
         self.include_loopback = bool(include_loopback)
 
         self.debug_level_meter = bool(debug_level_meter)
@@ -2138,6 +2108,7 @@ class SoundCardRecorder(Recorder):
         self._opened_channels: int | None = None
         self._opened_samplerate: int | None = None
         self._debug_counter = 0
+        self._resampler: AudioResampler | None = None
 
     def start(self, on_audio_frame: Callable[[bytes], None]) -> None:
         if self._running:
@@ -2155,15 +2126,24 @@ class SoundCardRecorder(Recorder):
                     f"[REC-SC] trying mic={self._mic.name!r} "
                     f"samplerate={sr} channels={ch}"
                 )
-
                 with self._mic.recorder(samplerate=sr, channels=ch) as rec:
-                    _ = rec.record(numframes=min(self.block_frames, 256))
+                    pilot = rec.record(numframes=min(self.block_frames, 256))
 
-                self._opened_samplerate = sr
-                self._opened_channels = ch
+                pilot_audio = np.asarray(pilot, dtype=np.float32).reshape(-1)
+                pilot_rms = float(np.sqrt(np.mean(np.square(pilot_audio)))) if pilot_audio.size else 0.0
+                pilot_peak = float(np.max(np.abs(pilot_audio))) if pilot_audio.size else 0.0
+
+                self._opened_samplerate = int(sr)
+                self._opened_channels = int(ch)
+                self._resampler = AudioResampler(
+                    src_rate=self._opened_samplerate,
+                    dst_rate=self.target_sample_rate,
+                )
+
                 print(
                     f"[REC-SC] opened mic={self._mic.name!r} "
-                    f"samplerate={sr} channels={ch}"
+                    f"samplerate={self._opened_samplerate} channels={self._opened_channels} "
+                    f"pilot_rms={pilot_rms:.5f} pilot_peak={pilot_peak:.5f}"
                 )
                 last_error = None
                 break
@@ -2203,6 +2183,12 @@ class SoundCardRecorder(Recorder):
 
         pythoncom.CoInitialize()
         try:
+            print(
+                f"[REC-SC] capture_loop started mic={self._mic.name!r} "
+                f"samplerate={self._opened_samplerate} channels={self._opened_channels} "
+                f"block_frames={self.block_frames}"
+            )
+
             with self._mic.recorder(
                 samplerate=self._opened_samplerate,
                 channels=self._opened_channels,
@@ -2224,21 +2210,21 @@ class SoundCardRecorder(Recorder):
 
                     mono = np.squeeze(audio, axis=1).astype(np.float32, copy=False)
 
+                    self._debug_counter += 1
                     if self.debug_level_meter:
-                        self._debug_counter += 1
-                        if self._debug_counter % self.debug_level_every_n_blocks == 0:
+                        if self._debug_counter <= 3 or self._debug_counter % self.debug_level_every_n_blocks == 0:
                             rms = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
                             peak = float(np.max(np.abs(mono))) if mono.size else 0.0
-                            print(f"[REC-SC] rms={rms:.5f} peak={peak:.5f}")
+                            print(
+                                f"[REC-SC] rms={rms:.5f} peak={peak:.5f} "
+                                f"frames={mono.shape[0]}"
+                            )
 
-                    src_sr = self._opened_samplerate
-                    if src_sr != self.target_sample_rate:
-                        mono = self._resample_linear(mono, src_sr, self.target_sample_rate)
+                    if self._resampler is None:
+                        raise RuntimeError("SoundCardRecorder resampler is not initialized.")
 
-                    pcm16 = np.clip(mono, -1.0, 1.0)
-                    pcm16 = (pcm16 * 32767.0).astype(np.int16)
-
-                    self._callback(pcm16.tobytes())
+                    pcm16_bytes = self._resampler.process_float_mono(mono)
+                    self._callback(pcm16_bytes)
         except Exception as e:
             print(f"[REC-SC] capture loop stopped due to error: {e}")
         finally:
@@ -2249,12 +2235,12 @@ class SoundCardRecorder(Recorder):
         candidates: list[tuple[int, int]] = []
 
         candidate_srs: list[int] = []
-        for sr in [self.sample_rate_in, 48000, 44100]:
+        for sr in [self.sample_rate_in, 48000, 44100, 16000]:
             if sr > 0 and sr not in candidate_srs:
                 candidate_srs.append(sr)
 
         candidate_channels: list[int] = []
-        for ch in [1, 2, self.channels]:
+        for ch in [1, self.channels, 2]:
             if ch > 0 and ch not in candidate_channels:
                 candidate_channels.append(ch)
 
@@ -2282,31 +2268,36 @@ class SoundCardRecorder(Recorder):
 
         if isinstance(device, int):
             if 0 <= device < len(mics):
-                print(f"[REC-SC] using microphone index={device}: {mics[device].name!r}")
+                print(f"[REC-SC] using soundcard microphone index={device}: {mics[device].name!r}")
                 return mics[device]
-            raise ValueError(f"Microphone index out of range for soundcard: {device}")
+            raise ValueError(
+                f"Soundcard microphone index out of range: {device}. "
+                f"Valid range is 0..{len(mics) - 1}. "
+                "Note: soundcard backend uses its own microphone list index, not sounddevice raw device index."
+            )
 
         key = str(device).strip().lower()
+
+        if key.isdigit():
+            idx = int(key)
+            if 0 <= idx < len(mics):
+                print(f"[REC-SC] using soundcard microphone index={idx}: {mics[idx].name!r}")
+                return mics[idx]
+            raise ValueError(
+                f"Soundcard microphone index out of range: {idx}. "
+                f"Valid range is 0..{len(mics) - 1}. "
+                "Note: soundcard backend uses its own microphone list index, not sounddevice raw device index."
+            )
+
         for mic in mics:
             if key in mic.name.lower():
                 print(f"[REC-SC] matched microphone {device!r} -> {mic.name!r}")
                 return mic
 
-        raise ValueError(f"No matching microphone found for {device!r}")
-
-    @staticmethod
-    def _resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-        if src_sr == dst_sr or x.size == 0:
-            return x.astype(np.float32, copy=False)
-
-        duration = x.shape[0] / float(src_sr)
-        dst_n = max(1, int(round(duration * dst_sr)))
-
-        src_idx = np.linspace(0, x.shape[0] - 1, num=x.shape[0], dtype=np.float32)
-        dst_idx = np.linspace(0, x.shape[0] - 1, num=dst_n, dtype=np.float32)
-
-        y = np.interp(dst_idx, src_idx, x).astype(np.float32)
-        return y
+        raise ValueError(
+            f"No matching microphone found for {device!r}. "
+            "For soundcard backend, pass either a soundcard microphone list index or a device name substring."
+        )
 ```
 
 ---
@@ -2315,14 +2306,13 @@ class SoundCardRecorder(Recorder):
 ```python
 from __future__ import annotations
 
-import threading
-import time
-from typing import Callable, Any
+from typing import Any, Callable
 
 import numpy as np
 import sounddevice as sd
 
 from shadowing.interfaces.recorder import Recorder
+from shadowing.realtime.capture.resampler import AudioResampler
 
 
 class SoundDeviceRecorder(Recorder):
@@ -2335,122 +2325,46 @@ class SoundDeviceRecorder(Recorder):
         dtype: str = "float32",
         blocksize: int = 0,
         latency: str | float = "low",
-        probe_duration_sec: float = 0.45,
-        probe_rms_threshold: float = 1e-4,
-        probe_peak_threshold: float = 8e-4,
     ) -> None:
         self.sample_rate_in = int(sample_rate_in)
         self.target_sample_rate = int(target_sample_rate)
         self.channels = int(channels)
         self.device = device
         self.dtype = dtype
-        self.blocksize = blocksize
+        self.blocksize = int(blocksize)
         self.latency = latency
-
-        self.probe_duration_sec = float(probe_duration_sec)
-        self.probe_rms_threshold = float(probe_rms_threshold)
-        self.probe_peak_threshold = float(probe_peak_threshold)
-
         self._stream: sd.InputStream | None = None
         self._callback: Callable[[bytes], None] | None = None
-
-        self._opened_channels: int | None = None
         self._opened_samplerate: int | None = None
-        self._resolved_input_device: int | None = None
+        self._opened_channels: int | None = None
+        self._resampler: AudioResampler | None = None
 
     def start(self, on_audio_frame: Callable[[bytes], None]) -> None:
         if self._stream is not None:
             return
-
         self._callback = on_audio_frame
-
-        input_device_index = self._resolve_input_device(self.device)
-        self._resolved_input_device = input_device_index
-
-        dev_info = sd.query_devices(input_device_index, "input")
+        device = self._resolve_input_device(self.device)
+        dev_info = sd.query_devices(device, "input")
         max_in = int(dev_info["max_input_channels"])
-        default_sr = int(float(dev_info["default_samplerate"]))
-        device_name = str(dev_info["name"])
+        if max_in < 1:
+            raise RuntimeError(f"Invalid input device: {dev_info}")
 
-        candidate_sample_rates: list[int] = []
-        for sr in [self.sample_rate_in, default_sr, 48000, 44100]:
-            if sr > 0 and sr not in candidate_sample_rates:
-                candidate_sample_rates.append(sr)
+        opened_channels = max(1, min(self.channels, max_in))
+        sr = self._pick_openable_samplerate(device, dev_info, opened_channels)
+        self._opened_samplerate = sr
+        self._opened_channels = opened_channels
+        self._resampler = AudioResampler(src_rate=sr, dst_rate=self.target_sample_rate)
 
-        candidate_channels: list[int] = []
-        for ch in [2, 1, max_in, self.channels]:
-            if ch > 0 and ch <= max_in and ch not in candidate_channels:
-                candidate_channels.append(ch)
-
-        last_error: Exception | None = None
-        best_silent_candidate: tuple[int, int, float, float] | None = None
-
-        for sr in candidate_sample_rates:
-            for ch in candidate_channels:
-                try:
-                    print(
-                        f"[REC] probing raw_device={input_device_index} "
-                        f"name={device_name!r} samplerate={sr} channels={ch} dtype={self.dtype}"
-                    )
-
-                    ok, rms, peak = self._probe_candidate(
-                        device=input_device_index,
-                        samplerate=sr,
-                        channels=ch,
-                    )
-
-                    print(
-                        f"[REC] probe_result raw_device={input_device_index} "
-                        f"samplerate={sr} channels={ch} "
-                        f"rms={rms:.6f} peak={peak:.6f} ok={ok}"
-                    )
-
-                    if ok:
-                        self._stream = sd.InputStream(
-                            samplerate=sr,
-                            blocksize=self.blocksize,
-                            device=input_device_index,
-                            channels=ch,
-                            dtype=self.dtype,
-                            latency=self.latency,
-                            callback=self._audio_callback,
-                        )
-                        self._stream.start()
-
-                        self._opened_channels = ch
-                        self._opened_samplerate = sr
-
-                        print(
-                            f"[REC] opened raw_device={input_device_index} "
-                            f"name={device_name!r} samplerate={sr} channels={ch}"
-                        )
-                        return
-
-                    if best_silent_candidate is None or (peak > best_silent_candidate[3]):
-                        best_silent_candidate = (sr, ch, rms, peak)
-
-                except Exception as e:
-                    last_error = e
-                    self._stream = None
-                    print(
-                        f"[REC] probe/open failed raw_device={input_device_index} "
-                        f"samplerate={sr} channels={ch} -> {e}"
-                    )
-
-        extra = ""
-        if best_silent_candidate is not None:
-            sr, ch, rms, peak = best_silent_candidate
-            extra = (
-                f" Best silent candidate: samplerate={sr}, channels={ch}, "
-                f"rms={rms:.6f}, peak={peak:.6f}."
-            )
-
-        raise RuntimeError(
-            "Failed to find a recording config with real input signal. "
-            f"raw_device={input_device_index}, name={device_name!r}, "
-            f"max_input_channels={max_in}, default_samplerate={default_sr}. "
-            f"Last error: {last_error}.{extra}"
+        self._stream = sd.InputStream(
+            samplerate=sr,
+            blocksize=self.blocksize,
+            device=device,
+            channels=opened_channels,
+            dtype=self.dtype,
+            latency=self.latency,
+            callback=self._audio_callback,
         )
+        self._stream.start()
 
     def stop(self) -> None:
         if self._stream is not None:
@@ -2466,354 +2380,40 @@ class SoundDeviceRecorder(Recorder):
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         if self._callback is None:
             return
-
         if status:
             print(f"[REC] callback status: {status}")
-
-        audio = np.asarray(indata)
-
+        audio = np.asarray(indata, dtype=np.float32)
         if audio.ndim == 1:
-            audio = audio[:, None]
-
-        if audio.shape[1] > 1:
-            audio = np.mean(audio, axis=1, keepdims=True)
-
-        mono = np.squeeze(audio, axis=1).astype(np.float32, copy=False)
-
-        src_sr = self._opened_samplerate or self.sample_rate_in
-        if src_sr != self.target_sample_rate:
-            mono = self._resample_linear(mono, src_sr, self.target_sample_rate)
-
-        pcm16 = np.clip(mono, -1.0, 1.0)
-        pcm16 = (pcm16 * 32767.0).astype(np.int16)
-
-        self._callback(pcm16.tobytes())
-
-    def _probe_candidate(
-        self,
-        device: int,
-        samplerate: int,
-        channels: int,
-    ) -> tuple[bool, float, float]:
-        captured: list[np.ndarray] = []
-        done = threading.Event()
-
-        def _probe_callback(indata, frames, time_info, status) -> None:
-            if status:
-                print(f"[REC] probe callback status: {status}")
-
-            x = np.asarray(indata, dtype=np.float32)
-
-            if x.ndim == 1:
-                x = x[:, None]
-
-            if x.shape[1] > 1:
-                x = np.mean(x, axis=1, keepdims=True)
-
-            mono = np.squeeze(x, axis=1).astype(np.float32, copy=False)
-            captured.append(mono.copy())
-
-            total_samples = sum(arr.size for arr in captured)
-            if total_samples >= int(samplerate * self.probe_duration_sec):
-                done.set()
-
-        stream: sd.InputStream | None = None
-        try:
-            stream = sd.InputStream(
-                samplerate=samplerate,
-                blocksize=self.blocksize,
-                device=device,
-                channels=channels,
-                dtype=self.dtype,
-                latency=self.latency,
-                callback=_probe_callback,
-            )
-            stream.start()
-
-            done.wait(timeout=max(0.8, self.probe_duration_sec + 0.4))
-        finally:
-            if stream is not None:
-                try:
-                    stream.stop()
-                finally:
-                    stream.close()
-
-        if not captured:
-            return False, 0.0, 0.0
-
-        mono = np.concatenate(captured, axis=0)
-        if mono.size == 0:
-            return False, 0.0, 0.0
-
-        rms = float(np.sqrt(np.mean(np.square(mono))))
-        peak = float(np.max(np.abs(mono)))
-
-        ok = (rms >= self.probe_rms_threshold) or (peak >= self.probe_peak_threshold)
-        return ok, rms, peak
-
-    def _resolve_input_device(self, device: int | str | None) -> int:
-        all_devices = sd.query_devices()
-        input_devices = [
-            (idx, dev)
-            for idx, dev in enumerate(all_devices)
-            if int(dev["max_input_channels"]) > 0
-        ]
-
-        self._print_input_device_map(input_devices)
-
-        if device is None:
-            default_input, _default_output = sd.default.device
-            if default_input is None or default_input < 0:
-                raise RuntimeError("No default input device available.")
-            dev = all_devices[default_input]
-            if int(dev["max_input_channels"]) <= 0:
-                raise RuntimeError(f"Default input device is not valid: {dev}")
-            print(f"[REC] using default input raw_device={default_input} name={dev['name']!r}")
-            return int(default_input)
-
-        if isinstance(device, int):
-            if 0 <= device < len(all_devices):
-                dev = all_devices[device]
-                if int(dev["max_input_channels"]) > 0:
-                    print(f"[REC] using raw input device index={device} name={dev['name']!r}")
-                    return int(device)
-
-            if 0 <= device < len(input_devices):
-                raw_idx, dev = input_devices[device]
-                print(
-                    f"[REC] input device {device} is not a valid raw input index; "
-                    f"fallback to input-list ordinal -> raw_device={raw_idx}, name={dev['name']!r}"
-                )
-                return int(raw_idx)
-
-            raise ValueError(
-                f"Input device {device} is neither a valid raw input device index "
-                f"nor a valid ordinal in the filtered input-device list."
-            )
-
-        target = str(device).strip().lower()
-        candidates: list[tuple[int, Any]] = []
-        for idx, dev in input_devices:
-            name = str(dev["name"]).lower()
-            if target == name or target in name:
-                candidates.append((idx, dev))
-
-        if not candidates:
-            raise ValueError(f"No matching input device found for: {device!r}")
-
-        raw_idx, dev = candidates[0]
-        print(f"[REC] matched input device name {device!r} -> raw_device={raw_idx}, name={dev['name']!r}")
-        return int(raw_idx)
-
-    @staticmethod
-    def _print_input_device_map(input_devices: list[tuple[int, Any]]) -> None:
-        print("[REC] available input devices (ordinal -> raw index):")
-        for ordinal, (raw_idx, dev) in enumerate(input_devices):
-            print(
-                f"  [{ordinal}] raw={raw_idx} "
-                f"name={dev['name']!r} "
-                f"max_in={int(dev['max_input_channels'])} "
-                f"default_sr={int(float(dev['default_samplerate']))}"
-            )
-
-    @staticmethod
-    def _resample_linear(
-        x: np.ndarray,
-        src_sr: int,
-        dst_sr: int,
-    ) -> np.ndarray:
-        if src_sr == dst_sr or x.size == 0:
-            return x.astype(np.float32, copy=False)
-
-        duration = x.shape[0] / float(src_sr)
-        dst_n = max(1, int(round(duration * dst_sr)))
-
-        src_idx = np.linspace(0, x.shape[0] - 1, num=x.shape[0], dtype=np.float32)
-        dst_idx = np.linspace(0, x.shape[0] - 1, num=dst_n, dtype=np.float32)
-
-        y = np.interp(dst_idx, src_idx, x).astype(np.float32)
-        return y
-```
-
----
-### 文件: `shadowing_app/src/shadowing/realtime/control/adaptive_controller.py`
-
-```python
-from __future__ import annotations
-
-import time
-from dataclasses import dataclass
-
-from shadowing.interfaces.controller import Controller
-from shadowing.types import ControlAction, ControlDecision
-
-
-@dataclass
-class _ReplayState:
-    active: bool = False
-    last_trigger_at_sec: float = 0.0
-    last_committed_idx: int = 0
-
-
-class AdaptiveController(Controller):
-
-    def __init__(
-        self,
-        target_lead_sec: float = 0.35,
-        max_catchup_lead_sec: float = 1.20,
-        hold_lead_sec: float = 1.40,
-        replay_drop_tokens: int = 3,
-        replay_cooldown_sec: float = 1.2,
-        replay_seek_lead_sec: float = 0.20,
-        ducking_gain_speaking: float = 0.55,
-        ducking_gain_transition: float = 0.75,
-        base_gain: float = 1.00,
-        ducking_only: bool = False,
-        disable_seek: bool = False,
-        disable_hold: bool = False,
-    ) -> None:
-        self.target_lead_sec = float(target_lead_sec)
-        self.max_catchup_lead_sec = float(max_catchup_lead_sec)
-        self.hold_lead_sec = float(hold_lead_sec)
-
-        self.replay_drop_tokens = int(replay_drop_tokens)
-        self.replay_cooldown_sec = float(replay_cooldown_sec)
-        self.replay_seek_lead_sec = float(replay_seek_lead_sec)
-
-        self.ducking_gain_speaking = float(ducking_gain_speaking)
-        self.ducking_gain_transition = float(ducking_gain_transition)
-        self.base_gain = float(base_gain)
-
-        self.ducking_only = bool(ducking_only)
-        self.disable_seek = bool(disable_seek)
-        self.disable_hold = bool(disable_hold)
-
-        self._replay = _ReplayState()
-        self._last_asr_event_at_sec = 0.0
-
-    def note_asr_event(self, event) -> None:
-        try:
-            self._last_asr_event_at_sec = float(event.emitted_at_sec)
-        except Exception:
-            self._last_asr_event_at_sec = time.monotonic()
-
-    def note_hold(self) -> None:
-        pass
-
-    def decide(self, status, alignment):
-        now = time.monotonic()
-
-        target_gain = self.base_gain
-
-        if alignment is None:
-            return ControlDecision(
-                action=ControlAction.NOOP,
-                reason="no_alignment",
-                target_gain=None,
-            )
-        lead = status.t_ref_heard_sec - alignment.ref_time_sec
-
-        if alignment.stable:
-            target_gain = self.ducking_gain_speaking
+            mono = audio
         else:
-            target_gain = self.ducking_gain_transition
+            mono = np.mean(audio, axis=1).astype(np.float32, copy=False)
+        if self._resampler is None:
+            raise RuntimeError("Recorder resampler is not initialized.")
+        self._callback(self._resampler.process_float_mono(mono))
 
-        replay_detected = self._detect_replay_lockin(alignment, now)
+    def _resolve_input_device(self, device: int | str | None) -> int | str | None:
+        if device is None:
+            return None
+        if isinstance(device, int):
+            return device
+        target = str(device).strip().lower()
+        for idx, dev in enumerate(sd.query_devices()):
+            if int(dev["max_input_channels"]) > 0 and target in str(dev["name"]).lower():
+                return idx
+        raise ValueError(f"No matching input device found for {device!r}")
 
-        if replay_detected:
-            if not self.disable_seek and not self.ducking_only:
-                target_time = max(0.0, alignment.ref_time_sec + self.replay_seek_lead_sec)
-                return ControlDecision(
-                    action=ControlAction.SEEK,
-                    reason="replay_lockin_seek",
-                    target_time_sec=target_time,
-                    target_gain=target_gain,
-                    replay_lockin=True,
-                )
-
-            if not self.disable_hold and not self.ducking_only:
-                return ControlDecision(
-                    action=ControlAction.HOLD,
-                    reason="replay_lockin_hold",
-                    target_gain=target_gain,
-                    replay_lockin=True,
-                )
-
-            return ControlDecision(
-                action=ControlAction.NOOP,
-                reason="replay_lockin_ducking_only",
-                target_gain=target_gain,
-                replay_lockin=True,
-            )
-
-        if self.ducking_only:
-            return ControlDecision(
-                action=ControlAction.NOOP,
-                reason="ducking_only",
-                target_gain=target_gain,
-            )
-
-        if lead > self.hold_lead_sec and not self.disable_hold:
-            return ControlDecision(
-                action=ControlAction.HOLD,
-                reason="lead_too_large_hold",
-                target_gain=target_gain,
-            )
-
-        if lead < -self.max_catchup_lead_sec and not self.disable_seek:
-            target_time = max(0.0, alignment.ref_time_sec + self.target_lead_sec)
-            return ControlDecision(
-                action=ControlAction.SEEK,
-                reason="user_ahead_seek",
-                target_time_sec=target_time,
-                target_gain=target_gain,
-            )
-
-        if status.state.value == "holding" and lead <= self.target_lead_sec:
-            return ControlDecision(
-                action=ControlAction.RESUME,
-                reason="within_band_resume",
-                target_gain=target_gain,
-            )
-
-        return ControlDecision(
-            action=ControlAction.NOOP,
-            reason="within_band",
-            target_gain=target_gain,
-        )
-
-    def _detect_replay_lockin(self, alignment, now_sec: float) -> bool:
-        current_committed = int(alignment.committed_ref_idx)
-        last_committed = int(self._replay.last_committed_idx)
-
-        detected = False
-
-        if alignment.stable:
-            dropped = last_committed - current_committed
-            if (
-                last_committed >= self.replay_drop_tokens + 2
-                and dropped >= self.replay_drop_tokens
-                and (now_sec - self._replay.last_trigger_at_sec) >= self.replay_cooldown_sec
-            ):
-                detected = True
-                self._replay.active = True
-                self._replay.last_trigger_at_sec = now_sec
-
-        self._replay.last_committed_idx = current_committed
-        return detected
-```
-
----
-### 文件: `shadowing_app/src/shadowing/realtime/control/bluetooth_offset.py`
-
-```python
-from __future__ import annotations
-
-
-class BluetoothOffsetCalibrator:
-
-    def estimate_offset_sec(self) -> float:
-        raise NotImplementedError
+    def _pick_openable_samplerate(self, device: int | str | None, dev_info: Any, opened_channels: int) -> int:
+        candidates: list[int] = []
+        for sr in [self.sample_rate_in, int(float(dev_info["default_samplerate"])), 48000, 44100, 16000]:
+            if sr > 0 and sr not in candidates:
+                candidates.append(sr)
+        for sr in candidates:
+            try:
+                sd.check_input_settings(device=device, samplerate=sr, channels=opened_channels, dtype=self.dtype)
+                return sr
+            except Exception:
+                continue
+        raise RuntimeError(f"Failed to find openable samplerate for input device: {dev_info}")
 ```
 
 ---
@@ -2828,180 +2428,16 @@ from dataclasses import dataclass
 @dataclass(slots=True)
 class ControlPolicy:
     target_lead_sec: float = 0.15
-    hold_if_lead_sec: float = 0.45
-    resume_if_lead_sec: float = 0.18
-    seek_if_lag_sec: float = -0.90
-    min_confidence: float = 0.60
-    seek_cooldown_sec: float = 0.40
-```
-
----
-### 文件: `shadowing_app/src/shadowing/realtime/control/state_estimator.py`
-
-```python
-from __future__ import annotations
-
-import time
-from collections import deque
-from dataclasses import dataclass
-
-from shadowing.types import AlignResult, AsrEvent, ControlFeatures, PlaybackStatus
-
-
-@dataclass(slots=True)
-class StateEstimatorConfig:
-    lead_ema_alpha: float = 0.35
-
-    speaking_window_sec: float = 0.6
-    partial_rate_window_sec: float = 2.0
-
-    min_target_lead_sec: float = 0.08
-    base_target_lead_sec: float = 0.15
-    max_target_lead_sec: float = 0.35
-
-    gain_normal: float = 1.0
-    gain_soft: float = 0.75
+    hold_if_lead_sec: float = 0.90
+    resume_if_lead_sec: float = 0.28
+    seek_if_lag_sec: float = -1.80
+    min_confidence: float = 0.75
+    seek_cooldown_sec: float = 1.20
     gain_following: float = 0.55
-
-    duck_hold_sec: float = 0.45
-
-
-class ControlStateEstimator:
-
-    def __init__(self, config: StateEstimatorConfig | None = None) -> None:
-        self.config = config or StateEstimatorConfig()
-
-        self._lead_ema: float | None = None
-        self._last_lead_ema: float | None = None
-
-        self._partial_times: deque[float] = deque()
-        self._hold_times: deque[float] = deque()
-
-        self._last_asr_event_at: float | None = None
-
-        self._last_following_at: float | None = None
-
-    def note_asr_event(self, event: AsrEvent) -> None:
-        now = time.monotonic()
-        self._last_asr_event_at = now
-
-        if event.event_type.value == "partial":
-            self._partial_times.append(now)
-            self._trim_deque(self._partial_times, now, self.config.partial_rate_window_sec)
-
-    def note_hold(self) -> None:
-        now = time.monotonic()
-        self._hold_times.append(now)
-        self._trim_deque(self._hold_times, now, 5.0)
-
-    def update(
-        self,
-        playback: PlaybackStatus,
-        alignment: AlignResult | None,
-    ) -> ControlFeatures:
-        now = time.monotonic()
-
-        lead_raw: float | None = None
-        alignment_conf = 0.0
-        alignment_stable = False
-
-        if alignment is not None:
-            lead_raw = playback.t_ref_heard_sec - alignment.ref_time_sec
-            alignment_conf = alignment.confidence
-            alignment_stable = alignment.stable
-
-        if lead_raw is not None:
-            if self._lead_ema is None:
-                self._lead_ema = lead_raw
-            else:
-                self._lead_ema = (
-                    self.config.lead_ema_alpha * lead_raw
-                    + (1.0 - self.config.lead_ema_alpha) * self._lead_ema
-                )
-
-        lead_slope: float | None = None
-        if self._lead_ema is not None and self._last_lead_ema is not None:
-            lead_slope = self._lead_ema - self._last_lead_ema
-        self._last_lead_ema = self._lead_ema
-
-        self._trim_deque(self._partial_times, now, self.config.partial_rate_window_sec)
-        self._trim_deque(self._hold_times, now, 5.0)
-
-        recent_partial_rate = len(self._partial_times) / max(self.config.partial_rate_window_sec, 1e-6)
-        recent_hold_count = len(self._hold_times)
-
-        user_speaking = False
-        if self._last_asr_event_at is not None:
-            user_speaking = (now - self._last_asr_event_at) <= self.config.speaking_window_sec
-
-        dynamic_target_lead = self._compute_dynamic_target_lead(
-            alignment_conf=alignment_conf,
-            alignment_stable=alignment_stable,
-            recent_hold_count=recent_hold_count,
-        )
-
-        suggested_gain = self._compute_suggested_gain(
-            now=now,
-            user_speaking=user_speaking,
-            alignment_stable=alignment_stable,
-            alignment_conf=alignment_conf,
-        )
-
-        return ControlFeatures(
-            lead_raw=lead_raw,
-            lead_ema=self._lead_ema,
-            lead_slope=lead_slope,
-            alignment_conf=alignment_conf,
-            alignment_stable=alignment_stable,
-            user_speaking=user_speaking,
-            recent_partial_rate=recent_partial_rate,
-            recent_hold_count=recent_hold_count,
-            dynamic_target_lead=dynamic_target_lead,
-            suggested_gain=suggested_gain,
-            playback_state=playback.state.value,
-        )
-
-    def _compute_dynamic_target_lead(
-        self,
-        alignment_conf: float,
-        alignment_stable: bool,
-        recent_hold_count: int,
-    ) -> float:
-        target = self.config.base_target_lead_sec
-
-        if alignment_stable and alignment_conf >= 0.85:
-            target += 0.05
-
-        if recent_hold_count >= 2:
-            target -= 0.06
-
-        target = min(max(target, self.config.min_target_lead_sec), self.config.max_target_lead_sec)
-        return target
-
-    def _compute_suggested_gain(
-        self,
-        now: float,
-        user_speaking: bool,
-        alignment_stable: bool,
-        alignment_conf: float,
-    ) -> float:
-        if user_speaking and alignment_stable and alignment_conf >= 0.75:
-            self._last_following_at = now
-            return self.config.gain_following
-
-        if self._last_following_at is not None:
-            if (now - self._last_following_at) <= self.config.duck_hold_sec:
-                return self.config.gain_following
-
-        if user_speaking:
-            return self.config.gain_soft
-
-        return self.config.gain_normal
-
-    @staticmethod
-    def _trim_deque(dq: deque[float], now: float, window_sec: float) -> None:
-        while dq and (now - dq[0]) > window_sec:
-            dq.popleft()
+    gain_transition: float = 0.80
+    recover_after_seek_sec: float = 0.60
+    startup_grace_sec: float = 0.80
+    low_confidence_hold_sec: float = 0.60
 ```
 
 ---
@@ -3013,8 +2449,8 @@ from __future__ import annotations
 import time
 
 from shadowing.interfaces.controller import Controller
-from shadowing.types import AlignResult, ControlAction, ControlDecision, PlaybackStatus
 from shadowing.realtime.control.policy import ControlPolicy
+from shadowing.types import AlignResult, ControlAction, ControlDecision, PlaybackStatus
 
 
 class StateMachineController(Controller):
@@ -3022,69 +2458,274 @@ class StateMachineController(Controller):
         self,
         policy: ControlPolicy | None = None,
         total_duration_sec: float | None = None,
+        disable_seek: bool = False,
     ) -> None:
         self.policy = policy or ControlPolicy()
         self.total_duration_sec = total_duration_sec
-        self._last_seek_at = 0.0
+        self.disable_seek = bool(disable_seek)
 
-    def decide(
-        self,
-        playback: PlaybackStatus,
-        alignment: AlignResult | None,
-    ) -> ControlDecision:
+        self._last_seek_at = 0.0
+        self._session_started_at = time.monotonic()
+        self._last_good_alignment_at = 0.0
+
+        self._ever_resumed_or_played = False
+        self._last_decision_log_at = 0.0
+        self._last_decision_signature = ""
+        self._last_alignment_ref_time_sec = 0.0
+
+        self._no_alignment_keep_playing_sec = max(
+            1.20,
+            self.policy.startup_grace_sec + self.policy.low_confidence_hold_sec,
+        )
+        self._low_confidence_keep_playing_sec = max(
+            1.50,
+            self.policy.low_confidence_hold_sec + 0.60,
+        )
+        self._decision_log_interval_sec = 1.20
+
+    def decide(self, playback: PlaybackStatus, alignment: AlignResult | None) -> ControlDecision:
+        now = time.monotonic()
+
+        if playback.state.value == "playing" and playback.t_ref_emitted_content_sec <= 0.05:
+            self._session_started_at = now
+
+        if playback.state.value == "playing":
+            self._ever_resumed_or_played = True
+
+        if alignment is not None and alignment.confidence >= self.policy.min_confidence:
+            self._last_good_alignment_at = now
+            self._last_alignment_ref_time_sec = alignment.ref_time_sec
+
         if alignment is None:
-            return ControlDecision(
-                action=ControlAction.NOOP,
-                reason="no_alignment",
-            )
+            decision = self._decide_without_alignment(playback, now)
+            self._log_decision_if_needed(playback, alignment, decision, now)
+            return decision
 
         if alignment.confidence < self.policy.min_confidence:
-            return ControlDecision(
-                action=ControlAction.NOOP,
-                reason="low_confidence",
-            )
+            decision = self._decide_low_confidence(playback, alignment, now)
+            self._log_decision_if_needed(playback, alignment, decision, now)
+            return decision
 
-        lead = playback.t_ref_heard_sec - alignment.ref_time_sec
+        lead = playback.t_ref_heard_content_sec - alignment.ref_time_sec
+
+        if self._is_in_seek_recovery(now):
+            decision = ControlDecision(
+                action=ControlAction.NOOP,
+                reason="recover_after_seek",
+                lead_sec=lead,
+                target_gain=self.policy.gain_transition,
+            )
+            self._log_decision_if_needed(playback, alignment, decision, now)
+            return decision
+
+        if playback.state.value == "holding":
+            if lead <= self.policy.resume_if_lead_sec:
+                decision = ControlDecision(
+                    action=ControlAction.RESUME,
+                    reason="user_caught_up",
+                    lead_sec=lead,
+                    target_gain=self.policy.gain_following,
+                )
+                self._log_decision_if_needed(playback, alignment, decision, now)
+                return decision
+
+            decision = ControlDecision(
+                action=ControlAction.NOOP,
+                reason="holding_wait",
+                lead_sec=lead,
+                target_gain=self.policy.gain_following,
+            )
+            self._log_decision_if_needed(playback, alignment, decision, now)
+            return decision
 
         if lead > self.policy.hold_if_lead_sec:
-            return ControlDecision(
+            decision = ControlDecision(
                 action=ControlAction.HOLD,
                 reason="reference_too_far_ahead",
                 lead_sec=lead,
+                target_gain=self.policy.gain_following,
+            )
+            self._log_decision_if_needed(playback, alignment, decision, now)
+            return decision
+
+        if not self.disable_seek:
+            if (
+                alignment.stable
+                and lead < self.policy.seek_if_lag_sec
+                and (now - self._last_seek_at) >= self.policy.seek_cooldown_sec
+            ):
+                target_time = alignment.ref_time_sec + self.policy.target_lead_sec
+                if self.total_duration_sec is not None:
+                    target_time = min(max(0.0, target_time), self.total_duration_sec)
+                else:
+                    target_time = max(0.0, target_time)
+
+                self._last_seek_at = now
+                decision = ControlDecision(
+                    action=ControlAction.SEEK,
+                    reason="user_skipped_forward",
+                    target_time_sec=target_time,
+                    lead_sec=lead,
+                    target_gain=self.policy.gain_following,
+                )
+                self._log_decision_if_needed(playback, alignment, decision, now)
+                return decision
+
+        decision = ControlDecision(
+            action=ControlAction.NOOP,
+            reason="within_band",
+            lead_sec=lead,
+            target_gain=self.policy.gain_following if alignment.stable else self.policy.gain_transition,
+        )
+        self._log_decision_if_needed(playback, alignment, decision, now)
+        return decision
+
+    def _decide_without_alignment(self, playback: PlaybackStatus, now: float) -> ControlDecision:
+        elapsed_since_start = now - self._session_started_at
+
+        if elapsed_since_start < self.policy.startup_grace_sec:
+            return ControlDecision(
+                action=ControlAction.NOOP,
+                reason="startup_grace",
+                target_gain=self.policy.gain_transition,
             )
 
-        if lead <= self.policy.resume_if_lead_sec:
+        stale_for = self._stale_good_alignment_sec(now)
+
+        if playback.state.value == "holding":
             return ControlDecision(
-                action=ControlAction.RESUME,
-                reason="user_caught_up",
-                lead_sec=lead,
+                action=ControlAction.NOOP,
+                reason="waiting_for_alignment",
+                target_gain=self.policy.gain_following,
             )
 
-        now = time.monotonic()
-        if (
-            alignment.stable
-            and lead < self.policy.seek_if_lag_sec
-            and (now - self._last_seek_at) >= self.policy.seek_cooldown_sec
-        ):
-            target_time = alignment.ref_time_sec + self.policy.target_lead_sec
-            if self.total_duration_sec is not None:
-                target_time = min(max(0.0, target_time), self.total_duration_sec)
-            else:
-                target_time = max(0.0, target_time)
-
-            self._last_seek_at = now
+        if self._ever_resumed_or_played and stale_for < self._no_alignment_keep_playing_sec:
             return ControlDecision(
-                action=ControlAction.SEEK,
-                reason="user_skipped_forward",
-                target_time_sec=target_time,
+                action=ControlAction.NOOP,
+                reason="keep_playing_no_alignment",
+                target_gain=self.policy.gain_transition,
+            )
+
+        return ControlDecision(
+            action=ControlAction.HOLD,
+            reason="waiting_for_alignment",
+            target_gain=self.policy.gain_following,
+        )
+
+    def _decide_low_confidence(
+        self,
+        playback: PlaybackStatus,
+        alignment: AlignResult,
+        now: float,
+    ) -> ControlDecision:
+        lead = playback.t_ref_heard_content_sec - alignment.ref_time_sec
+        elapsed_since_start = now - self._session_started_at
+
+        if elapsed_since_start < self.policy.startup_grace_sec:
+            return ControlDecision(
+                action=ControlAction.NOOP,
+                reason="startup_low_confidence_grace",
                 lead_sec=lead,
+                target_gain=self.policy.gain_transition,
+            )
+
+        stale_for = self._stale_good_alignment_sec(now)
+
+        if playback.state.value == "holding":
+            if lead <= self.policy.resume_if_lead_sec and alignment.candidate_ref_idx >= alignment.committed_ref_idx:
+                return ControlDecision(
+                    action=ControlAction.RESUME,
+                    reason="low_confidence_but_caught_up",
+                    lead_sec=lead,
+                    target_gain=self.policy.gain_transition,
+                )
+
+            return ControlDecision(
+                action=ControlAction.NOOP,
+                reason="low_confidence_wait",
+                lead_sec=lead,
+                target_gain=self.policy.gain_transition,
+            )
+
+        if self._ever_resumed_or_played:
+            if stale_for < self._low_confidence_keep_playing_sec and lead <= (self.policy.hold_if_lead_sec + 0.35):
+                return ControlDecision(
+                    action=ControlAction.NOOP,
+                    reason="keep_playing_low_confidence",
+                    lead_sec=lead,
+                    target_gain=self.policy.gain_transition,
+                )
+
+        if lead > (self.policy.hold_if_lead_sec + 0.20):
+            return ControlDecision(
+                action=ControlAction.HOLD,
+                reason="low_confidence_and_ref_ahead",
+                lead_sec=lead,
+                target_gain=self.policy.gain_transition,
             )
 
         return ControlDecision(
             action=ControlAction.NOOP,
-            reason="within_band",
+            reason="low_confidence_keep_running",
             lead_sec=lead,
+            target_gain=self.policy.gain_transition,
         )
+
+    def _stale_good_alignment_sec(self, now: float) -> float:
+        if self._last_good_alignment_at <= 0:
+            return float("inf")
+        return now - self._last_good_alignment_at
+
+    def _is_in_seek_recovery(self, now_sec: float) -> bool:
+        return (now_sec - self._last_seek_at) < self.policy.recover_after_seek_sec
+
+    def _log_decision_if_needed(
+        self,
+        playback: PlaybackStatus,
+        alignment: AlignResult | None,
+        decision: ControlDecision,
+        now: float,
+    ) -> None:
+        lead_str = "None" if decision.lead_sec is None else f"{decision.lead_sec:.3f}"
+        conf_str = "None" if alignment is None else f"{alignment.confidence:.3f}"
+        cand_str = "None" if alignment is None else str(alignment.candidate_ref_idx)
+        committed_str = "None" if alignment is None else str(alignment.committed_ref_idx)
+        stable_str = "None" if alignment is None else str(alignment.stable)
+
+        signature = (
+            f"{playback.state.value}|{decision.action.value}|{decision.reason}|"
+            f"{lead_str}|{conf_str}|{cand_str}|{committed_str}|{stable_str}"
+        )
+
+        should_log = False
+        if signature != self._last_decision_signature:
+            should_log = True
+        elif decision.action in (ControlAction.HOLD, ControlAction.RESUME, ControlAction.SEEK):
+            should_log = True
+        elif (now - self._last_decision_log_at) >= self._decision_log_interval_sec:
+            should_log = True
+
+        if not should_log:
+            return
+
+        stale_good = self._stale_good_alignment_sec(now)
+        stale_good_str = "inf" if stale_good == float("inf") else f"{stale_good:.2f}"
+
+        print(
+            "[CTRL] "
+            f"playback={playback.state.value} "
+            f"action={decision.action.value} "
+            f"reason={decision.reason} "
+            f"lead={lead_str} "
+            f"align_conf={conf_str} "
+            f"stable={stable_str} "
+            f"candidate={cand_str} "
+            f"committed={committed_str} "
+            f"stale_good={stale_good_str}"
+        )
+
+        self._last_decision_signature = signature
+        self._last_decision_log_at = now
 ```
 
 ---
@@ -3097,18 +2738,15 @@ import queue
 import threading
 import time
 
+from shadowing.interfaces.aligner import Aligner
+from shadowing.interfaces.asr import ASRProvider
+from shadowing.interfaces.controller import Controller
 from shadowing.interfaces.player import Player
 from shadowing.interfaces.recorder import Recorder
-from shadowing.interfaces.asr import ASRProvider
-from shadowing.interfaces.aligner import Aligner
-from shadowing.interfaces.controller import Controller
 from shadowing.interfaces.repository import LessonRepository
-from shadowing.types import (
-    AsrEvent,
-    ControlAction,
-    PlayerCommand,
-    PlayerCommandType,
-)
+from shadowing.realtime.asr.normalizer import TextNormalizer
+from shadowing.realtime.asr.partial_adapter import RawPartialAdapter
+from shadowing.types import AlignResult, AsrEvent, ControlAction, PlayerCommand, PlayerCommandType
 
 
 class ShadowingOrchestrator:
@@ -3120,8 +2758,8 @@ class ShadowingOrchestrator:
         asr: ASRProvider,
         aligner: Aligner,
         controller: Controller,
-        audio_queue_maxsize: int = 6,
-        asr_event_queue_maxsize: int = 32,
+        audio_queue_maxsize: int = 150,
+        asr_event_queue_maxsize: int = 64,
         loop_interval_sec: float = 0.03,
     ) -> None:
         self.repo = repo
@@ -3131,36 +2769,41 @@ class ShadowingOrchestrator:
         self.aligner = aligner
         self.controller = controller
 
+        self.normalizer = TextNormalizer()
+        self.partial_adapter = RawPartialAdapter()
+
         self.audio_frame_queue: queue.Queue[bytes] = queue.Queue(maxsize=audio_queue_maxsize)
         self.asr_event_queue: queue.Queue[AsrEvent] = queue.Queue(maxsize=asr_event_queue_maxsize)
 
-        self.loop_interval_sec = loop_interval_sec
+        self.loop_interval_sec = float(loop_interval_sec)
         self._running = False
         self._asr_thread: threading.Thread | None = None
-        self._last_alignment = None
-
-        self._debug_enabled = False
-        self._debug_heartbeat_sec = 1.0
-        self._debug_print_asr = True
-        self._debug_print_alignment = True
-        self._debug_print_decision = True
-        self._debug_print_player_status = True
-        self._debug_print_reference_head = True
-        self._last_heartbeat_at = 0.0
-
+        self._last_alignment: AlignResult | None = None
         self._pure_playback = False
+        self._debug_enabled = False
+        self._last_seen_generation = 0
+        self._use_partial_adapter = True
 
-    def configure_debug(self, debug_cfg: dict) -> None:
-        self._debug_enabled = bool(debug_cfg.get("enabled", False))
-        self._debug_heartbeat_sec = float(debug_cfg.get("heartbeat_sec", 1.0))
-        self._debug_print_asr = bool(debug_cfg.get("print_asr", True))
-        self._debug_print_alignment = bool(debug_cfg.get("print_alignment", True))
-        self._debug_print_decision = bool(debug_cfg.get("print_decision", True))
-        self._debug_print_player_status = bool(debug_cfg.get("print_player_status", True))
-        self._debug_print_reference_head = bool(debug_cfg.get("print_reference_head", True))
+        self._audio_frames_enqueued = 0
+        self._audio_frames_dropped = 0
+        self._audio_queue_high_watermark = 0
+        self._asr_events_emitted = 0
+        self._asr_events_dropped = 0
+        self._asr_poll_iterations = 0
 
     def configure_runtime(self, runtime_cfg: dict) -> None:
         self._pure_playback = bool(runtime_cfg.get("pure_playback", False))
+        self._use_partial_adapter = bool(runtime_cfg.get("use_partial_adapter", True))
+
+    def configure_debug(self, debug_cfg: dict) -> None:
+        self._debug_enabled = bool(debug_cfg.get("enabled", False))
+        self.partial_adapter.debug = bool(debug_cfg.get("adapter_debug", False))
+
+        if hasattr(self.aligner, "debug"):
+            try:
+                self.aligner.debug = bool(debug_cfg.get("aligner_debug", False))
+            except Exception:
+                pass
 
     def start_session(self, lesson_id: str) -> None:
         manifest = self.repo.load_manifest(lesson_id)
@@ -3168,45 +2811,29 @@ class ShadowingOrchestrator:
         chunks = self.repo.load_audio_chunks(lesson_id)
 
         if hasattr(self.controller, "total_duration_sec"):
-            try:
-                self.controller.total_duration_sec = ref_map.total_duration_sec
-            except Exception:
-                pass
-
-        if hasattr(self.player, "sample_rate"):
-            try:
-                self.player.sample_rate = int(manifest.sample_rate_out)
-            except Exception:
-                pass
+            self.controller.total_duration_sec = ref_map.total_duration_sec
 
         self.aligner.reset(ref_map)
-
-        if self._debug_enabled and self._debug_print_reference_head:
-            head = "".join(tok.char for tok in ref_map.tokens[:20])
-            head_py = [tok.pinyin for tok in ref_map.tokens[:10]]
-            print(f"[REF] total_tokens={len(ref_map.tokens)} total_duration={ref_map.total_duration_sec:.3f}")
-            print(f"[REF] head_chars={head!r}")
-            print(f"[REF] head_pinyin={head_py}")
-
         self.player.load_chunks(chunks)
 
         self._running = True
+        self._last_seen_generation = 0
+        self._last_alignment = None
+        self._audio_frames_enqueued = 0
+        self._audio_frames_dropped = 0
+        self._audio_queue_high_watermark = 0
+        self._asr_events_emitted = 0
+        self._asr_events_dropped = 0
+        self._asr_poll_iterations = 0
 
         if not self._pure_playback:
-            hotwords = manifest.lesson_text
-
             if hasattr(self.asr, "hotwords"):
                 try:
-                    self.asr.hotwords = hotwords
+                    self.asr.hotwords = manifest.lesson_text
                 except Exception:
                     pass
 
-            if hasattr(self.asr, "reference_text"):
-                try:
-                    self.asr.reference_text = manifest.lesson_text
-                except Exception:
-                    pass
-
+            self.partial_adapter.reset()
             self.asr.start()
             self._asr_thread = threading.Thread(target=self._asr_worker, daemon=True)
             self._asr_thread.start()
@@ -3214,20 +2841,8 @@ class ShadowingOrchestrator:
 
         self.player.start()
 
-        if self._pure_playback:
-            self.player.submit_command(
-                PlayerCommand(
-                    cmd=PlayerCommandType.SET_GAIN,
-                    gain=1.0,
-                    reason="pure_playback_gain",
-                )
-            )
-
-        self._last_heartbeat_at = time.monotonic()
-
         while self._running:
             self._control_tick()
-            self._debug_heartbeat()
             time.sleep(self.loop_interval_sec)
 
     def stop_session(self) -> None:
@@ -3244,26 +2859,49 @@ class ShadowingOrchestrator:
             except Exception:
                 pass
 
+            if self._asr_thread is not None and self._asr_thread.is_alive():
+                self._asr_thread.join(timeout=1.0)
+            self._asr_thread = None
+
         try:
-            self.player.submit_command(
-                PlayerCommand(cmd=PlayerCommandType.STOP, reason="session_stop")
-            )
             self.player.stop()
+            self.player.close()
         except Exception:
             pass
+
+        if self._debug_enabled:
+            print(
+                "[ORCH-STATS] "
+                f"audio_enqueued={self._audio_frames_enqueued} "
+                f"audio_dropped={self._audio_frames_dropped} "
+                f"audio_q_high_watermark={self._audio_queue_high_watermark}/{self.audio_frame_queue.maxsize} "
+                f"asr_events_emitted={self._asr_events_emitted} "
+                f"asr_events_dropped={self._asr_events_dropped} "
+                f"asr_poll_iterations={self._asr_poll_iterations} "
+                f"use_partial_adapter={self._use_partial_adapter}"
+            )
 
     def _on_audio_frame(self, pcm: bytes) -> None:
         try:
             self.audio_frame_queue.put_nowait(pcm)
+            self._audio_frames_enqueued += 1
+            current_qsize = self.audio_frame_queue.qsize()
+            if current_qsize > self._audio_queue_high_watermark:
+                self._audio_queue_high_watermark = current_qsize
         except queue.Full:
+            self._audio_frames_dropped += 1
             try:
                 _ = self.audio_frame_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
                 self.audio_frame_queue.put_nowait(pcm)
+                self._audio_frames_enqueued += 1
+                current_qsize = self.audio_frame_queue.qsize()
+                if current_qsize > self._audio_queue_high_watermark:
+                    self._audio_queue_high_watermark = current_qsize
             except queue.Full:
-                pass
+                self._audio_frames_dropped += 1
 
     def _asr_worker(self) -> None:
         while self._running and not self._pure_playback:
@@ -3272,91 +2910,76 @@ class ShadowingOrchestrator:
             except queue.Empty:
                 continue
 
+            self._asr_poll_iterations += 1
             self.asr.feed_pcm16(pcm)
-            events = self.asr.poll_events()
+            raw_events = self.asr.poll_raw_events()
 
-            for event in events:
+            for raw in raw_events:
+                candidate = raw
+                if self._use_partial_adapter:
+                    candidate = self.partial_adapter.adapt(raw)
+                    if candidate is None:
+                        continue
+
+                normalized = self.normalizer.normalize_raw_event(candidate)
+                if normalized is None:
+                    continue
+
                 try:
-                    self.asr_event_queue.put_nowait(event)
+                    self.asr_event_queue.put_nowait(normalized)
+                    self._asr_events_emitted += 1
                 except queue.Full:
+                    self._asr_events_dropped += 1
                     try:
                         _ = self.asr_event_queue.get_nowait()
                     except queue.Empty:
                         pass
                     try:
-                        self.asr_event_queue.put_nowait(event)
+                        self.asr_event_queue.put_nowait(normalized)
+                        self._asr_events_emitted += 1
                     except queue.Full:
-                        pass
+                        self._asr_events_dropped += 1
 
-    def _control_tick(self) -> None:
-        latest_alignment = self._last_alignment
+    def _handle_generation_change_if_needed(self, status) -> None:
+        if status.generation == self._last_seen_generation:
+            return
 
         if self._debug_enabled:
-            print(
-                f"[DBG] tick_start "
-                f"cached_alignment={type(self._last_alignment).__name__} "
-                f"value={self._last_alignment}"
-            )
+            print(f"[SYNC] playback generation changed {self._last_seen_generation} -> {status.generation}")
 
+        self._last_seen_generation = status.generation
+        self._last_alignment = None
+
+        while True:
+            try:
+                _ = self.asr_event_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.aligner.on_playback_generation_changed(status.generation)
+
+    def _control_tick(self) -> None:
+        status = self.player.get_status()
+        self._handle_generation_change_if_needed(status)
+
+        latest_alignment = self._last_alignment
         while not self._pure_playback:
             try:
                 event = self.asr_event_queue.get_nowait()
             except queue.Empty:
                 break
 
-            if hasattr(self.controller, "note_asr_event"):
-                try:
-                    self.controller.note_asr_event(event)
-                except Exception:
-                    pass
-
-            if self._debug_enabled and self._debug_print_asr:
-                self._debug_print_asr_event(event)
-
             latest_alignment = self.aligner.update(event)
-
-            if self._debug_enabled:
-                print(
-                    f"[DBG] aligner_return "
-                    f"type={type(latest_alignment).__name__} "
-                    f"value={latest_alignment}"
-                )
-
             if latest_alignment is not None:
                 self._last_alignment = latest_alignment
-                if self._debug_enabled:
-                    print(
-                        f"[DBG] cache_alignment_updated "
-                        f"type={type(self._last_alignment).__name__} "
-                        f"value={self._last_alignment}"
-                    )
-
-            if self._debug_enabled and self._debug_print_alignment and latest_alignment is not None:
-                self._debug_print_alignment_result(latest_alignment)
 
         status = self.player.get_status()
 
-        if self._debug_enabled:
-            print(
-                f"[DBG] before_decide "
-                f"latest_alignment_type={type(latest_alignment).__name__} "
-                f"latest_alignment={latest_alignment}"
-            )
-
         if status.state.value == "finished":
-            if self._debug_enabled:
-                print("[SYSTEM] player finished, stopping orchestrator.")
             self._running = False
             return
 
         if self._pure_playback:
-            if self._debug_enabled and self._debug_print_decision:
-                print(
-                    "[CTRL] action=noop "
-                    "reason=pure_playback "
-                    "lead=None target=None gain=1.00 "
-                    f"player_state={status.state.value}"
-                )
             return
 
         decision = self.controller.decide(status, latest_alignment)
@@ -3370,25 +2993,14 @@ class ShadowingOrchestrator:
                 )
             )
 
-        if self._debug_enabled and self._debug_print_decision:
-            self._debug_print_decision_result(status, latest_alignment, decision)
-
         if decision.action == ControlAction.HOLD:
-            if hasattr(self.controller, "note_hold"):
-                try:
-                    self.controller.note_hold()
-                except Exception:
-                    pass
-
             self.player.submit_command(
                 PlayerCommand(cmd=PlayerCommandType.HOLD, reason=decision.reason)
             )
-
         elif decision.action == ControlAction.RESUME:
             self.player.submit_command(
                 PlayerCommand(cmd=PlayerCommandType.RESUME, reason=decision.reason)
             )
-
         elif decision.action == ControlAction.SEEK and decision.target_time_sec is not None:
             self.player.submit_command(
                 PlayerCommand(
@@ -3397,71 +3009,11 @@ class ShadowingOrchestrator:
                     reason=decision.reason,
                 )
             )
-
         elif decision.action == ControlAction.STOP:
             self.player.submit_command(
                 PlayerCommand(cmd=PlayerCommandType.STOP, reason=decision.reason)
             )
             self._running = False
-            
-
-    def _debug_heartbeat(self) -> None:
-        if not self._debug_enabled or not self._debug_print_player_status:
-            return
-
-        now = time.monotonic()
-        if (now - self._last_heartbeat_at) < self._debug_heartbeat_sec:
-            return
-
-        status = self.player.get_status()
-        print(
-            "[PLAYER] "
-            f"state={status.state.value} "
-            f"chunk={status.chunk_id} "
-            f"frame={status.frame_index} "
-            f"t_sched={status.t_ref_sched_sec:.3f} "
-            f"t_heard={status.t_ref_heard_sec:.3f}"
-        )
-        self._last_heartbeat_at = now
-
-    def _debug_print_asr_event(self, event: AsrEvent) -> None:
-        print(
-            "[ASR] "
-            f"type={event.event_type.value} "
-            f"text={event.text!r} "
-            f"norm={event.normalized_text!r} "
-            f"py={event.pinyin_seq}"
-        )
-
-    def _debug_print_alignment_result(self, alignment) -> None:
-        print(
-            "[ALIGN] "
-            f"committed={alignment.committed_ref_idx} "
-            f"candidate={alignment.candidate_ref_idx} "
-            f"t_user={alignment.ref_time_sec:.3f} "
-            f"conf={alignment.confidence:.3f} "
-            f"stable={alignment.stable} "
-            f"matched={alignment.matched_text!r}"
-        )
-
-    def _debug_print_decision_result(self, status, alignment, decision) -> None:
-        lead = None
-        if alignment is not None:
-            lead = status.t_ref_heard_sec - alignment.ref_time_sec
-
-        lead_str = "None" if lead is None else f"{lead:.3f}"
-        target_str = "None" if decision.target_time_sec is None else f"{decision.target_time_sec:.3f}"
-        gain_str = "None" if decision.target_gain is None else f"{decision.target_gain:.2f}"
-
-        print(
-            "[CTRL] "
-            f"action={decision.action.value} "
-            f"reason={decision.reason} "
-            f"lead={lead_str} "
-            f"target={target_str} "
-            f"gain={gain_str} "
-            f"player_state={status.state.value}"
-        )
 ```
 
 ---
@@ -3478,15 +3030,13 @@ from shadowing.types import AudioChunk
 
 
 class ChunkQueue:
-
     def __init__(self) -> None:
         self._chunks: list[AudioChunk] = []
         self._chunk_start_times: list[float] = []
-
-        self._current_chunk_idx: int = 0
-        self._frame_offset_in_chunk: int = 0
-        self._sample_rate: int = 0
-        self._total_duration_sec: float = 0.0
+        self._current_chunk_idx = 0
+        self._frame_offset_in_chunk = 0
+        self._sample_rate = 0
+        self._total_duration_sec = 0.0
 
     def load(self, chunks: list[AudioChunk]) -> None:
         self._chunks = chunks
@@ -3494,7 +3044,8 @@ class ChunkQueue:
         self._current_chunk_idx = 0
         self._frame_offset_in_chunk = 0
         self._sample_rate = chunks[0].sample_rate if chunks else 0
-
+        if chunks and any(c.sample_rate != self._sample_rate for c in chunks):
+            raise ValueError("All playback chunks must share the same sample rate.")
         if chunks:
             last = chunks[-1]
             self._total_duration_sec = last.start_time_sec + last.duration_sec
@@ -3513,34 +3064,26 @@ class ChunkQueue:
     def current_frame_index(self) -> int:
         return self._frame_offset_in_chunk
 
-    def is_empty(self) -> bool:
-        return not self._chunks
-
     def is_finished(self) -> bool:
         return bool(self._chunks) and self._current_chunk_idx >= len(self._chunks)
 
     def seek(self, target_time_sec: float) -> None:
         if not self._chunks:
             return
-
         idx = bisect_right(self._chunk_start_times, target_time_sec) - 1
         idx = max(0, min(idx, len(self._chunks) - 1))
-
         chunk = self._chunks[idx]
         local_time = max(0.0, target_time_sec - chunk.start_time_sec)
         local_frame = int(local_time * chunk.sample_rate)
-        local_frame = min(local_frame, len(chunk.samples))
-
+        local_frame = min(local_frame, chunk.samples.shape[0])
         self._current_chunk_idx = idx
         self._frame_offset_in_chunk = local_frame
 
-    def get_scheduled_time_sec(self) -> float:
+    def get_content_time_sec(self) -> float:
         if not self._chunks:
             return 0.0
-
         if self._current_chunk_idx >= len(self._chunks):
             return self._total_duration_sec
-
         chunk = self._chunks[self._current_chunk_idx]
         return chunk.start_time_sec + (self._frame_offset_in_chunk / chunk.sample_rate)
 
@@ -3548,57 +3091,82 @@ class ChunkQueue:
         out = np.zeros((frames, channels), dtype=np.float32)
         if not self._chunks or self.is_finished():
             return out
-
         written = 0
         while written < frames and self._current_chunk_idx < len(self._chunks):
             chunk = self._chunks[self._current_chunk_idx]
-            remain_in_chunk = len(chunk.samples) - self._frame_offset_in_chunk
-            need = frames - written
-            take = min(remain_in_chunk, need)
-
+            remain = chunk.samples.shape[0] - self._frame_offset_in_chunk
+            take = min(remain, frames - written)
             if take > 0:
-                data = chunk.samples[
-                    self._frame_offset_in_chunk : self._frame_offset_in_chunk + take
-                ]
-
+                data = chunk.samples[self._frame_offset_in_chunk : self._frame_offset_in_chunk + take]
                 if data.ndim == 1:
                     out[written : written + take, 0] = data
                 else:
                     out[written : written + take, : data.shape[1]] = data
-
                 self._frame_offset_in_chunk += take
                 written += take
-
-            if self._frame_offset_in_chunk >= len(chunk.samples):
+            if self._frame_offset_in_chunk >= chunk.samples.shape[0]:
                 self._current_chunk_idx += 1
                 self._frame_offset_in_chunk = 0
-
-                if self._current_chunk_idx >= len(self._chunks):
-                    break
-
         return out
 ```
 
 ---
-### 文件: `shadowing_app/src/shadowing/realtime/playback/command_slot.py`
+### 文件: `shadowing_app/src/shadowing/realtime/playback/command_queue.py`
 
 ```python
 from __future__ import annotations
 
-from shadowing.types import PlayerCommand
+import queue
+from dataclasses import dataclass
+
+from shadowing.types import PlayerCommand, PlayerCommandType
 
 
-class CommandSlot:
-    def __init__(self) -> None:
-        self._cmd: PlayerCommand | None = None
+@dataclass(slots=True)
+class MergedPlayerCommands:
+    state_cmd: PlayerCommand | None = None
+    seek_cmd: PlayerCommand | None = None
+    gain_cmd: PlayerCommand | None = None
+
+
+class PlayerCommandQueue:
+    def __init__(self, maxsize: int = 64) -> None:
+        self._queue: queue.Queue[PlayerCommand] = queue.Queue(maxsize=maxsize)
 
     def put(self, cmd: PlayerCommand) -> None:
-        self._cmd = cmd
+        try:
+            self._queue.put_nowait(cmd)
+        except queue.Full:
+            try:
+                _ = self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._queue.put_nowait(cmd)
 
-    def pop(self) -> PlayerCommand | None:
-        cmd = self._cmd
-        self._cmd = None
-        return cmd
+    def drain_merged(self) -> MergedPlayerCommands:
+        merged = MergedPlayerCommands()
+        while True:
+            try:
+                cmd = self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if cmd.cmd == PlayerCommandType.SET_GAIN:
+                merged.gain_cmd = cmd
+                continue
+
+            if cmd.cmd == PlayerCommandType.SEEK:
+                merged.seek_cmd = cmd
+                continue
+
+            if cmd.cmd == PlayerCommandType.STOP:
+                merged.state_cmd = cmd
+                continue
+
+            if merged.state_cmd is None or merged.state_cmd.cmd != PlayerCommandType.STOP:
+                merged.state_cmd = cmd
+
+        return merged
 ```
 
 ---
@@ -3613,24 +3181,30 @@ from dataclasses import dataclass
 @dataclass(slots=True)
 class PlaybackClockSnapshot:
     t_host_output_sec: float
-    t_ref_sched_sec: float
-    t_ref_heard_sec: float
+    t_ref_block_start_content_sec: float
+    t_ref_block_end_content_sec: float
+    t_ref_emitted_content_sec: float
+    t_ref_heard_content_sec: float
 
 
 class PlaybackClock:
     def __init__(self, bluetooth_output_offset_sec: float = 0.0) -> None:
-        self.bluetooth_output_offset_sec = bluetooth_output_offset_sec
+        self.bluetooth_output_offset_sec = float(bluetooth_output_offset_sec)
 
     def compute(
         self,
         output_buffer_dac_time_sec: float,
-        scheduled_ref_time_sec: float,
+        block_start_content_sec: float,
+        block_end_content_sec: float,
     ) -> PlaybackClockSnapshot:
-        heard = scheduled_ref_time_sec - self.bluetooth_output_offset_sec
+        emitted = block_start_content_sec
+        heard = max(0.0, emitted - self.bluetooth_output_offset_sec)
         return PlaybackClockSnapshot(
-            t_host_output_sec=output_buffer_dac_time_sec,
-            t_ref_sched_sec=scheduled_ref_time_sec,
-            t_ref_heard_sec=max(0.0, heard),
+            t_host_output_sec=float(output_buffer_dac_time_sec),
+            t_ref_block_start_content_sec=float(block_start_content_sec),
+            t_ref_block_end_content_sec=float(block_end_content_sec),
+            t_ref_emitted_content_sec=float(emitted),
+            t_ref_heard_content_sec=float(heard),
         )
 ```
 
@@ -3640,86 +3214,170 @@ class PlaybackClock:
 ```python
 from __future__ import annotations
 
+from dataclasses import dataclass
+from math import gcd
+
+import numpy as np
 import sounddevice as sd
+from scipy.signal import resample_poly
 
 from shadowing.interfaces.player import Player
-from shadowing.types import (
-    AudioChunk,
-    PlaybackState,
-    PlaybackStatus,
-    PlayerCommand,
-    PlayerCommandType,
-)
 from shadowing.realtime.playback.chunk_queue import ChunkQueue
+from shadowing.realtime.playback.command_queue import PlayerCommandQueue
 from shadowing.realtime.playback.playback_clock import PlaybackClock
-from shadowing.realtime.playback.command_slot import CommandSlot
+from shadowing.types import AudioChunk, PlaybackState, PlaybackStatus, PlayerCommand, PlayerCommandType
+
+
+@dataclass(slots=True)
+class PlaybackConfig:
+    sample_rate: int
+    channels: int
+    device: int | None = None
+    latency: str | float = "low"
+    blocksize: int = 0
+    bluetooth_output_offset_sec: float = 0.0
+
+
+class _OutputResampler:
+    def __init__(self, src_rate: int, dst_rate: int) -> None:
+        self.src_rate = int(src_rate)
+        self.dst_rate = int(dst_rate)
+        g = gcd(self.src_rate, self.dst_rate)
+        self.up = self.dst_rate // g
+        self.down = self.src_rate // g
+
+    def process(self, audio: np.ndarray) -> np.ndarray:
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError(f"Expected 2D audio array, got shape={arr.shape}")
+        if self.src_rate == self.dst_rate or arr.shape[0] == 0:
+            return arr.astype(np.float32, copy=False)
+
+        channels = arr.shape[1]
+        pieces: list[np.ndarray] = []
+        for ch in range(channels):
+            y = resample_poly(arr[:, ch], self.up, self.down).astype(np.float32, copy=False)
+            pieces.append(y)
+
+        min_len = min(piece.shape[0] for piece in pieces)
+        if min_len <= 0:
+            return np.zeros((0, channels), dtype=np.float32)
+
+        out = np.stack([piece[:min_len] for piece in pieces], axis=1)
+        return out.astype(np.float32, copy=False)
 
 
 class SoundDevicePlayer(Player):
-    def __init__(
-        self,
-        sample_rate: int,
-        channels: int,
-        device: int | None = None,
-        bluetooth_output_offset_sec: float = 0.0,
-        latency: str | float = "low",
-        blocksize: int = 0,
-    ) -> None:
-        self.sample_rate = sample_rate
-        self.channels = channels
-        self.device = device
-        self.latency = latency
-        self.blocksize = blocksize
-
-        self.clock = PlaybackClock(bluetooth_output_offset_sec)
+    def __init__(self, config: PlaybackConfig) -> None:
+        self.config = config
+        self.clock = PlaybackClock(config.bluetooth_output_offset_sec)
         self.queue = ChunkQueue()
-        self.command_slot = CommandSlot()
-
+        self.command_queue = PlayerCommandQueue()
         self._stream: sd.OutputStream | None = None
         self._state = PlaybackState.STOPPED
-
-        self._current_chunk_id = -1
-        self._frame_index = 0
-        self._t_host_output_sec = 0.0
-        self._t_ref_sched_sec = 0.0
-        self._t_ref_heard_sec = 0.0
-
         self._gain = 1.0
+        self._generation = 0
+        self._callback_count = 0
+
+        self._content_sample_rate = int(config.sample_rate)
+        self._opened_output_sample_rate = int(config.sample_rate)
+        self._output_resampler: _OutputResampler | None = None
+
+        self._resolved_output_device: int | None = None
+        self._resolved_output_device_name = ""
+        self._silent_branch_logged = False
+
+        self._status_snapshot = PlaybackStatus(
+            state=PlaybackState.STOPPED,
+            chunk_id=-1,
+            frame_index=0,
+            gain=1.0,
+            generation=0,
+            t_host_output_sec=0.0,
+            t_ref_block_start_content_sec=0.0,
+            t_ref_block_end_content_sec=0.0,
+            t_ref_emitted_content_sec=0.0,
+            t_ref_heard_content_sec=0.0,
+        )
 
     def load_chunks(self, chunks: list[AudioChunk]) -> None:
+        if chunks and any(c.sample_rate != self.config.sample_rate for c in chunks):
+            raise ValueError("Chunk sample rate does not match player config sample rate.")
         self.queue.load(chunks)
-        if chunks:
-            self._current_chunk_id = chunks[0].chunk_id
-            self._frame_index = 0
+        self._content_sample_rate = int(self.config.sample_rate)
+        total_duration = chunks[-1].start_time_sec + chunks[-1].duration_sec if chunks else 0.0
+        print(
+            f"[PLAYER] loaded_chunks={len(chunks)} sample_rate={self.config.sample_rate} "
+            f"channels={self.config.channels} total_duration_sec={total_duration:.3f}"
+        )
 
     def start(self) -> None:
         if self._stream is not None:
             return
 
-        self._stream = sd.OutputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype="float32",
-            callback=self._audio_callback,
-            device=self.device,
-            latency=self.latency,
-            blocksize=self.blocksize,
+        actual_device = self._resolve_output_device(self.config.device)
+        dev_info = sd.query_devices(actual_device, "output")
+
+        opened_sr = self._pick_openable_output_samplerate(actual_device, dev_info)
+        self._opened_output_sample_rate = int(opened_sr)
+        self._output_resampler = (
+            None
+            if self._opened_output_sample_rate == self._content_sample_rate
+            else _OutputResampler(
+                src_rate=self._content_sample_rate,
+                dst_rate=self._opened_output_sample_rate,
+            )
         )
-        self._stream.start()
-        self._state = PlaybackState.PLAYING
+
+        self._resolved_output_device = int(actual_device)
+        self._resolved_output_device_name = str(dev_info["name"])
+
+        print(
+            f"[PLAYER-START] requested_device={self.config.device} "
+            f"resolved_device={self._resolved_output_device} "
+            f"name={self._resolved_output_device_name} "
+            f"latency={self.config.latency} blocksize={self.config.blocksize}"
+        )
+
+        try:
+            self._stream = sd.OutputStream(
+                samplerate=self._opened_output_sample_rate,
+                channels=self.config.channels,
+                dtype="float32",
+                callback=self._audio_callback,
+                device=self._resolved_output_device,
+                latency=self.config.latency,
+                blocksize=self.config.blocksize,
+            )
+
+            self._state = PlaybackState.PLAYING
+            self._silent_branch_logged = False
+            self._stream.start()
+
+            print(
+                f"[PLAYER] opened_output device={self._resolved_output_device} "
+                f"name={dev_info['name']} default_sr={float(dev_info['default_samplerate'])} "
+                f"content_sr={self._content_sample_rate} stream_sr={self._opened_output_sample_rate} "
+                f"channels={self.config.channels}"
+            )
+            if self._opened_output_sample_rate != self._content_sample_rate:
+                print(
+                    f"[PLAYER] output_resample enabled "
+                    f"{self._content_sample_rate} -> {self._opened_output_sample_rate}"
+                )
+        except Exception as e:
+            self._state = PlaybackState.STOPPED
+            raise RuntimeError(
+                f"Failed to open output stream: device={self._resolved_output_device}, "
+                f"sample_rate={self._opened_output_sample_rate}, channels={self.config.channels}, "
+                f"latency={self.config.latency}, blocksize={self.config.blocksize}"
+            ) from e
 
     def submit_command(self, command: PlayerCommand) -> None:
-        self.command_slot.put(command)
+        self.command_queue.put(command)
 
     def get_status(self) -> PlaybackStatus:
-        return PlaybackStatus(
-            state=self._state,
-            chunk_id=self._current_chunk_id,
-            frame_index=self._frame_index,
-            t_host_output_sec=self._t_host_output_sec,
-            t_ref_sched_sec=self._t_ref_sched_sec,
-            t_ref_heard_sec=self._t_ref_heard_sec,
-        )
+        return self._status_snapshot
 
     def stop(self) -> None:
         self.submit_command(PlayerCommand(cmd=PlayerCommandType.STOP, reason="external_stop"))
@@ -3731,57 +3389,178 @@ class SoundDevicePlayer(Player):
             self._stream = None
         self._state = PlaybackState.STOPPED
 
-    def _apply_command_if_any(self) -> None:
-        cmd = self.command_slot.pop()
-        if cmd is None:
-            return
+    def _apply_merged_commands(self) -> None:
+        merged = self.command_queue.drain_merged()
 
-        if cmd.cmd == PlayerCommandType.HOLD:
+        if merged.gain_cmd and merged.gain_cmd.gain is not None:
+            self._gain = min(max(merged.gain_cmd.gain, 0.0), 1.0)
+
+        hold_after_seek = False
+        if merged.state_cmd is not None:
+            if merged.state_cmd.cmd == PlayerCommandType.HOLD:
+                hold_after_seek = True
+            elif merged.state_cmd.cmd == PlayerCommandType.RESUME:
+                self._state = PlaybackState.PLAYING
+                self._silent_branch_logged = False
+            elif merged.state_cmd.cmd == PlayerCommandType.STOP:
+                self._state = PlaybackState.STOPPED
+            elif merged.state_cmd.cmd == PlayerCommandType.START:
+                self._state = PlaybackState.PLAYING
+                self._silent_branch_logged = False
+
+        if merged.seek_cmd is not None and merged.seek_cmd.target_time_sec is not None:
+            self._state = PlaybackState.SEEKING
+            self.queue.seek(merged.seek_cmd.target_time_sec)
+            self._generation += 1
+            self._state = PlaybackState.HOLDING if hold_after_seek else PlaybackState.PLAYING
+            if self._state == PlaybackState.PLAYING:
+                self._silent_branch_logged = False
+        elif hold_after_seek:
             self._state = PlaybackState.HOLDING
 
-        elif cmd.cmd == PlayerCommandType.RESUME:
-            self._state = PlaybackState.PLAYING
-
-        elif cmd.cmd == PlayerCommandType.SEEK:
-            self._state = PlaybackState.SEEKING
-            if cmd.target_time_sec is not None:
-                self.queue.seek(cmd.target_time_sec)
-            self._state = PlaybackState.PLAYING
-
-        elif cmd.cmd == PlayerCommandType.STOP:
-            self._state = PlaybackState.STOPPED
-
-        elif cmd.cmd == PlayerCommandType.START:
-            self._state = PlaybackState.PLAYING
-
-        elif cmd.cmd == PlayerCommandType.SET_GAIN:
-            if cmd.gain is not None:
-                self._gain = min(max(cmd.gain, 0.0), 1.0)
-
     def _audio_callback(self, outdata, frames, time_info, status) -> None:
-        self._apply_command_if_any()
+        self._callback_count += 1
+        self._apply_merged_commands()
+        block_start = self.queue.get_content_time_sec()
 
         if self._state in (PlaybackState.STOPPED, PlaybackState.HOLDING, PlaybackState.FINISHED):
             outdata.fill(0.0)
+            if not self._silent_branch_logged:
+                print(
+                    f"[PLAYER-SILENT] callback active but state={self._state.value} "
+                    f"device={self._resolved_output_device} frames={frames}"
+                )
+                self._silent_branch_logged = True
         else:
-            block = self.queue.read_frames(frames=frames, channels=self.channels)
+            self._silent_branch_logged = False
+
+            if self._output_resampler is None:
+                block = self.queue.read_frames(frames=frames, channels=self.config.channels)
+            else:
+                src_frames = self._estimate_source_frames(frames)
+                source_block = self.queue.read_frames(frames=src_frames, channels=self.config.channels)
+                block = self._output_resampler.process(source_block)
+
+                if block.shape[0] < frames:
+                    padded = np.zeros((frames, self.config.channels), dtype=np.float32)
+                    if block.shape[0] > 0:
+                        padded[: block.shape[0], :] = block
+                    block = padded
+                elif block.shape[0] > frames:
+                    block = block[:frames, :]
 
             outdata[:] = block * self._gain
 
             if self.queue.is_finished():
                 self._state = PlaybackState.FINISHED
 
-            self._current_chunk_id = self.queue.current_chunk_id
-            self._frame_index = self.queue.current_frame_index
+            if self._callback_count <= 5 or self._callback_count % 50 == 0:
+                peak = float(np.max(np.abs(outdata))) if outdata.size else 0.0
+                print(
+                    f"[PLAYER-CB] n={self._callback_count} frames={frames} "
+                    f"state={self._state.value} chunk_id={self.queue.current_chunk_id} "
+                    f"frame_index={self.queue.current_frame_index} peak={peak:.6f}"
+                )
 
-        scheduled_ref_time = self.queue.get_scheduled_time_sec()
-        clock_snapshot = self.clock.compute(
+        if status:
+            print(f"[PLAYER-CB-STATUS] {status}")
+
+        block_end = self.queue.get_content_time_sec()
+        snapshot = self.clock.compute(
             output_buffer_dac_time_sec=time_info.outputBufferDacTime,
-            scheduled_ref_time_sec=scheduled_ref_time,
+            block_start_content_sec=block_start,
+            block_end_content_sec=block_end,
         )
-        self._t_host_output_sec = clock_snapshot.t_host_output_sec
-        self._t_ref_sched_sec = clock_snapshot.t_ref_sched_sec
-        self._t_ref_heard_sec = clock_snapshot.t_ref_heard_sec
+        self._status_snapshot = PlaybackStatus(
+            state=self._state,
+            chunk_id=self.queue.current_chunk_id,
+            frame_index=self.queue.current_frame_index,
+            gain=self._gain,
+            generation=self._generation,
+            t_host_output_sec=snapshot.t_host_output_sec,
+            t_ref_block_start_content_sec=snapshot.t_ref_block_start_content_sec,
+            t_ref_block_end_content_sec=snapshot.t_ref_block_end_content_sec,
+            t_ref_emitted_content_sec=snapshot.t_ref_emitted_content_sec,
+            t_ref_heard_content_sec=snapshot.t_ref_heard_content_sec,
+        )
+
+        if self._callback_count <= 3 or self._callback_count % 200 == 0:
+            peak_now = float(np.max(np.abs(outdata))) if outdata.size else 0.0
+            print(
+                f"[PLAYER-CB-HEARTBEAT] n={self._callback_count} "
+                f"state={self._state.value} frames={frames} peak={peak_now:.6f}"
+            )
+
+    def _resolve_output_device(self, requested_device: int | None) -> int:
+        if requested_device is not None:
+            dev_info = sd.query_devices(requested_device)
+            if int(dev_info["max_output_channels"]) <= 0:
+                raise ValueError(
+                    f"Requested device is not an output device: "
+                    f"device={requested_device}, name={dev_info['name']}"
+                )
+            return int(requested_device)
+
+        default_in, default_out = sd.default.device
+        candidates: list[int] = []
+
+        if default_out is not None and int(default_out) >= 0:
+            candidates.append(int(default_out))
+        if default_in is not None and int(default_in) >= 0 and int(default_in) not in candidates:
+            candidates.append(int(default_in))
+
+        for idx, dev in enumerate(sd.query_devices()):
+            if int(dev["max_output_channels"]) > 0 and idx not in candidates:
+                candidates.append(idx)
+
+        for idx in candidates:
+            try:
+                dev_info = sd.query_devices(idx)
+                if int(dev_info["max_output_channels"]) > 0:
+                    return int(idx)
+            except Exception:
+                continue
+
+        raise RuntimeError("No valid output device available.")
+
+    def _pick_openable_output_samplerate(self, device: int, dev_info) -> int:
+        candidates: list[int] = []
+        preferred = [
+            self.config.sample_rate,
+            int(float(dev_info["default_samplerate"])),
+            48000,
+            44100,
+            16000,
+        ]
+        for sr in preferred:
+            if sr > 0 and sr not in candidates:
+                candidates.append(int(sr))
+
+        last_error: Exception | None = None
+        for sr in candidates:
+            try:
+                sd.check_output_settings(
+                    device=device,
+                    samplerate=sr,
+                    channels=self.config.channels,
+                    dtype="float32",
+                )
+                return int(sr)
+            except Exception as e:
+                last_error = e
+                continue
+
+        raise RuntimeError(
+            f"Failed to find openable output samplerate for device={device}, "
+            f"default_sr={float(dev_info['default_samplerate'])}, last_error={last_error}"
+        )
+
+    def _estimate_source_frames(self, output_frames: int) -> int:
+        if self._opened_output_sample_rate <= 0 or self._content_sample_rate <= 0:
+            return output_frames
+        ratio = self._content_sample_rate / self._opened_output_sample_rate
+        estimated = int(np.ceil(output_frames * ratio)) + 8
+        return max(1, estimated)
 ```
 
 ---
@@ -3808,9 +3587,14 @@ class ShadowingRuntime:
 ### 文件: `shadowing_app/src/shadowing/types.py`
 
 ```python
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, List
+from typing import Optional
+
+import numpy as np
+from numpy.typing import NDArray
 
 
 class PlaybackState(str, Enum):
@@ -3857,7 +3641,7 @@ class AudioChunk:
     chunk_id: int
     sample_rate: int
     channels: int
-    samples: "object"
+    samples: NDArray[np.float32]
     duration_sec: float
     start_time_sec: float
     path: Optional[str] = None
@@ -3877,7 +3661,7 @@ class RefToken:
 @dataclass(slots=True)
 class ReferenceMap:
     lesson_id: str
-    tokens: List[RefToken]
+    tokens: list[RefToken]
     total_duration_sec: float
 
 
@@ -3886,8 +3670,11 @@ class LessonManifest:
     lesson_id: str
     lesson_text: str
     sample_rate_out: int
-    chunk_paths: List[str]
+    chunk_paths: list[str]
     reference_map_path: str
+    schema_version: int = 1
+    provider_name: str = "elevenlabs"
+    output_format: str = "mp3_44100_128"
 
 
 @dataclass(slots=True)
@@ -3895,9 +3682,20 @@ class PlaybackStatus:
     state: PlaybackState
     chunk_id: int
     frame_index: int
+    gain: float
+    generation: int
     t_host_output_sec: float
-    t_ref_sched_sec: float
-    t_ref_heard_sec: float
+    t_ref_block_start_content_sec: float
+    t_ref_block_end_content_sec: float
+    t_ref_emitted_content_sec: float
+    t_ref_heard_content_sec: float
+
+
+@dataclass(slots=True)
+class RawAsrEvent:
+    event_type: AsrEventType
+    text: str
+    emitted_at_sec: float
 
 
 @dataclass(slots=True)
@@ -3905,8 +3703,26 @@ class AsrEvent:
     event_type: AsrEventType
     text: str
     normalized_text: str
-    pinyin_seq: List[str]
+    chars: list[str]
+    pinyin_seq: list[str]
     emitted_at_sec: float
+
+
+@dataclass(slots=True)
+class HypToken:
+    char: str
+    pinyin: str
+
+
+@dataclass(slots=True)
+class CandidateAlignment:
+    ref_start_idx: int
+    ref_end_idx: int
+    score: float
+    confidence: float
+    matched_ref_indices: list[int] = field(default_factory=list)
+    backward_jump: bool = False
+    mode: str = "normal"
 
 
 @dataclass(slots=True)
@@ -3917,7 +3733,16 @@ class AlignResult:
     confidence: float
     stable: bool
     matched_text: str = ""
-    matched_pinyin: List[str] = field(default_factory=list)
+    matched_pinyin: list[str] = field(default_factory=list)
+    window_start_idx: int = 0
+    window_end_idx: int = 0
+    alignment_mode: str = "normal"
+    backward_jump_detected: bool = False
+    debug_score: float = 0.0
+    debug_stable_run: int = 0
+    debug_backward_run: int = 0
+    debug_matched_count: int = 0
+    debug_hyp_length: int = 0
 
 
 @dataclass(slots=True)
@@ -3928,21 +3753,6 @@ class ControlDecision:
     lead_sec: Optional[float] = None
     target_gain: Optional[float] = None
     replay_lockin: bool = False
-
-
-@dataclass(slots=True)
-class ControlFeatures:
-    lead_raw: Optional[float]
-    lead_ema: Optional[float]
-    lead_slope: Optional[float]
-    alignment_conf: float
-    alignment_stable: bool
-    user_speaking: bool
-    recent_partial_rate: float
-    recent_hold_count: int
-    dynamic_target_lead: float
-    suggested_gain: float
-    playback_state: str
 ```
 
 ---
@@ -3954,9 +3764,41 @@ import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
-
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+```
+
+---
+### 文件: `shadowing_app/tools/list_playback_devices.py`
+
+```python
+import _bootstrap  # noqa: F401
+
+import sounddevice as sd
+
+
+def main() -> None:
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+
+    print("=== Output devices ===")
+    for idx, dev in enumerate(devices):
+        max_out = int(dev["max_output_channels"])
+        if max_out <= 0:
+            continue
+        hostapi_name = hostapis[int(dev["hostapi"])]["name"]
+        print(
+            f"[{idx}] {dev['name']} | hostapi={hostapi_name} | "
+            f"max_out={max_out} | default_sr={float(dev['default_samplerate'])}"
+        )
+
+    default_in, default_out = sd.default.device
+    print()
+    print(f"Default output device: {default_out}")
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
@@ -3966,11 +3808,10 @@ if str(SRC_DIR) not in sys.path:
 import _bootstrap  # noqa: F401
 
 from shadowing.realtime.capture.device_utils import (
-    print_input_devices,
     get_default_input_device_index,
     pick_working_input_config,
+    print_input_devices,
 )
-
 
 
 def main() -> None:
@@ -3995,6 +3836,7 @@ if __name__ == "__main__":
 
 ```python
 from __future__ import annotations
+
 import _bootstrap  # noqa: F401
 import argparse
 import os
@@ -4007,16 +3849,15 @@ from shadowing.preprocess.pipeline import LessonPreprocessPipeline
 from shadowing.preprocess.providers.elevenlabs_tts import ElevenLabsTTSProvider
 
 
-DEFAULT_TEXT_FILE = r"D:\sl_video_scheme\shadowing_app\assets\raw_texts\演讲稿3.txt"
-
 DEFAULT_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
 DEFAULT_MODEL_ID = "eleven_multilingual_v2"
+DEFAULT_OUTPUT_FORMAT = "pcm_44100"
 
 
 def slugify_filename_stem(stem: str) -> str:
     stem = stem.strip()
-    stem = re.sub(r"[\\/:\*\?\"<>\|]+", "_", stem)
-    stem = re.sub(r"\s+", "_", stem)
+    stem = re.sub(r'[\\/:\\*\\?"<>\\|]+', "_", stem)
+    stem = re.sub(r"\\s+", "_", stem)
     stem = stem.strip("._")
     return stem or "lesson"
 
@@ -4025,101 +3866,38 @@ def lesson_assets_exist(lesson_dir: Path) -> tuple[bool, list[str]]:
     manifest = lesson_dir / "lesson_manifest.json"
     ref_map = lesson_dir / "reference_map.json"
     chunks_dir = lesson_dir / "chunks"
-
     missing: list[str] = []
-
     if not manifest.exists():
         missing.append(str(manifest))
-
     if not ref_map.exists():
         missing.append(str(ref_map))
-
     if not chunks_dir.exists():
         missing.append(str(chunks_dir))
     else:
         has_audio = any(chunks_dir.glob("*.wav")) or any(chunks_dir.glob("*.mp3"))
         if not has_audio:
             missing.append(f"{chunks_dir} (no audio files found)")
-
     return len(missing) == 0, missing
 
 
 def same_source_text(lesson_dir: Path, current_text: str) -> bool:
     source_path = lesson_dir / "source.txt"
-    if not source_path.exists():
-        return False
-
-    cached_text = source_path.read_text(encoding="utf-8").strip()
-    return cached_text == current_text.strip()
-
-
-def print_cache_status(
-    lesson_dir: Path,
-    assets_ok: bool,
-    same_text: bool,
-    force: bool,
-) -> None:
-    print("=== Cache check ===")
-    print(f"lesson dir         : {lesson_dir}")
-    print(f"assets complete    : {assets_ok}")
-    print(f"source text same   : {same_text}")
-    print(f"force rebuild      : {force}")
-    print()
+    return source_path.exists() and source_path.read_text(encoding="utf-8").strip() == current_text.strip()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Preprocess a local txt speech file into lesson assets using ElevenLabs."
-    )
-    parser.add_argument(
-        "--text-file",
-        type=str,
-        default=DEFAULT_TEXT_FILE,
-        help="Path to local txt file. Default points to a fake placeholder path; change it locally.",
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=os.getenv("ELEVENLABS_API_KEY", ""),
-        help="ElevenLabs API key. Defaults to env ELEVENLABS_API_KEY.",
-    )
-    parser.add_argument(
-        "--voice-id",
-        type=str,
-        default=DEFAULT_VOICE_ID,
-        help="ElevenLabs voice id.",
-    )
-    parser.add_argument(
-        "--model-id",
-        type=str,
-        default=DEFAULT_MODEL_ID,
-        help="ElevenLabs model id.",
-    )
-    parser.add_argument(
-        "--lesson-base-dir",
-        type=str,
-        default="assets/lessons",
-        help="Base output dir for generated lessons.",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Force rebuild even if local cached assets already exist.",
-    )
-
+    parser = argparse.ArgumentParser(description="Preprocess a local txt speech file into lesson assets using ElevenLabs.")
+    parser.add_argument("--text-file", type=str, required=True)
+    parser.add_argument("--api-key", type=str, default=os.getenv("ELEVENLABS_API_KEY", ""))
+    parser.add_argument("--voice-id", type=str, default=DEFAULT_VOICE_ID)
+    parser.add_argument("--model-id", type=str, default=DEFAULT_MODEL_ID)
+    parser.add_argument("--output-format", type=str, default=DEFAULT_OUTPUT_FORMAT)
+    parser.add_argument("--lesson-base-dir", type=str, default="assets/lessons")
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     text_path = Path(args.text_file).expanduser().resolve()
-    if not text_path.exists():
-        raise FileNotFoundError(f"Text file not found: {text_path}")
-
-    if text_path.suffix.lower() != ".txt":
-        raise ValueError(f"Expected a .txt file, got: {text_path}")
-
     lesson_text = text_path.read_text(encoding="utf-8").strip()
-    if not lesson_text:
-        raise ValueError(f"Text file is empty: {text_path}")
-
     lesson_id = slugify_filename_stem(text_path.stem)
     lesson_base_dir = Path(args.lesson_base_dir).resolve()
     output_dir = lesson_base_dir / lesson_id
@@ -4127,49 +3905,12 @@ def main() -> None:
 
     assets_ok, missing = lesson_assets_exist(output_dir)
     text_same = same_source_text(output_dir, lesson_text)
-
-    print("=== Preprocess config ===")
-    print(f"text file : {text_path}")
-    print(f"lesson id : {lesson_id}")
-    print(f"output dir: {output_dir}")
-    print(f"voice id  : {args.voice_id}")
-    print(f"model id  : {args.model_id}")
-    print()
-
-    print_cache_status(
-        lesson_dir=output_dir,
-        assets_ok=assets_ok,
-        same_text=text_same,
-        force=args.force,
-    )
-
     if assets_ok and text_same and not args.force:
-        print("Local lesson assets already exist and source text is unchanged.")
-        print("Skip ElevenLabs preprocessing.")
-        print()
-        print("Next step:")
-        print(f'python tools\\run_shadowing.py --text-file "{text_path}"')
+        print("Local lesson assets already exist and source text is unchanged. Skip ElevenLabs preprocessing.")
         return
 
     if not args.api_key:
-        raise ValueError(
-            "Missing ElevenLabs API key. Pass --api-key or set ELEVENLABS_API_KEY."
-        )
-
-    if not assets_ok:
-        print("Cache miss: lesson assets are incomplete.")
-        if missing:
-            print("Missing:")
-            for item in missing:
-                print(f"  - {item}")
-        print()
-    elif not text_same:
-        print("Cache invalidated: source text has changed.")
-        print()
-
-    if args.force:
-        print("Force rebuild enabled. ElevenLabs preprocessing will run.")
-        print()
+        raise ValueError("Missing ElevenLabs API key. Pass --api-key or set ELEVENLABS_API_KEY.")
 
     source_copy_path = output_dir / "source.txt"
     if source_copy_path.resolve() != text_path:
@@ -4179,21 +3920,19 @@ def main() -> None:
         api_key=args.api_key,
         voice_id=args.voice_id,
         model_id=args.model_id,
+        output_format=args.output_format,
     )
     repo = FileLessonRepository(str(lesson_base_dir))
-    pipeline = LessonPreprocessPipeline(tts_provider=tts, repo=repo)
-
-    pipeline.run(
+    LessonPreprocessPipeline(tts_provider=tts, repo=repo).run(
         lesson_id=lesson_id,
         text=lesson_text,
         output_dir=str(output_dir),
     )
-
-    print("Preprocess completed.")
-    print(f"Generated lesson assets under: {output_dir}")
-    print()
-    print("Next step:")
-    print(f'python tools\\run_shadowing.py --text-file "{text_path}"')
+    print(f"Preprocess completed: {output_dir}")
+    if missing:
+        print("Previous missing items:")
+        for item in missing:
+            print(f"  - {item}")
 
 
 if __name__ == "__main__":
@@ -4205,8 +3944,8 @@ if __name__ == "__main__":
 
 ```python
 from __future__ import annotations
-import _bootstrap  # noqa: F401
 
+import _bootstrap  # noqa: F401
 import argparse
 import json
 import os
@@ -4214,15 +3953,12 @@ import re
 from pathlib import Path
 
 from shadowing.bootstrap import build_runtime
-from shadowing.realtime.asr.fake_asr_provider import FakeASRProvider
-
-
-DEFAULT_TEXT_FILE = r"D:\sl_video_scheme\shadowing_app\assets\raw_texts\演讲稿3.txt"
+from shadowing.realtime.capture.device_utils import pick_working_input_config
 
 
 def slugify_filename_stem(stem: str) -> str:
     stem = stem.strip()
-    stem = re.sub(r'[\\/:\*\?"<>\|]+', "_", stem)
+    stem = re.sub(r'[\\/:*?"<>|]+', "_", stem)
     stem = re.sub(r"\s+", "_", stem)
     stem = stem.strip("._")
     return stem or "lesson"
@@ -4234,51 +3970,18 @@ def validate_lesson_assets(lesson_dir: Path) -> None:
     chunks_dir = lesson_dir / "chunks"
 
     missing: list[str] = []
-    if not manifest.exists():
-        missing.append(str(manifest))
-    if not ref_map.exists():
-        missing.append(str(ref_map))
-    if not chunks_dir.exists():
-        missing.append(str(chunks_dir))
+    for p in (manifest, ref_map, chunks_dir):
+        if not p.exists():
+            missing.append(str(p))
 
     if missing:
-        msg = "\n".join(missing)
         raise FileNotFoundError(
-            "Lesson assets not found. Please run preprocess first.\n"
-            f"Missing:\n{msg}"
+            "Lesson assets not found. Please run preprocess first.\n" + "\n".join(missing)
         )
 
 
 def load_manifest(lesson_dir: Path) -> dict:
-    manifest_path = lesson_dir / "lesson_manifest.json"
-    return json.loads(manifest_path.read_text(encoding="utf-8"))
-
-
-def resolve_recording_config(
-    manual_device: int | None,
-    manual_samplerate: int | None,
-) -> dict:
-    from shadowing.realtime.capture.device_utils import pick_working_input_config
-
-    if manual_device is not None:
-        return {
-            "device": manual_device,
-            "samplerate": int(manual_samplerate or 48000),
-            "channels": 1,
-            "dtype": "float32",
-        }
-
-    rec_cfg = pick_working_input_config()
-    if rec_cfg is None:
-        raise RuntimeError(
-            "No working input device config found. "
-            "Try specifying --input-device manually, e.g. --input-device 9"
-        )
-
-    if manual_samplerate is not None:
-        rec_cfg["samplerate"] = int(manual_samplerate)
-
-    return rec_cfg
+    return json.loads((lesson_dir / "lesson_manifest.json").read_text(encoding="utf-8"))
 
 
 def collect_sherpa_paths() -> dict:
@@ -4293,11 +3996,17 @@ def collect_sherpa_paths() -> dict:
 def validate_sherpa_paths(paths: dict) -> None:
     missing_keys: list[str] = []
     missing_files: list[str] = []
+    env_map = {
+        "tokens": "SHERPA_TOKENS",
+        "encoder": "SHERPA_ENCODER",
+        "decoder": "SHERPA_DECODER",
+        "joiner": "SHERPA_JOINER",
+    }
 
     for key in ("tokens", "encoder", "decoder", "joiner"):
         value = (paths.get(key) or "").strip()
         if not value:
-            missing_keys.append(key)
+            missing_keys.append(env_map[key])
             continue
         if not Path(value).expanduser().exists():
             missing_files.append(f"{key}: {value}")
@@ -4305,54 +4014,66 @@ def validate_sherpa_paths(paths: dict) -> None:
     if missing_keys or missing_files:
         parts: list[str] = []
         if missing_keys:
-            parts.append(
-                "Missing sherpa env vars: "
-                + ", ".join(
-                    {
-                        "tokens": "SHERPA_TOKENS",
-                        "encoder": "SHERPA_ENCODER",
-                        "decoder": "SHERPA_DECODER",
-                        "joiner": "SHERPA_JOINER",
-                    }[k]
-                    for k in missing_keys
-                )
-            )
+            parts.append("Missing sherpa env vars: " + ", ".join(missing_keys))
         if missing_files:
             parts.append("Non-existent sherpa files:\n" + "\n".join(missing_files))
-
-        raise FileNotFoundError(
-            "Sherpa model configuration is invalid.\n" + "\n".join(parts)
-        )
+        raise FileNotFoundError("Sherpa model configuration is invalid.\n" + "\n".join(parts))
 
 
 def build_config(
     lesson_base_dir: str,
-    input_device: int | None,
+    input_device: int | str | None,
     input_samplerate: int,
     asr_mode: str,
     bluetooth_offset_sec: float,
-    debug: bool,
     playback_sample_rate: int,
-    pure_playback: bool,
-    ducking_only: bool,
-    disable_seek: bool,
-    disable_hold: bool,
     sherpa_paths: dict,
+    pure_playback: bool,
+    lesson_text_for_fake: str,
+    startup_grace_sec: float,
+    low_confidence_hold_sec: float,
+    use_partial_adapter: bool,
+    audio_queue_maxsize: int,
+    asr_event_queue_maxsize: int,
+    output_device: int | None,
+    playback_latency: str,
+    playback_blocksize: int,
+    capture_backend: str,
+    capture_latency: str,
+    capture_blocksize: int,
+    capture_include_loopback: bool,
+    capture_debug_level_meter: bool,
+    capture_debug_level_every_n_blocks: int,
+    asr_debug_feed: bool,
+    asr_debug_feed_every_n_chunks: int,
 ) -> dict:
     return {
         "lesson_base_dir": lesson_base_dir,
         "playback": {
             "sample_rate": playback_sample_rate,
-            "device": None,
+            "channels": 1,
+            "device": output_device,
             "bluetooth_output_offset_sec": bluetooth_offset_sec,
+            "latency": playback_latency,
+            "blocksize": playback_blocksize,
         },
         "capture": {
+            "backend": capture_backend,
             "device_sample_rate": input_samplerate,
             "target_sample_rate": 16000,
+            "channels": 1,
             "device": input_device,
+            "dtype": "float32",
+            "blocksize": capture_blocksize,
+            "block_frames": capture_blocksize if capture_blocksize > 0 else 1440,
+            "latency": capture_latency,
+            "include_loopback": capture_include_loopback,
+            "debug_level_meter": capture_debug_level_meter,
+            "debug_level_every_n_blocks": capture_debug_level_every_n_blocks,
         },
         "asr": {
             "mode": asr_mode,
+            "sample_rate": 16000,
             "hotwords": "",
             "tokens": sherpa_paths["tokens"],
             "encoder": sherpa_paths["encoder"],
@@ -4366,95 +4087,103 @@ def build_config(
             "rule1_min_trailing_silence": 10.0,
             "rule2_min_trailing_silence": 10.0,
             "rule3_min_utterance_length": 60.0,
+            "emit_partial_interval_sec": 0.08,
+            "enable_endpoint": True,
+            "debug_feed": asr_debug_feed,
+            "debug_feed_every_n_chunks": asr_debug_feed_every_n_chunks,
+            "reference_text": lesson_text_for_fake if asr_mode == "fake" else "",
+            "chars_per_sec": 4.0,
+            "emit_final_on_endpoint": True,
+            "bytes_per_sample": 2,
+            "channels": 1,
+            "vad_rms_threshold": 0.01,
+            "vad_min_active_ms": 30.0,
+            "scripted_steps": [],
         },
-        "debug": {
-            "enabled": debug,
-            "heartbeat_sec": 1.0,
-            "print_asr": True,
-            "print_alignment": True,
-            "print_decision": True,
-            "print_player_status": True,
-            "print_reference_head": True,
+        "alignment": {
+            "window_back": 8,
+            "window_ahead": 40,
+            "stable_frames": 2,
+            "min_confidence": 0.60,
+            "backward_lock_frames": 3,
+            "clause_boundary_bonus": 0.15,
+            "cross_clause_backward_extra_penalty": 0.20,
+            "debug": False,
+        },
+        "control": {
+            "target_lead_sec": 0.15,
+            "hold_if_lead_sec": 0.90,
+            "resume_if_lead_sec": 0.28,
+            "seek_if_lag_sec": -1.80,
+            "min_confidence": 0.75,
+            "seek_cooldown_sec": 1.20,
+            "gain_following": 0.55,
+            "gain_transition": 0.80,
+            "recover_after_seek_sec": 0.60,
+            "startup_grace_sec": startup_grace_sec,
+            "low_confidence_hold_sec": low_confidence_hold_sec,
+            "disable_seek": False,
         },
         "runtime": {
             "pure_playback": pure_playback,
+            "use_partial_adapter": use_partial_adapter,
+            "audio_queue_maxsize": audio_queue_maxsize,
+            "asr_event_queue_maxsize": asr_event_queue_maxsize,
+            "loop_interval_sec": 0.03,
         },
-        "control": {
-            "ducking_only": ducking_only,
-            "disable_seek": disable_seek,
-            "disable_hold": disable_hold,
+        "debug": {
+            "enabled": False,
+            "adapter_debug": False,
+            "aligner_debug": False,
         },
     }
 
 
+def _parse_input_device_arg(raw_value: str | None) -> int | str | None:
+    if raw_value is None:
+        return None
+    raw = str(raw_value).strip()
+    if raw == "":
+        return None
+    if raw.isdigit():
+        return int(raw)
+    return raw
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Run the shadowing app for a local txt speech lesson."
-    )
-    parser.add_argument(
-        "--text-file",
-        type=str,
-        default=DEFAULT_TEXT_FILE,
-        help="Path to the original txt file. Lesson id is derived from the file name.",
-    )
-    parser.add_argument(
-        "--lesson-base-dir",
-        type=str,
-        default="assets/lessons",
-        help="Base dir where preprocessed lesson assets are stored.",
-    )
-    parser.add_argument(
-        "--asr",
-        type=str,
-        default="fake",
-        choices=["fake", "sherpa"],
-        help="ASR mode.",
-    )
-    parser.add_argument(
-        "--bluetooth-offset-sec",
-        type=float,
-        default=0.18,
-        help="Estimated Bluetooth playback offset.",
-    )
-    parser.add_argument(
-        "--input-device",
-        type=int,
-        default=None,
-        help="Manually specify recording input device index. "
-             "Recommended on Windows when auto-picked device fails.",
-    )
-    parser.add_argument(
-        "--input-samplerate",
-        type=int,
-        default=None,
-        help="Override recording input sample rate. "
-             "Useful if a device fails at its default rate.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable runtime debug logs.",
-    )
-    parser.add_argument(
-        "--pure-playback",
-        action="store_true",
-        help="Pure playback debug mode: disable controller intervention and force gain=1.0.",
-    )
-    parser.add_argument(
-        "--ducking-only",
-        action="store_true",
-        help="Only apply ducking/gain control. Disable resume/hold/seek actions.",
-    )
-    parser.add_argument(
-        "--disable-seek",
-        action="store_true",
-        help="Disable SEEK decisions.",
-    )
-    parser.add_argument(
-        "--disable-hold",
-        action="store_true",
-        help="Disable HOLD decisions.",
-    )
+    parser = argparse.ArgumentParser(description="Run the shadowing app for a local txt speech lesson.")
+    parser.add_argument("--text-file", type=str, required=True)
+    parser.add_argument("--lesson-base-dir", type=str, default="assets/lessons")
+    parser.add_argument("--asr", type=str, default="fake", choices=["fake", "sherpa"])
+    parser.add_argument("--bluetooth-offset-sec", type=float, default=0.18)
+
+    parser.add_argument("--input-device", type=str, default=None)
+    parser.add_argument("--input-samplerate", type=int, default=None)
+    parser.add_argument("--output-device", type=int, default=None)
+
+    parser.add_argument("--pure-playback", action="store_true")
+    parser.add_argument("--adapter-debug", action="store_true")
+    parser.add_argument("--aligner-debug", action="store_true")
+    parser.add_argument("--disable-seek", action="store_true")
+    parser.add_argument("--bypass-partial-adapter", action="store_true")
+
+    parser.add_argument("--audio-queue-maxsize", type=int, default=150)
+    parser.add_argument("--asr-event-queue-maxsize", type=int, default=64)
+    parser.add_argument("--startup-grace-sec", type=float, default=0.80)
+    parser.add_argument("--low-confidence-hold-sec", type=float, default=0.60)
+
+    parser.add_argument("--playback-latency", type=str, default="high")
+    parser.add_argument("--playback-blocksize", type=int, default=2048)
+
+    parser.add_argument("--capture-backend", type=str, default="sounddevice", choices=["sounddevice", "soundcard"])
+    parser.add_argument("--capture-latency", type=str, default="low")
+    parser.add_argument("--capture-blocksize", type=int, default=0)
+    parser.add_argument("--capture-include-loopback", action="store_true")
+    parser.add_argument("--capture-debug-level-meter", action="store_true")
+    parser.add_argument("--capture-debug-level-every", type=int, default=20)
+
+    parser.add_argument("--asr-debug-feed", action="store_true")
+    parser.add_argument("--asr-debug-feed-every", type=int, default=20)
 
     args = parser.parse_args()
 
@@ -4462,170 +4191,100 @@ def main() -> None:
     if not text_path.exists():
         raise FileNotFoundError(f"Text file not found: {text_path}")
 
+    lesson_text = text_path.read_text(encoding="utf-8").strip()
+    if not lesson_text:
+        raise ValueError(f"Text file is empty: {text_path}")
+
     lesson_id = slugify_filename_stem(text_path.stem)
+
     lesson_base_dir = Path(args.lesson_base_dir).resolve()
     lesson_dir = lesson_base_dir / lesson_id
-
     validate_lesson_assets(lesson_dir)
+
     manifest = load_manifest(lesson_dir)
     playback_sample_rate = int(manifest["sample_rate_out"])
 
-    rec_cfg = resolve_recording_config(
-        manual_device=args.input_device,
-        manual_samplerate=args.input_samplerate,
-    )
+    parsed_input_device = _parse_input_device_arg(args.input_device)
+
+    if args.capture_backend == "sounddevice":
+        rec_cfg = pick_working_input_config(
+            preferred_device=parsed_input_device if isinstance(parsed_input_device, int) else None
+        ) or {
+            "device": parsed_input_device,
+            "samplerate": args.input_samplerate or 48000,
+        }
+        if args.input_samplerate is not None:
+            rec_cfg["samplerate"] = args.input_samplerate
+        effective_input_device: int | str | None = rec_cfg["device"]
+        effective_input_samplerate = int(rec_cfg["samplerate"])
+    else:
+        effective_input_device = parsed_input_device
+        effective_input_samplerate = int(args.input_samplerate or 48000)
 
     sherpa_paths = collect_sherpa_paths()
-
     if args.asr == "sherpa" and not args.pure_playback:
         validate_sherpa_paths(sherpa_paths)
 
-    config = build_config(
-        lesson_base_dir=str(lesson_base_dir),
-        input_device=rec_cfg["device"],
-        input_samplerate=int(rec_cfg["samplerate"]),
-        asr_mode=args.asr,
-        bluetooth_offset_sec=args.bluetooth_offset_sec,
-        debug=args.debug,
-        playback_sample_rate=playback_sample_rate,
-        pure_playback=args.pure_playback,
-        ducking_only=args.ducking_only,
-        disable_seek=args.disable_seek,
-        disable_hold=args.disable_hold,
-        sherpa_paths=sherpa_paths,
+    if args.capture_backend == "soundcard" and isinstance(parsed_input_device, int):
+        print(
+            "[RUN-NOTE] soundcard backend uses soundcard microphone list index, "
+            "not sounddevice raw device index."
+        )
+
+    print(
+        f"[RUN-CONFIG] lesson_id={lesson_id} "
+        f"capture_backend={args.capture_backend} "
+        f"input_device={effective_input_device!r} "
+        f"input_samplerate={effective_input_samplerate} "
+        f"output_device={args.output_device!r} "
+        f"playback_sr={playback_sample_rate} "
+        f"playback_latency={args.playback_latency} "
+        f"playback_blocksize={int(args.playback_blocksize)} "
+        f"capture_latency={args.capture_latency} "
+        f"capture_blocksize={int(args.capture_blocksize)}"
     )
 
-    print("=== Run config ===")
-    print(f"text file       : {text_path}")
-    print(f"lesson id       : {lesson_id}")
-    print(f"lesson dir      : {lesson_dir}")
-    print(f"input device    : {rec_cfg['device']}")
-    print(f"input sr        : {rec_cfg['samplerate']}")
-    print(f"playback sr     : {playback_sample_rate}")
-    print(f"asr mode        : {args.asr}")
-    print(f"bt offset sec   : {args.bluetooth_offset_sec}")
-    print(f"debug           : {args.debug}")
-    print(f"pure playback   : {args.pure_playback}")
-    print(f"ducking only    : {args.ducking_only}")
-    print(f"disable seek    : {args.disable_seek}")
-    print(f"disable hold    : {args.disable_hold}")
-    print()
+    config = build_config(
+        lesson_base_dir=str(lesson_base_dir),
+        input_device=effective_input_device,
+        input_samplerate=effective_input_samplerate,
+        asr_mode=args.asr,
+        bluetooth_offset_sec=args.bluetooth_offset_sec,
+        playback_sample_rate=playback_sample_rate,
+        sherpa_paths=sherpa_paths,
+        pure_playback=args.pure_playback,
+        lesson_text_for_fake=lesson_text,
+        startup_grace_sec=float(args.startup_grace_sec),
+        low_confidence_hold_sec=float(args.low_confidence_hold_sec),
+        use_partial_adapter=not bool(args.bypass_partial_adapter),
+        audio_queue_maxsize=int(args.audio_queue_maxsize),
+        asr_event_queue_maxsize=int(args.asr_event_queue_maxsize),
+        output_device=args.output_device,
+        playback_latency=args.playback_latency,
+        playback_blocksize=int(args.playback_blocksize),
+        capture_backend=args.capture_backend,
+        capture_latency=args.capture_latency,
+        capture_blocksize=int(args.capture_blocksize),
+        capture_include_loopback=bool(args.capture_include_loopback),
+        capture_debug_level_meter=bool(args.capture_debug_level_meter),
+        capture_debug_level_every_n_blocks=int(args.capture_debug_level_every),
+        asr_debug_feed=bool(args.asr_debug_feed),
+        asr_debug_feed_every_n_chunks=int(args.asr_debug_feed_every),
+    )
+
+    config["control"]["disable_seek"] = bool(args.disable_seek or args.asr == "fake")
+    config["debug"]["enabled"] = bool(args.adapter_debug or args.aligner_debug)
+    config["debug"]["adapter_debug"] = bool(args.adapter_debug)
+    config["debug"]["aligner_debug"] = bool(args.aligner_debug)
+    config["alignment"]["debug"] = bool(args.aligner_debug)
 
     runtime = build_runtime(config)
 
-    if args.asr == "fake" and not args.pure_playback:
-        lesson_text = text_path.read_text(encoding="utf-8").strip()
-        runtime.orchestrator.asr = FakeASRProvider.from_reference_text(
-            reference_text=lesson_text,
-            chars_per_step=4,
-            step_interval_sec=0.25,
-            lag_sec=0.4,
-            tail_final=True,
-        )
-
-    if hasattr(runtime.orchestrator, "configure_debug"):
-        runtime.orchestrator.configure_debug(config["debug"])
-
-    print("Starting shadowing runtime...")
-    print("Press Ctrl+C to stop.")
-    print()
-
+    print("Starting shadowing runtime. Press Ctrl+C to stop.")
     try:
         runtime.run(lesson_id)
     except KeyboardInterrupt:
         print("\nStopped by user.")
-
-
-if __name__ == "__main__":
-    main()
-```
-
----
-### 文件: `shadowing_app/tools/test_fake_asr_with_recorder.py`
-
-```python
-import queue
-import threading
-import time
-import _bootstrap  # noqa: F401
-
-from shadowing.realtime.capture.device_utils import (
-    print_input_devices,
-    get_default_input_device_index,
-    pick_working_input_config,
-)
-from shadowing.realtime.asr.fake_asr_provider import FakeASRProvider, FakeAsrConfig
-from shadowing.realtime.capture.device_utils import pick_working_input_config
-from shadowing.realtime.capture.sounddevice_recorder import SoundDeviceRecorder
-
-
-def main() -> None:
-    q: queue.Queue[bytes] = queue.Queue(maxsize=8)
-    running = True
-
-    rec_cfg = pick_working_input_config()
-    if rec_cfg is None:
-        raise RuntimeError("No working input device config found.")
-
-    recorder = SoundDeviceRecorder(
-        sample_rate_in=rec_cfg["samplerate"],
-        target_sample_rate=16000,
-        channels=rec_cfg["channels"],
-        device=rec_cfg["device"],
-        dtype=rec_cfg["dtype"],
-    )
-
-    asr = FakeASRProvider(
-        FakeAsrConfig(
-            reference_text="今天天气真好我们一起练习中文",
-            chars_per_sec=4.5,
-            emit_partial_interval_sec=0.10,
-            sample_rate=16000,
-        )
-    )
-    asr.start()
-
-    def on_audio_frame(pcm: bytes) -> None:
-        try:
-            q.put_nowait(pcm)
-        except queue.Full:
-            try:
-                _ = q.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                q.put_nowait(pcm)
-            except queue.Full:
-                pass
-
-    def worker() -> None:
-        while running:
-            try:
-                pcm = q.get(timeout=0.05)
-            except queue.Empty:
-                continue
-
-            asr.feed_pcm16(pcm)
-            events = asr.poll_events()
-            for e in events:
-                print(f"[{e.event_type}] text={e.text} norm={e.normalized_text} py={e.pinyin_seq}")
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-
-    recorder.start(on_audio_frame)
-    print("Recording... speak something. Ctrl+C to stop.")
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        recorder.stop()
-        recorder.close()
-        asr.close()
-
 
 if __name__ == "__main__":
     main()
@@ -4654,7 +4313,7 @@ def main() -> None:
         name = str(dev["name"])
         max_in = int(dev["max_input_channels"])
         default_sr = int(float(dev["default_samplerate"]))
-        print(f"\n[{ordinal}] raw={raw_idx} name={name!r} max_in={max_in} default_sr={default_sr}")
+        print(f"\\n[{ordinal}] raw={raw_idx} name={name!r} max_in={max_in} default_sr={default_sr}")
 
         candidate_sample_rates = []
         for sr in [48000, 44100, default_sr]:
@@ -4688,6 +4347,44 @@ def main() -> None:
 
         if not opened:
             print("  No working combination found for this device.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+### 文件: `shadowing_app/tools/test_soundcard_mic.py`
+
+```python
+import time
+import numpy as np
+import pythoncom
+import soundcard as sc
+
+
+def main():
+    pythoncom.CoInitialize()
+    try:
+        mics = list(sc.all_microphones(include_loopback=False))
+        print("available microphones:")
+        for i, mic in enumerate(mics):
+            print(f"  [{i}] {mic.name!r}")
+
+        mic = mics[0]
+        print(f"\\nusing: {mic.name!r}")
+
+        with mic.recorder(samplerate=48000, channels=1) as rec:
+            print("start recording... speak now")
+            for i in range(20):
+                data = rec.record(numframes=1024)
+                audio = np.asarray(data, dtype=np.float32).reshape(-1)
+                rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+                peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+                print(f"[{i:02d}] shape={audio.shape} rms={rms:.6f} peak={peak:.6f}")
+                time.sleep(0.1)
+    finally:
+        pythoncom.CoUninitialize()
 
 
 if __name__ == "__main__":
