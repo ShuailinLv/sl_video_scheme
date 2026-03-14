@@ -1,7 +1,7 @@
 {
   "devices": {
     "耳机 (漫步者•花再 Zero Air) -> 耳机 (漫步者•花再 Zero Air)": {
-      "sessions": 1,
+      "sessions": 3,
       "input_device_id": "耳机 (漫步者•花再 Zero Air)",
       "output_device_id": "耳机 (漫步者•花再 Zero Air)",
       "device_profile": {
@@ -13,16 +13,16 @@
         "output_sample_rate": 44100,
         "estimated_input_latency_ms": 140.0,
         "estimated_output_latency_ms": 180.0,
-        "noise_floor_rms": 0.005002484036713772,
+        "noise_floor_rms": 0.012157650212479422,
         "input_gain_hint": "normal",
         "reliability_tier": "low"
       },
-      "avg_first_reliable_progress_time_sec": 6.0,
-      "avg_startup_false_hold_count": 0.0,
-      "avg_hold_count": 1.0,
-      "avg_lost_count": 0.0,
+      "avg_first_reliable_progress_time_sec": 5.209087500009046,
+      "avg_startup_false_hold_count": 0.22749999999999998,
+      "avg_hold_count": 1.5775000000000001,
+      "avg_lost_count": 0.35,
       "avg_reacquire_count": 2.0,
-      "avg_mean_tracking_quality": 0.617080064036471,
+      "avg_mean_tracking_quality": 0.651304033797524,
       "estimated_output_latency_ms": 180.0,
       "estimated_input_latency_ms": 140.0,
       "recommended_control": {
@@ -42,7 +42,7 @@
         "min_vad_rms": 0.008,
         "vad_noise_multiplier": 3.25
       },
-      "last_updated_at": "2026-03-14T14:20:45"
+      "last_updated_at": "2026-03-14T21:54:50"
     }
   }
 }

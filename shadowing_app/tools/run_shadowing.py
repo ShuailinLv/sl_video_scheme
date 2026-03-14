@@ -188,13 +188,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lesson-base-dir", type=str, default="assets/lessons")
 
     parser.add_argument("--asr", type=str, default="sherpa", choices=["fake", "sherpa"])
+
     parser.add_argument("--output-device", type=int, default=None)
     parser.add_argument("--input-device", type=str, default=None)
     parser.add_argument("--input-samplerate", type=int, default=None)
+    parser.add_argument(
+        "--capture-backend",
+        type=str,
+        default="sounddevice",
+        choices=["sounddevice", "soundcard"],
+    )
 
     parser.add_argument("--bluetooth-offset-sec", type=float, default=0.18)
     parser.add_argument("--playback-latency", type=str, default="high")
     parser.add_argument("--playback-blocksize", type=int, default=2048)
+
+    parser.add_argument("--aligner-debug", action="store_true")
 
     parser.add_argument("--asr-debug-feed", action="store_true")
     parser.add_argument("--asr-debug-feed-every", type=int, default=20)
@@ -206,6 +215,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile-path", type=str, default="runtime/device_profiles.json")
     parser.add_argument("--session-dir", type=str, default="runtime/latest_session")
     parser.add_argument("--event-logging", action="store_true")
+
+    parser.add_argument("--startup-grace-sec", type=float, default=0.80)
+    parser.add_argument("--low-confidence-hold-sec", type=float, default=0.60)
+    parser.add_argument("--guide-play-sec", type=float, default=2.20)
+    parser.add_argument("--no-progress-hold-min-play-sec", type=float, default=4.00)
+    parser.add_argument("--progress-stale-sec", type=float, default=1.10)
+    parser.add_argument("--hold-trend-sec", type=float, default=0.75)
+    parser.add_argument("--tracking-quality-hold-min", type=float, default=0.60)
+    parser.add_argument("--tracking-quality-seek-min", type=float, default=0.72)
+    parser.add_argument("--resume-from-hold-speaking-lead-slack-sec", type=float, default=0.45)
 
     return parser
 
@@ -270,6 +289,7 @@ def main() -> None:
     print(
         "[RUN-CONFIG] "
         f"lesson_id={lesson_id} "
+        f"capture_backend={args.capture_backend!r} "
         f"input_device={effective_input_device!r} "
         f"input_name={input_device_name!r} "
         f"input_samplerate={effective_input_samplerate} "
@@ -277,7 +297,8 @@ def main() -> None:
         f"output_name={output_device_name!r} "
         f"playback_sr={playback_sample_rate} "
         f"playback_latency={args.playback_latency} "
-        f"playback_blocksize={int(args.playback_blocksize)}"
+        f"playback_blocksize={int(args.playback_blocksize)} "
+        f"aligner_debug={bool(args.aligner_debug)}"
     )
 
     runtime = build_runtime(
@@ -292,7 +313,7 @@ def main() -> None:
                 "bluetooth_output_offset_sec": float(args.bluetooth_offset_sec),
             },
             "capture": {
-                "backend": "sounddevice",
+                "backend": str(args.capture_backend),
                 "device_sample_rate": effective_input_samplerate,
                 "target_sample_rate": 16000,
                 "channels": 1,
@@ -328,7 +349,7 @@ def main() -> None:
                 "backward_lock_frames": 3,
                 "clause_boundary_bonus": 0.15,
                 "cross_clause_backward_extra_penalty": 0.20,
-                "debug": False,
+                "debug": bool(args.aligner_debug),
                 "max_hyp_tokens": 16,
             },
             "control": {
@@ -341,13 +362,17 @@ def main() -> None:
                 "gain_following": 0.55,
                 "gain_transition": 0.80,
                 "gain_soft_duck": 0.42,
-                "guide_play_sec": 2.20,
-                "no_progress_hold_min_play_sec": 4.00,
-                "progress_stale_sec": 1.10,
-                "hold_trend_sec": 0.75,
-                "tracking_quality_hold_min": 0.60,
-                "tracking_quality_seek_min": 0.72,
-                "resume_from_hold_speaking_lead_slack_sec": 0.45,
+                "startup_grace_sec": float(args.startup_grace_sec),
+                "low_confidence_hold_sec": float(args.low_confidence_hold_sec),
+                "guide_play_sec": float(args.guide_play_sec),
+                "no_progress_hold_min_play_sec": float(args.no_progress_hold_min_play_sec),
+                "progress_stale_sec": float(args.progress_stale_sec),
+                "hold_trend_sec": float(args.hold_trend_sec),
+                "tracking_quality_hold_min": float(args.tracking_quality_hold_min),
+                "tracking_quality_seek_min": float(args.tracking_quality_seek_min),
+                "resume_from_hold_speaking_lead_slack_sec": float(
+                    args.resume_from_hold_speaking_lead_slack_sec
+                ),
                 "disable_seek": False,
             },
             "runtime": {

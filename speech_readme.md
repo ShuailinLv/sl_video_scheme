@@ -15,4 +15,4 @@ set SHERPA_JOINER=D:\sl_video_scheme\sherpa-onnx-streaming-zipformer-zh-14M\join
 
 
 
-(py312_speech) D:\sl_video_scheme\shadowing_app>python tools\run_shadowing.py --text-file "D:\sl_video_scheme\shadowing_app\assets\raw_texts\演讲稿3.txt" --asr sherpa --bypass-partial-adapter --aligner-debug --disable-seek --startup-grace-sec 2.0 --low-confidence-hold-sec 1.5 --output-device 4 --playback-latency high --playback-blocksize 4096 --capture-backend soundcard --input-device "耳机" --capture-blocksize 1440 --capture-debug-level-meter --asr-debug-feed --asr-debug-feed-every 10
+python tools/run_shadowing.py --text-file "D:\sl_video_scheme\shadowing_app\assets\raw_texts\演讲稿3.txt" --asr sherpa --aligner-debug --startup-grace-sec 2.0 --low-confidence-hold-sec 1.5 --output-device 4 --playback-latency high --playback-blocksize 4096 --capture-backend sounddevice --input-device "耳机" --input-samplerate 48000 --asr-debug-feed --asr-debug-feed-every 10 --event-logging
