@@ -1,0 +1,48 @@
+{
+  "devices": {
+    "耳机 (漫步者•花再 Zero Air) -> 耳机 (漫步者•花再 Zero Air)": {
+      "sessions": 1,
+      "input_device_id": "耳机 (漫步者•花再 Zero Air)",
+      "output_device_id": "耳机 (漫步者•花再 Zero Air)",
+      "device_profile": {
+        "input_device_id": "耳机 (漫步者•花再 Zero Air)",
+        "output_device_id": "耳机 (漫步者•花再 Zero Air)",
+        "input_kind": "bluetooth_headset",
+        "output_kind": "bluetooth_headset",
+        "input_sample_rate": 48000,
+        "output_sample_rate": 44100,
+        "estimated_input_latency_ms": 140.0,
+        "estimated_output_latency_ms": 180.0,
+        "noise_floor_rms": 0.005002484036713772,
+        "input_gain_hint": "normal",
+        "reliability_tier": "low"
+      },
+      "avg_first_reliable_progress_time_sec": 6.0,
+      "avg_startup_false_hold_count": 0.0,
+      "avg_hold_count": 1.0,
+      "avg_lost_count": 0.0,
+      "avg_reacquire_count": 2.0,
+      "avg_mean_tracking_quality": 0.617080064036471,
+      "estimated_output_latency_ms": 180.0,
+      "estimated_input_latency_ms": 140.0,
+      "recommended_control": {
+        "guide_play_sec": 3.6,
+        "no_progress_hold_min_play_sec": 6.0,
+        "progress_stale_sec": 1.28,
+        "hold_trend_sec": 0.87,
+        "tracking_quality_hold_min": 0.6,
+        "tracking_quality_seek_min": 0.77,
+        "resume_from_hold_speaking_lead_slack_sec": 0.55,
+        "gain_soft_duck": 0.38
+      },
+      "recommended_playback": {
+        "bluetooth_output_offset_sec": 0.18
+      },
+      "recommended_signal": {
+        "min_vad_rms": 0.008,
+        "vad_noise_multiplier": 3.25
+      },
+      "last_updated_at": "2026-03-14T14:20:45"
+    }
+  }
+}
