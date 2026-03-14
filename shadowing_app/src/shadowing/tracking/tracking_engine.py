@@ -20,6 +20,11 @@ class TrackingEngine:
         self._last_candidate_idx = 0
         self._last_snapshot: TrackingSnapshot | None = None
 
+        self._smoothed_mode = TrackingMode.BOOTSTRAP
+        self._lock_recovery_run = 0
+        self._lost_escalation_run = 0
+        self._rejoin_run = 0
+
     def reset(self, reference_map: ReferenceMap) -> None:
         self.ref_map = reference_map
         self._last_candidate_idx = 0
@@ -27,10 +32,18 @@ class TrackingEngine:
         self.anchor_manager.reset()
         self.loss_detector.reset()
         self.aligner.reset(reference_map)
+        self._smoothed_mode = TrackingMode.BOOTSTRAP
+        self._lock_recovery_run = 0
+        self._lost_escalation_run = 0
+        self._rejoin_run = 0
 
     def on_playback_generation_changed(self, generation: int) -> None:
         self.aligner.on_playback_generation_changed(generation)
         self.loss_detector.reset()
+        self._smoothed_mode = TrackingMode.REACQUIRING
+        self._lock_recovery_run = 0
+        self._lost_escalation_run = 0
+        self._rejoin_run = 0
 
     def update(self, event: AsrEvent) -> TrackingSnapshot | None:
         if self.ref_map is None:
@@ -87,7 +100,7 @@ class TrackingEngine:
             matched_text=alignment.matched_text,
         )
 
-        mode, temporal_consistency = self.loss_detector.update(
+        raw_mode, temporal_consistency = self.loss_detector.update(
             snapshot=snapshot,
             overall_score=seed_quality,
             is_reliable=is_reliable,
@@ -101,12 +114,18 @@ class TrackingEngine:
         )
         overall_score = max(0.0, min(1.0, overall_score))
 
+        smoothed_mode = self._smooth_mode(
+            raw_mode=raw_mode,
+            overall_score=overall_score,
+            alignment_confidence=alignment.confidence,
+        )
+
         quality = TrackingQuality(
             overall_score=float(overall_score),
             observation_score=float(observation_score),
             temporal_consistency_score=float(temporal_consistency),
             anchor_score=float(anchor_consistency),
-            mode=mode,
+            mode=smoothed_mode,
             is_reliable=bool(overall_score >= 0.66 and alignment.confidence >= 0.62),
         )
 
@@ -121,7 +140,7 @@ class TrackingEngine:
             monotonic_consistency=float(monotonic_consistency),
             anchor_consistency=float(anchor_consistency),
             emitted_at_sec=float(alignment.emitted_at_sec),
-            tracking_mode=mode,
+            tracking_mode=smoothed_mode,
             tracking_quality=quality,
             matched_text=alignment.matched_text,
         )
@@ -154,3 +173,76 @@ class TrackingEngine:
         if delta >= 0:
             return 1.0
         return max(0.0, 1.0 - min(1.0, abs(delta) / 8.0))
+
+    def _smooth_mode(
+        self,
+        *,
+        raw_mode: TrackingMode,
+        overall_score: float,
+        alignment_confidence: float,
+    ) -> TrackingMode:
+        current = self._smoothed_mode
+
+        if raw_mode == TrackingMode.LOCKED:
+            if overall_score >= 0.74 and alignment_confidence >= 0.68:
+                self._lock_recovery_run += 1
+            else:
+                self._lock_recovery_run = 0
+        else:
+            self._lock_recovery_run = 0
+
+        if raw_mode == TrackingMode.LOST and overall_score < 0.42:
+            self._lost_escalation_run += 1
+        else:
+            self._lost_escalation_run = 0
+
+        if raw_mode in (TrackingMode.REACQUIRING, TrackingMode.WEAK_LOCKED):
+            self._rejoin_run += 1
+        else:
+            self._rejoin_run = 0
+
+        if current == TrackingMode.LOCKED:
+            if raw_mode == TrackingMode.LOCKED:
+                return TrackingMode.LOCKED
+            if raw_mode in (TrackingMode.REACQUIRING, TrackingMode.LOST):
+                self._smoothed_mode = TrackingMode.REACQUIRING
+                return self._smoothed_mode
+            if raw_mode == TrackingMode.WEAK_LOCKED:
+                self._smoothed_mode = TrackingMode.WEAK_LOCKED
+                return self._smoothed_mode
+
+        if current == TrackingMode.REACQUIRING:
+            if raw_mode == TrackingMode.LOCKED and self._lock_recovery_run >= 2:
+                self._smoothed_mode = TrackingMode.LOCKED
+                return self._smoothed_mode
+            if raw_mode == TrackingMode.LOST and self._lost_escalation_run >= 2:
+                self._smoothed_mode = TrackingMode.LOST
+                return self._smoothed_mode
+            if raw_mode == TrackingMode.WEAK_LOCKED and overall_score >= 0.60:
+                self._smoothed_mode = TrackingMode.WEAK_LOCKED
+                return self._smoothed_mode
+            return TrackingMode.REACQUIRING
+
+        if current == TrackingMode.LOST:
+            if raw_mode == TrackingMode.LOCKED and self._lock_recovery_run >= 2:
+                self._smoothed_mode = TrackingMode.LOCKED
+                return self._smoothed_mode
+            if raw_mode in (TrackingMode.REACQUIRING, TrackingMode.WEAK_LOCKED) and self._rejoin_run >= 2:
+                self._smoothed_mode = TrackingMode.REACQUIRING
+                return self._smoothed_mode
+            return TrackingMode.LOST
+
+        if current == TrackingMode.WEAK_LOCKED:
+            if raw_mode == TrackingMode.LOCKED and self._lock_recovery_run >= 2:
+                self._smoothed_mode = TrackingMode.LOCKED
+                return self._smoothed_mode
+            if raw_mode == TrackingMode.LOST and self._lost_escalation_run >= 2:
+                self._smoothed_mode = TrackingMode.REACQUIRING
+                return self._smoothed_mode
+            if raw_mode == TrackingMode.REACQUIRING:
+                self._smoothed_mode = TrackingMode.REACQUIRING
+                return self._smoothed_mode
+            return TrackingMode.WEAK_LOCKED
+
+        self._smoothed_mode = raw_mode
+        return self._smoothed_mode

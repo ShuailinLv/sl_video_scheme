@@ -2,7 +2,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+_BLUETOOTH_KEYWORDS = (
+    "bluetooth",
+    "headset",
+    "hands-free",
+    "hands free",
+    "airpods",
+    "buds",
+    "earbuds",
+    "zero air",
+    "耳机",
+    "蓝牙",
+)
 
+
+def _looks_like_bluetooth(name: str) -> bool:
+    text = (name or "").strip().lower()
+    if not text:
+        return False
+    return any(k in text for k in _BLUETOOTH_KEYWORDS)
 @dataclass(slots=True)
 class DeviceProfile:
     input_device_id: str
@@ -28,7 +46,7 @@ def classify_input_device(device_name: int | str | None) -> str:
     name = _normalize_device_name(device_name)
     if not name:
         return "unknown"
-    if "bluetooth" in name or "耳机" in name or "headset" in name:
+    if _looks_like_bluetooth(name):
         return "bluetooth_headset"
     if "usb" in name or "麦克风" in name or "microphone" in name:
         return "usb_mic"
@@ -41,7 +59,7 @@ def classify_output_device(device_name: int | str | None) -> str:
     name = _normalize_device_name(device_name)
     if not name:
         return "unknown"
-    if "bluetooth" in name or "耳机" in name or "headset" in name:
+    if _looks_like_bluetooth(name):
         return "bluetooth_headset"
     if "speaker" in name or "扬声器" in name:
         return "speaker"

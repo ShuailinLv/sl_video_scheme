@@ -235,19 +235,7 @@ def should_run_bluetooth_preflight(input_device: int | str | None, output_device
 
     input_is_bt = _looks_like_bluetooth(input_resolved.name)
     output_is_bt = _looks_like_bluetooth(output_resolved.name)
-
-    if not input_is_bt:
-        return False
-    if not output_is_bt:
-        return False
-
-    input_family = _device_family_key(input_resolved.name)
-    output_family = _device_family_key(output_resolved.name)
-
-    if input_family and output_family and input_family == output_family:
-        return True
-
-    return True
+    return bool(input_is_bt and output_is_bt)
 
 
 def _pick_duplex_samplerate(

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-
 
 class ProfileStore:
     def __init__(self, profile_path: str) -> None:
@@ -168,6 +168,7 @@ class ProfileStore:
             "recommended_control": recommended_control,
             "recommended_playback": recommended_playback,
             "recommended_signal": recommended_signal,
+            "last_updated_at": datetime.now().isoformat(timespec="seconds"),
         }
 
         self.save(data)

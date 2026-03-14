@@ -9,6 +9,8 @@ from typing import Iterator
 @dataclass(slots=True)
 class ReplayEvent:
     event_type: str
+    ts_monotonic_sec: float | None
+    session_tick: int | None
     payload: dict
 
 
@@ -25,5 +27,15 @@ class ReplayLoader:
                 data = json.loads(line)
                 yield ReplayEvent(
                     event_type=str(data.get("event_type", "")),
+                    ts_monotonic_sec=(
+                        float(data["ts_monotonic_sec"])
+                        if data.get("ts_monotonic_sec") is not None
+                        else None
+                    ),
+                    session_tick=(
+                        int(data["session_tick"])
+                        if data.get("session_tick") is not None
+                        else None
+                    ),
                     payload=dict(data.get("payload", {})),
                 )

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(slots=True)
@@ -10,9 +10,45 @@ class AutoTuningState:
     device_risk: str = "medium"
     startup_profile_decided: bool = False
     last_tuned_at_sec: float = 0.0
+    baseline_control: dict[str, float] = field(default_factory=dict)
+    last_good_control: dict[str, float] = field(default_factory=dict)
+    best_tracking_quality: float = 0.0
 
 
 class RuntimeAutoTuner:
+    _CONTROL_KEYS = (
+        "guide_play_sec",
+        "no_progress_hold_min_play_sec",
+        "progress_stale_sec",
+        "hold_trend_sec",
+        "tracking_quality_hold_min",
+        "tracking_quality_seek_min",
+        "resume_from_hold_speaking_lead_slack_sec",
+        "gain_soft_duck",
+    )
+
+    _MAX_DELTAS = {
+        "guide_play_sec": 0.90,
+        "no_progress_hold_min_play_sec": 1.20,
+        "progress_stale_sec": 0.24,
+        "hold_trend_sec": 0.20,
+        "tracking_quality_hold_min": 0.06,
+        "tracking_quality_seek_min": 0.06,
+        "resume_from_hold_speaking_lead_slack_sec": 0.14,
+        "gain_soft_duck": 0.08,
+    }
+
+    _HARD_BOUNDS = {
+        "guide_play_sec": (1.4, 4.2),
+        "no_progress_hold_min_play_sec": (2.5, 6.5),
+        "progress_stale_sec": (0.8, 1.9),
+        "hold_trend_sec": (0.45, 1.30),
+        "tracking_quality_hold_min": (0.50, 0.82),
+        "tracking_quality_seek_min": (0.64, 0.90),
+        "resume_from_hold_speaking_lead_slack_sec": (0.25, 0.90),
+        "gain_soft_duck": (0.28, 0.55),
+    }
+
     def __init__(self) -> None:
         self.state = AutoTuningState()
 
@@ -48,6 +84,8 @@ class RuntimeAutoTuner:
             if offset is not None and hasattr(player, "set_output_offset_sec"):
                 player.set_output_offset_sec(float(offset))
 
+        self._capture_baseline(controller_policy)
+
     def maybe_tune(
         self,
         *,
@@ -61,8 +99,25 @@ class RuntimeAutoTuner:
         latency_snapshot,
         device_profile,
     ) -> dict[str, float]:
+        if not self.state.baseline_control:
+            self._capture_baseline(controller_policy)
+
+        if progress is not None and progress.tracking_quality >= max(0.76, self.state.best_tracking_quality):
+            self.state.best_tracking_quality = float(progress.tracking_quality)
+            self.state.last_good_control = self._snapshot_control(controller_policy)
+
         if (now_sec - self.state.last_tuned_at_sec) < 1.2:
             return {}
+
+        if (
+            progress is not None
+            and self.state.last_good_control
+            and progress.tracking_quality < max(0.50, self.state.best_tracking_quality - 0.14)
+            and progress.tracking_mode.value in ("reacquiring", "lost")
+        ):
+            self._restore_control(controller_policy, self.state.last_good_control)
+            self.state.last_tuned_at_sec = float(now_sec)
+            return dict(self.state.last_good_control)
 
         updates: dict[str, float] = {}
 
@@ -86,47 +141,30 @@ class RuntimeAutoTuner:
             self.state.startup_profile_decided = True
 
             if speaker_style == "quiet":
-                updates["guide_play_sec"] = min(4.0, controller_policy.guide_play_sec + 0.6)
-                updates["no_progress_hold_min_play_sec"] = min(
-                    6.0,
-                    controller_policy.no_progress_hold_min_play_sec + 0.8,
+                updates["guide_play_sec"] = controller_policy.guide_play_sec + 0.6
+                updates["no_progress_hold_min_play_sec"] = controller_policy.no_progress_hold_min_play_sec + 0.8
+                updates["progress_stale_sec"] = controller_policy.progress_stale_sec + 0.14
+                updates["resume_from_hold_speaking_lead_slack_sec"] = (
+                    controller_policy.resume_from_hold_speaking_lead_slack_sec + 0.12
                 )
-                updates["progress_stale_sec"] = min(1.8, controller_policy.progress_stale_sec + 0.14)
-                updates["resume_from_hold_speaking_lead_slack_sec"] = min(
-                    0.90,
-                    controller_policy.resume_from_hold_speaking_lead_slack_sec + 0.12,
-                )
-                updates["tracking_quality_hold_min"] = min(
-                    0.78,
-                    controller_policy.tracking_quality_hold_min + 0.02,
-                )
+                updates["tracking_quality_hold_min"] = controller_policy.tracking_quality_hold_min + 0.02
 
             elif speaker_style == "fast":
-                updates["progress_stale_sec"] = max(0.85, controller_policy.progress_stale_sec - 0.10)
-                updates["hold_trend_sec"] = max(0.50, controller_policy.hold_trend_sec - 0.08)
-                updates["resume_from_hold_speaking_lead_slack_sec"] = min(
-                    0.90,
-                    controller_policy.resume_from_hold_speaking_lead_slack_sec + 0.08,
+                updates["progress_stale_sec"] = controller_policy.progress_stale_sec - 0.10
+                updates["hold_trend_sec"] = controller_policy.hold_trend_sec - 0.08
+                updates["resume_from_hold_speaking_lead_slack_sec"] = (
+                    controller_policy.resume_from_hold_speaking_lead_slack_sec + 0.08
                 )
 
             if self.state.environment_style == "noisy":
-                updates["tracking_quality_hold_min"] = min(
-                    0.82,
-                    controller_policy.tracking_quality_hold_min + 0.04,
-                )
-                updates["tracking_quality_seek_min"] = min(
-                    0.90,
-                    controller_policy.tracking_quality_seek_min + 0.04,
-                )
+                updates["tracking_quality_hold_min"] = controller_policy.tracking_quality_hold_min + 0.04
+                updates["tracking_quality_seek_min"] = controller_policy.tracking_quality_seek_min + 0.04
                 signal_monitor.vad_noise_multiplier = min(4.2, signal_monitor.vad_noise_multiplier + 0.20)
 
         if startup_false_hold_count >= 1:
-            updates["guide_play_sec"] = min(4.2, controller_policy.guide_play_sec + 0.25)
-            updates["no_progress_hold_min_play_sec"] = min(
-                6.5,
-                controller_policy.no_progress_hold_min_play_sec + 0.35,
-            )
-            updates["hold_trend_sec"] = min(1.30, controller_policy.hold_trend_sec + 0.05)
+            updates["guide_play_sec"] = controller_policy.guide_play_sec + 0.25
+            updates["no_progress_hold_min_play_sec"] = controller_policy.no_progress_hold_min_play_sec + 0.35
+            updates["hold_trend_sec"] = controller_policy.hold_trend_sec + 0.05
 
         if progress is not None:
             if (
@@ -134,10 +172,9 @@ class RuntimeAutoTuner:
                 and progress.active_speaking
                 and progress.progress_age_sec < 1.2
             ):
-                updates["gain_soft_duck"] = max(0.28, controller_policy.gain_soft_duck - 0.03)
-                updates["resume_from_hold_speaking_lead_slack_sec"] = min(
-                    0.90,
-                    controller_policy.resume_from_hold_speaking_lead_slack_sec + 0.04,
+                updates["gain_soft_duck"] = controller_policy.gain_soft_duck - 0.03
+                updates["resume_from_hold_speaking_lead_slack_sec"] = (
+                    controller_policy.resume_from_hold_speaking_lead_slack_sec + 0.04
                 )
 
             if (
@@ -145,35 +182,24 @@ class RuntimeAutoTuner:
                 and progress.tracking_mode.value == "locked"
                 and mean_tracking_quality >= 0.76
             ):
-                updates["tracking_quality_seek_min"] = max(
-                    0.66,
-                    controller_policy.tracking_quality_seek_min - 0.01,
-                )
+                updates["tracking_quality_seek_min"] = controller_policy.tracking_quality_seek_min - 0.01
 
         if lost_count >= 2 or reacquire_count >= 3:
-            updates["tracking_quality_hold_min"] = min(
-                0.82,
-                controller_policy.tracking_quality_hold_min + 0.03,
-            )
-            updates["tracking_quality_seek_min"] = min(
-                0.90,
-                controller_policy.tracking_quality_seek_min + 0.03,
-            )
-            updates["hold_trend_sec"] = min(1.30, controller_policy.hold_trend_sec + 0.05)
-            updates["progress_stale_sec"] = min(1.90, controller_policy.progress_stale_sec + 0.06)
+            updates["tracking_quality_hold_min"] = controller_policy.tracking_quality_hold_min + 0.03
+            updates["tracking_quality_seek_min"] = controller_policy.tracking_quality_seek_min + 0.03
+            updates["hold_trend_sec"] = controller_policy.hold_trend_sec + 0.05
+            updates["progress_stale_sec"] = controller_policy.progress_stale_sec + 0.06
 
         if mean_tracking_quality >= 0.82 and startup_false_hold_count == 0 and lost_count == 0:
-            updates["tracking_quality_hold_min"] = max(
-                0.54,
-                controller_policy.tracking_quality_hold_min - 0.01,
-            )
-            updates["hold_trend_sec"] = max(0.50, controller_policy.hold_trend_sec - 0.02)
+            updates["tracking_quality_hold_min"] = controller_policy.tracking_quality_hold_min - 0.01
+            updates["hold_trend_sec"] = controller_policy.hold_trend_sec - 0.02
 
         if latency_snapshot is not None and hasattr(player, "set_output_offset_sec"):
             player.set_output_offset_sec(
                 max(0.0, float(latency_snapshot.estimated_output_latency_ms) / 1000.0)
             )
 
+        updates = self._clamp_updates(controller_policy, updates)
         self._apply_updates(controller_policy, updates)
         self.state.last_tuned_at_sec = float(now_sec)
         return updates
@@ -216,3 +242,37 @@ class RuntimeAutoTuner:
         if signal_quality.quality_score < 0.42:
             return "noisy"
         return "normal"
+
+    def _capture_baseline(self, controller_policy) -> None:
+        self.state.baseline_control = self._snapshot_control(controller_policy)
+        if not self.state.last_good_control:
+            self.state.last_good_control = dict(self.state.baseline_control)
+
+    def _snapshot_control(self, controller_policy) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for key in self._CONTROL_KEYS:
+            if hasattr(controller_policy, key):
+                out[key] = float(getattr(controller_policy, key))
+        return out
+
+    def _restore_control(self, controller_policy, values: dict[str, float]) -> None:
+        for key, value in values.items():
+            if hasattr(controller_policy, key):
+                setattr(controller_policy, key, float(value))
+
+    def _clamp_updates(self, controller_policy, updates: dict[str, float]) -> dict[str, float]:
+        baseline = self.state.baseline_control or self._snapshot_control(controller_policy)
+        clamped: dict[str, float] = {}
+
+        for key, value in updates.items():
+            if key not in baseline:
+                continue
+
+            base = float(baseline[key])
+            max_delta = float(self._MAX_DELTAS.get(key, 0.0))
+            lo_hard, hi_hard = self._HARD_BOUNDS.get(key, (-1e9, 1e9))
+            lo = max(lo_hard, base - max_delta)
+            hi = min(hi_hard, base + max_delta)
+            clamped[key] = max(lo, min(hi, float(value)))
+
+        return clamped

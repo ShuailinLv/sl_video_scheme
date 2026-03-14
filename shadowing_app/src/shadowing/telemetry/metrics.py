@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
+_STARTUP_FALSE_HOLD_REASONS = {
+    "no_progress_timeout",
+    "reference_too_far_ahead",
+}
 
 @dataclass(slots=True)
 class SessionMetricsSummary:
@@ -64,7 +67,7 @@ class MetricsAggregator:
         if action == "hold":
             self.hold_count += 1
             if self.session_started_at_sec > 0.0 and (now_sec - self.session_started_at_sec) <= 5.0:
-                if reason in ("no_progress_timeout", "reference_too_far_ahead"):
+                if reason in _STARTUP_FALSE_HOLD_REASONS:
                     self.startup_false_hold_count += 1
         elif action == "resume":
             self.resume_count += 1

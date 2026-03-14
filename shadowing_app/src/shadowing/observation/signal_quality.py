@@ -17,6 +17,7 @@ class _SignalState:
     last_active_at_sec: float = 0.0
     clipping_ratio: float = 0.0
     dropout_detected: bool = False
+    dropout_run_sec: float = 0.0
 
 
 class SignalQualityMonitor:
@@ -27,12 +28,14 @@ class SignalQualityMonitor:
         speaking_decay: float = 0.92,
         speaking_rise: float = 0.22,
         clipping_threshold: float = 0.98,
+        dropout_min_sec: float = 0.18,
     ) -> None:
         self.min_vad_rms = float(min_vad_rms)
         self.vad_noise_multiplier = float(vad_noise_multiplier)
         self.speaking_decay = float(speaking_decay)
         self.speaking_rise = float(speaking_rise)
         self.clipping_threshold = float(clipping_threshold)
+        self.dropout_min_sec = max(0.05, float(dropout_min_sec))
         self.state = _SignalState()
 
     def feed_pcm16(self, pcm_bytes: bytes, observed_at_sec: float) -> None:
@@ -48,6 +51,13 @@ class SignalQualityMonitor:
         peak = float(np.max(np.abs(audio_f32))) if audio_f32.size else 0.0
         clipping_ratio = float(np.mean(np.abs(audio_f32) >= self.clipping_threshold)) if audio_f32.size else 0.0
 
+        dt_sec = 0.0
+        if (
+            self.state.last_observed_at_sec > 0.0
+            and observed_at_sec >= self.state.last_observed_at_sec
+        ):
+            dt_sec = float(observed_at_sec - self.state.last_observed_at_sec)
+            
         noise_floor = self.state.noise_floor_rms
         dynamic_threshold = max(self.min_vad_rms, noise_floor * self.vad_noise_multiplier)
         vad_active = rms >= dynamic_threshold and peak >= max(0.012, dynamic_threshold * 1.2)
@@ -61,16 +71,25 @@ class SignalQualityMonitor:
         else:
             self.state.speaking_likelihood *= self.speaking_decay
 
-        if rms < max(self.min_vad_rms * 0.7, dynamic_threshold * 0.8):
-            self.state.noise_floor_rms = 0.96 * noise_floor + 0.04 * rms
+        is_near_zero = rms <= 1e-5 and peak <= 1e-5
+        if is_near_zero:
+            self.state.dropout_run_sec += max(0.0, dt_sec)
         else:
-            self.state.noise_floor_rms = 0.995 * noise_floor + 0.005 * rms
+            self.state.dropout_run_sec = 0.0
+        self.state.dropout_detected = self.state.dropout_run_sec >= self.dropout_min_sec
+
+        clearly_non_speech = (not vad_active) and self.state.speaking_likelihood < 0.25
+        if clearly_non_speech and rms < max(self.min_vad_rms * 0.75, dynamic_threshold * 0.85):
+            self.state.noise_floor_rms = 0.97 * noise_floor + 0.03 * rms
+        elif clearly_non_speech:
+            self.state.noise_floor_rms = 0.992 * noise_floor + 0.008 * rms
+        else:
+            self.state.noise_floor_rms = 0.998 * noise_floor + 0.002 * rms
 
         self.state.last_observed_at_sec = observed_at_sec
         self.state.last_rms = rms
         self.state.last_peak = peak
         self.state.clipping_ratio = clipping_ratio
-        self.state.dropout_detected = rms <= 1e-5 and peak <= 1e-5
 
     def snapshot(self, now_sec: float) -> SignalQuality:
         last_seen = self.state.last_observed_at_sec
@@ -88,7 +107,7 @@ class SignalQualityMonitor:
         base_quality += min(0.15, self.state.speaking_likelihood * 0.20)
         base_quality -= min(0.18, self.state.clipping_ratio * 2.0)
         base_quality -= freshness_penalty
-        if self.state.dropout_detected:
+        if self.state.dropout_detected and silence_run > 0.18:
             base_quality -= 0.20
 
         dynamic_threshold = max(self.min_vad_rms, self.state.noise_floor_rms * self.vad_noise_multiplier)

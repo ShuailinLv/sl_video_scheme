@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from shadowing.adaptation.profile_store import ProfileStore
+from shadowing.adaptation.runtime_auto_tuner import RuntimeAutoTuner
+from shadowing.audio.latency_calibrator import LatencyCalibrator
 from shadowing.infrastructure.lesson_repo import FileLessonRepository
+from shadowing.observation.signal_quality import SignalQualityMonitor
 from shadowing.realtime.alignment.incremental_aligner import IncrementalAligner
 from shadowing.realtime.asr.fake_asr_provider import FakeASRProvider, FakeAsrConfig, FakeAsrStep
 from shadowing.realtime.asr.sherpa_streaming_provider import SherpaStreamingProvider
@@ -10,7 +14,8 @@ from shadowing.realtime.control.policy import ControlPolicy
 from shadowing.realtime.control.state_machine_controller import StateMachineController
 from shadowing.realtime.orchestrator import ShadowingOrchestrator
 from shadowing.realtime.playback.sounddevice_player import PlaybackConfig, SoundDevicePlayer
-from shadowing.realtime.runtime import ShadowingRuntime
+from shadowing.realtime.runtime import RealtimeRuntimeConfig, ShadowingRuntime
+from shadowing.telemetry.event_logger import EventLogger
 from shadowing.types import AsrEventType
 
 
@@ -27,10 +32,7 @@ def _build_fake_asr_config(asr_cfg: dict) -> FakeAsrConfig:
             raise ValueError(f"Invalid fake ASR scripted step: {item!r}")
 
         event_type_raw = str(item.get("event_type", "partial")).lower()
-        if event_type_raw == "final":
-            event_type = AsrEventType.FINAL
-        else:
-            event_type = AsrEventType.PARTIAL
+        event_type = AsrEventType.FINAL if event_type_raw == "final" else AsrEventType.PARTIAL
 
         scripted_steps.append(
             FakeAsrStep(
@@ -71,7 +73,6 @@ def build_runtime(config: dict) -> ShadowingRuntime:
 
     capture_cfg = config["capture"]
     capture_backend = str(capture_cfg.get("backend", "sounddevice")).strip().lower()
-
     if capture_backend == "soundcard":
         recorder = SoundCardRecorder(
             sample_rate_in=int(capture_cfg["device_sample_rate"]),
@@ -96,7 +97,6 @@ def build_runtime(config: dict) -> ShadowingRuntime:
 
     asr_cfg = config["asr"]
     asr_mode = str(asr_cfg.get("mode", "sherpa")).lower()
-
     if asr_mode == "fake":
         asr = FakeASRProvider(_build_fake_asr_config(asr_cfg))
     else:
@@ -154,14 +154,26 @@ def build_runtime(config: dict) -> ShadowingRuntime:
             control_cfg.get("resume_from_hold_speaking_lead_slack_sec", 0.45)
         ),
         reacquire_soft_duck_sec=float(control_cfg.get("reacquire_soft_duck_sec", 2.00)),
+        disable_seek=bool(control_cfg.get("disable_seek", False)),
     )
-
     controller = StateMachineController(
         policy=policy,
         disable_seek=bool(control_cfg.get("disable_seek", False)),
     )
 
     runtime_cfg = config.get("runtime", {})
+    adaptation_cfg = config.get("adaptation", {})
+    session_cfg = config.get("session", {})
+
+    profile_store = None
+    if adaptation_cfg.get("profile_path"):
+        profile_store = ProfileStore(str(adaptation_cfg["profile_path"]))
+
+    event_logger = None
+    session_dir = session_cfg.get("session_dir")
+    if session_dir:
+        event_logger = EventLogger(str(session_dir), enabled=bool(session_cfg.get("event_logging", True)))
+
     orchestrator = ShadowingOrchestrator(
         repo=repo,
         player=player,
@@ -169,14 +181,24 @@ def build_runtime(config: dict) -> ShadowingRuntime:
         asr=asr,
         aligner=aligner,
         controller=controller,
+        device_context=dict(config.get("device_context", {})),
+        signal_monitor=SignalQualityMonitor(
+            min_vad_rms=float(config.get("signal", {}).get("min_vad_rms", 0.006)),
+            vad_noise_multiplier=float(config.get("signal", {}).get("vad_noise_multiplier", 2.8)),
+        ),
+        latency_calibrator=LatencyCalibrator(),
+        auto_tuner=RuntimeAutoTuner(),
+        profile_store=profile_store,
+        event_logger=event_logger,
         audio_queue_maxsize=int(runtime_cfg.get("audio_queue_maxsize", 150)),
         asr_event_queue_maxsize=int(runtime_cfg.get("asr_event_queue_maxsize", 64)),
         loop_interval_sec=float(runtime_cfg.get("loop_interval_sec", 0.03)),
+        debug=bool(config.get("debug", {}).get("enabled", False)),
     )
 
-    if "runtime" in config:
-        orchestrator.configure_runtime(config["runtime"])
-    if "debug" in config:
-        orchestrator.configure_debug(config["debug"])
-
-    return ShadowingRuntime(orchestrator)
+    return ShadowingRuntime(
+        orchestrator=orchestrator,
+        config=RealtimeRuntimeConfig(
+            tick_sleep_sec=float(runtime_cfg.get("loop_interval_sec", 0.03)),
+        ),
+    )

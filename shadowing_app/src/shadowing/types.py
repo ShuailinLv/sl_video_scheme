@@ -225,19 +225,15 @@ class ProgressEstimate:
     estimated_ref_idx: int
     estimated_ref_time_sec: float
     progress_velocity_idx_per_sec: float
-
     event_emitted_at_sec: float
     last_progress_at_sec: float
     progress_age_sec: float
-
     source_candidate_ref_idx: int
     source_committed_ref_idx: int
-
     tracking_mode: TrackingMode
     tracking_quality: float
     stable: bool
     confidence: float
-
     active_speaking: bool
     recently_progressed: bool
     user_state: UserReadState

@@ -50,7 +50,9 @@ class IncrementalAligner(Aligner):
         debug: bool = False,
         max_hyp_tokens: int = 16,
     ) -> None:
-        self.window_selector = WindowSelector(look_back=window_back, look_ahead=window_ahead)
+        self.base_window_back = max(4, int(window_back))
+        self.base_window_ahead = max(20, int(window_ahead))
+        self.window_selector = WindowSelector(look_back=self.base_window_back, look_ahead=self.base_window_ahead)
         self.scorer = AlignmentScorer()
         self.stable_frames = int(stable_frames)
         self.min_confidence = float(min_confidence)
@@ -100,10 +102,15 @@ class IncrementalAligner(Aligner):
             return None
 
         hyp_tokens = [HypToken(char=c, pinyin=py) for c, py in hyp_pairs]
+
+        dyn_back, dyn_ahead = self._select_window_params()
         window_tokens, window_start, window_end = self.window_selector.select(
             self.ref_map,
             self.state.committed_idx,
+            look_back=dyn_back,
+            look_ahead=dyn_ahead,
         )
+
         candidate, local_match_ratio = self._align_window(
             hyp_tokens=hyp_tokens,
             ref_tokens=window_tokens,
@@ -135,7 +142,8 @@ class IncrementalAligner(Aligner):
                 f"backward={candidate.backward_jump} "
                 f"matched_n={len(candidate.matched_ref_indices)} "
                 f"hyp_n={len(hyp_tokens)} "
-                f"mode={candidate.mode}"
+                f"mode={candidate.mode} "
+                f"window=({window_start},{max(window_start, window_end - 1)})"
             )
 
         return AlignResult(
@@ -159,6 +167,22 @@ class IncrementalAligner(Aligner):
             repeat_penalty=repeat_penalty,
             emitted_at_sec=event.emitted_at_sec,
         )
+
+    def _select_window_params(self) -> tuple[int, int]:
+        look_back = self.base_window_back
+        look_ahead = self.base_window_ahead
+
+        if self.state.recovering_after_seek:
+            look_back += 8
+            look_ahead += 28
+        elif self.state.backward_run > 0:
+            look_back += 6
+            look_ahead += 18
+        elif self.state.stable_run >= max(2, self.stable_frames):
+            look_back = max(6, self.base_window_back - 2)
+            look_ahead = max(28, self.base_window_ahead - 8)
+
+        return look_back, look_ahead
 
     def _observe_candidate(self, candidate: CandidateAlignment, event_type: AsrEventType) -> bool:
         stable = False

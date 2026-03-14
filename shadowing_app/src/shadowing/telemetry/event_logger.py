@@ -14,12 +14,23 @@ class EventLogger:
         self.events_path = self.session_dir / "events.jsonl"
         self._lock = threading.Lock()
 
-    def log(self, event_type: str, payload: dict[str, Any]) -> None:
+    def log(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        ts_monotonic_sec: float | None = None,
+        session_tick: int | None = None,
+    ) -> None:
         if not self.enabled:
             return
 
         record = {
             "event_type": str(event_type),
+            "ts_monotonic_sec": (
+                float(ts_monotonic_sec) if ts_monotonic_sec is not None else None
+            ),
+            "session_tick": int(session_tick) if session_tick is not None else None,
             "payload": payload,
         }
 
