@@ -36,6 +36,11 @@ class OrchestratorStats:
     raw_asr_events: int = 0
     normalized_asr_events: int = 0
     ticks: int = 0
+    asr_frames_fed: int = 0
+    asr_frames_skipped: int = 0
+    asr_gate_open_count: int = 0
+    asr_gate_close_count: int = 0
+    asr_resets_from_silence: int = 0
 
 
 class ShadowingOrchestrator:
@@ -95,6 +100,22 @@ class ShadowingOrchestrator:
         self._warm_start: dict[str, Any] = {}
         self._session_started_at_sec = 0.0
 
+        self._asr_gate_open = False
+        self._asr_gate_last_open_at_sec = 0.0
+        self._asr_gate_last_close_at_sec = 0.0
+        self._last_human_voice_like_at_sec = 0.0
+        self._last_asr_reset_at_sec = 0.0
+
+        self._speech_open_rms = 0.010
+        self._speech_keep_rms = 0.0065
+        self._speech_open_peak = 0.030
+        self._speech_keep_peak = 0.018
+        self._speech_open_likelihood = 0.58
+        self._speech_keep_likelihood = 0.42
+        self._speech_tail_hold_sec = 0.38
+        self._asr_reset_after_silence_sec = 1.15
+        self._asr_reset_cooldown_sec = 0.90
+
     def configure_runtime(self, runtime_cfg: dict[str, Any]) -> None:
         if "loop_interval_sec" in runtime_cfg:
             self.loop_interval_sec = float(runtime_cfg["loop_interval_sec"])
@@ -125,6 +146,12 @@ class ShadowingOrchestrator:
         self._last_tracking_mode = None
         self._last_gain_sent = None
         self._last_control_action_key = None
+
+        self._asr_gate_open = False
+        self._asr_gate_last_open_at_sec = 0.0
+        self._asr_gate_last_close_at_sec = self._session_started_at_sec
+        self._last_human_voice_like_at_sec = 0.0
+        self._last_asr_reset_at_sec = 0.0
 
         output_sr = chunks[0].sample_rate if chunks else 44100
         self._device_profile = self._build_initial_device_profile(output_sr)
@@ -245,10 +272,7 @@ class ShadowingOrchestrator:
                         "anchor_consistency": tracking.anchor_consistency,
                         "matched_text": tracking.matched_text,
                         "emitted_at_sec": tracking.emitted_at_sec,
-                        "playback_generation": playback_status.generation,
                     },
-                    ts_monotonic_sec=time.monotonic(),
-                    session_tick=self.stats.ticks,
                 )
 
             progress = self.progress_estimator.update(
@@ -270,13 +294,13 @@ class ShadowingOrchestrator:
 
                 playback_status = self.player.get_status()
                 self.latency_calibrator.observe_sync(
-                    now_sec=event.emitted_at_sec,
                     playback_ref_time_sec=playback_status.t_ref_heard_content_sec,
                     user_ref_time_sec=progress.estimated_ref_time_sec,
                     tracking_quality=progress.tracking_quality,
                     stable=progress.stable,
                     active_speaking=progress.active_speaking,
                 )
+
         if progress is None:
             progress = self.progress_estimator.snapshot(
                 now_sec=now_sec,
@@ -295,7 +319,6 @@ class ShadowingOrchestrator:
             now_sec=now_sec,
             progress=progress,
             signal_snapshot=signal_snapshot,
-            playback_status=playback_status,
         )
         self._log_event(progress=progress, signal_snapshot=signal_snapshot, decision=decision)
 
@@ -329,7 +352,113 @@ class ShadowingOrchestrator:
             self.signal_monitor.feed_pcm16(pcm_bytes, observed_at_sec)
             signal_snapshot = self.signal_monitor.snapshot(observed_at_sec)
             self.latency_calibrator.observe_signal(signal_snapshot)
-            self.asr.feed_pcm16(pcm_bytes)
+
+            should_feed_asr = self._should_feed_asr(signal_snapshot=signal_snapshot, now_sec=observed_at_sec)
+            if should_feed_asr:
+                self.asr.feed_pcm16(pcm_bytes)
+                self.stats.asr_frames_fed += 1
+            else:
+                self.stats.asr_frames_skipped += 1
+                self._maybe_reset_asr_for_silence(signal_snapshot=signal_snapshot, now_sec=observed_at_sec)
+
+    def _should_feed_asr(self, *, signal_snapshot, now_sec: float) -> bool:
+        strong_voice = bool(
+            signal_snapshot.vad_active
+            and signal_snapshot.rms >= self._speech_open_rms
+            and signal_snapshot.peak >= self._speech_open_peak
+        )
+        likely_voice = bool(
+            signal_snapshot.speaking_likelihood >= self._speech_open_likelihood
+            and signal_snapshot.rms >= self._speech_keep_rms
+        )
+
+        keep_voice = bool(
+            signal_snapshot.vad_active
+            and signal_snapshot.rms >= self._speech_keep_rms
+            and signal_snapshot.peak >= self._speech_keep_peak
+        ) or bool(
+            signal_snapshot.speaking_likelihood >= self._speech_keep_likelihood
+            and signal_snapshot.peak >= self._speech_keep_peak
+        )
+
+        if strong_voice or likely_voice:
+            self._last_human_voice_like_at_sec = float(now_sec)
+
+        gate_should_open = strong_voice or likely_voice
+        gate_should_keep = False
+        if self._asr_gate_open and self._last_human_voice_like_at_sec > 0.0:
+            gate_should_keep = keep_voice or (
+                (now_sec - self._last_human_voice_like_at_sec) <= self._speech_tail_hold_sec
+            )
+
+        new_gate_state = gate_should_open or gate_should_keep
+
+        if new_gate_state and not self._asr_gate_open:
+            self._asr_gate_open = True
+            self._asr_gate_last_open_at_sec = float(now_sec)
+            self.stats.asr_gate_open_count += 1
+            if self.debug:
+                print(
+                    "[ASR-GATE] open "
+                    f"t={now_sec:.3f} rms={signal_snapshot.rms:.5f} "
+                    f"peak={signal_snapshot.peak:.5f} "
+                    f"vad={signal_snapshot.vad_active} "
+                    f"speaking={signal_snapshot.speaking_likelihood:.3f}"
+                )
+        elif (not new_gate_state) and self._asr_gate_open:
+            self._asr_gate_open = False
+            self._asr_gate_last_close_at_sec = float(now_sec)
+            self.stats.asr_gate_close_count += 1
+            if self.debug:
+                print(
+                    "[ASR-GATE] close "
+                    f"t={now_sec:.3f} rms={signal_snapshot.rms:.5f} "
+                    f"peak={signal_snapshot.peak:.5f} "
+                    f"vad={signal_snapshot.vad_active} "
+                    f"speaking={signal_snapshot.speaking_likelihood:.3f}"
+                )
+
+        return self._asr_gate_open
+
+    def _maybe_reset_asr_for_silence(self, *, signal_snapshot, now_sec: float) -> None:
+        if self._asr_gate_open:
+            return
+
+        recently_had_voice = (
+            self._last_human_voice_like_at_sec > 0.0
+            and (now_sec - self._last_human_voice_like_at_sec) <= self._asr_reset_after_silence_sec
+        )
+        if recently_had_voice:
+            return
+
+        recently_reset = (
+            self._last_asr_reset_at_sec > 0.0
+            and (now_sec - self._last_asr_reset_at_sec) <= self._asr_reset_cooldown_sec
+        )
+        if recently_reset:
+            return
+
+        very_quiet = (
+            signal_snapshot.rms <= self._speech_keep_rms
+            and signal_snapshot.peak <= self._speech_keep_peak
+            and signal_snapshot.speaking_likelihood <= 0.28
+        )
+        if not very_quiet:
+            return
+
+        try:
+            self.asr.reset()
+            self._last_asr_reset_at_sec = float(now_sec)
+            self.stats.asr_resets_from_silence += 1
+            if self.debug:
+                print(
+                    "[ASR-GATE] reset_stream_for_silence "
+                    f"t={now_sec:.3f} rms={signal_snapshot.rms:.5f} "
+                    f"peak={signal_snapshot.peak:.5f} "
+                    f"speaking={signal_snapshot.speaking_likelihood:.3f}"
+                )
+        except Exception:
+            pass
 
     def _apply_decision(self, decision, playback_status) -> None:
         action_key = (decision.action.value, decision.reason)
@@ -368,215 +497,4 @@ class ShadowingOrchestrator:
 
         desired_gain = decision.target_gain
         if desired_gain is not None:
-            if self._last_gain_sent is None or abs(float(desired_gain) - float(self._last_gain_sent)) >= 0.015:
-                self.player.submit_command(
-                    PlayerCommand(
-                        cmd=PlayerCommandType.SET_GAIN,
-                        gain=float(desired_gain),
-                        reason=decision.reason,
-                    )
-                )
-                self._last_gain_sent = float(desired_gain)
-
-    def _run_auto_tuning(
-        self,
-        *,
-        now_sec: float,
-        progress,
-        signal_snapshot,
-        playback_status,
-    ) -> None:
-        if self._device_profile is None:
-            return
-
-        updates = self.auto_tuner.maybe_tune(
-            now_sec=now_sec,
-            controller_policy=self.controller.policy,
-            player=self.player,
-            signal_monitor=self.signal_monitor,
-            metrics_summary=self.metrics.summary_dict(),
-            signal_quality=signal_snapshot,
-            progress=progress,
-            latency_snapshot=self.latency_calibrator.snapshot(),
-            device_profile=asdict(self._device_profile),
-        )
-
-        if self.event_logger is not None and updates:
-            self.event_logger.log(
-                "auto_tune_update",
-                {
-                    "updates": updates,
-                    "best_tracking_quality": self.auto_tuner.state.best_tracking_quality,
-                    "speaker_style": self.auto_tuner.state.speaker_style,
-                    "environment_style": self.auto_tuner.state.environment_style,
-                    "playback_generation": playback_status.generation,
-                },
-                ts_monotonic_sec=time.monotonic(),
-                session_tick=self.stats.ticks,
-            )
-
-    def _build_initial_device_profile(self, output_sample_rate: int) -> DeviceProfile:
-        input_device_name = str(self.device_context.get("input_device_name", "unknown"))
-        output_device_name = str(self.device_context.get("output_device_name", "unknown"))
-        input_sample_rate = int(self.device_context.get("input_sample_rate", 48000))
-        noise_floor_rms = float(self.device_context.get("noise_floor_rms", 0.0025))
-
-        return build_device_profile(
-            input_device_name=input_device_name,
-            output_device_name=output_device_name,
-            input_sample_rate=input_sample_rate,
-            output_sample_rate=output_sample_rate,
-            noise_floor_rms=noise_floor_rms,
-        )
-
-    def _persist_session_profile(self) -> None:
-        if self.profile_store is None or self._device_profile is None:
-            return
-
-        latency_snapshot = self.latency_calibrator.snapshot()
-
-        updated_profile = DeviceProfileSnapshot(
-            input_device_id=self._device_profile.input_device_id,
-            output_device_id=self._device_profile.output_device_id,
-            input_kind=self._device_profile.input_kind,
-            output_kind=self._device_profile.output_kind,
-            input_sample_rate=self._device_profile.input_sample_rate,
-            output_sample_rate=self._device_profile.output_sample_rate,
-            estimated_input_latency_ms=(
-                latency_snapshot.estimated_input_latency_ms
-                if latency_snapshot is not None
-                else self._device_profile.estimated_input_latency_ms
-            ),
-            estimated_output_latency_ms=(
-                latency_snapshot.estimated_output_latency_ms
-                if latency_snapshot is not None
-                else self._device_profile.estimated_output_latency_ms
-            ),
-            noise_floor_rms=float(self.signal_monitor.state.noise_floor_rms),
-            input_gain_hint=self._device_profile.input_gain_hint,
-            reliability_tier=self._device_profile.reliability_tier,
-        )
-
-        latency_dict = None
-        if latency_snapshot is not None:
-            latency_dict = asdict(
-                LatencyCalibrationSnapshot(
-                    estimated_input_latency_ms=latency_snapshot.estimated_input_latency_ms,
-                    estimated_output_latency_ms=latency_snapshot.estimated_output_latency_ms,
-                    confidence=latency_snapshot.confidence,
-                    calibrated=latency_snapshot.calibrated,
-                )
-            )
-
-        self.profile_store.update_from_session(
-            input_device_id=updated_profile.input_device_id,
-            output_device_id=updated_profile.output_device_id,
-            device_profile=asdict(updated_profile),
-            metrics=self.metrics.summary_dict(),
-            latency_calibration=latency_dict,
-        )
-
-    def _persist_summary(self) -> None:
-        if self.event_logger is None:
-            return
-
-        latency_snapshot = self.latency_calibrator.snapshot()
-        summary = {
-            "lesson_id": self._lesson_id,
-            "metrics": self.metrics.summary_dict(),
-            "latency_calibration": (
-                asdict(
-                    LatencyCalibrationSnapshot(
-                        estimated_input_latency_ms=latency_snapshot.estimated_input_latency_ms,
-                        estimated_output_latency_ms=latency_snapshot.estimated_output_latency_ms,
-                        confidence=latency_snapshot.confidence,
-                        calibrated=latency_snapshot.calibrated,
-                    )
-                )
-                if latency_snapshot is not None
-                else {}
-            ),
-            "device_profile": asdict(
-                DeviceProfileSnapshot(
-                    input_device_id=self._device_profile.input_device_id,
-                    output_device_id=self._device_profile.output_device_id,
-                    input_kind=self._device_profile.input_kind,
-                    output_kind=self._device_profile.output_kind,
-                    input_sample_rate=self._device_profile.input_sample_rate,
-                    output_sample_rate=self._device_profile.output_sample_rate,
-                    estimated_input_latency_ms=self._device_profile.estimated_input_latency_ms,
-                    estimated_output_latency_ms=self._device_profile.estimated_output_latency_ms,
-                    noise_floor_rms=float(self.signal_monitor.state.noise_floor_rms),
-                    input_gain_hint=self._device_profile.input_gain_hint,
-                    reliability_tier=self._device_profile.reliability_tier,
-                )
-            ) if self._device_profile is not None else {},
-            "stats": asdict(self.stats),
-        }
-
-        summary_path = Path(self.event_logger.session_dir) / "summary.json"
-        summary_path.write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        self.event_logger.log(
-            "session_summary",
-            summary,
-            ts_monotonic_sec=time.monotonic(),
-            session_tick=self.stats.ticks,
-        )
-
-    def _log_event(self, *, progress, signal_snapshot, decision) -> None:
-        if self.event_logger is None:
-            return
-
-        self.event_logger.log(
-            "signal_snapshot",
-            {
-                "observed_at_sec": signal_snapshot.observed_at_sec,
-                "rms": signal_snapshot.rms,
-                "peak": signal_snapshot.peak,
-                "vad_active": signal_snapshot.vad_active,
-                "speaking_likelihood": signal_snapshot.speaking_likelihood,
-                "quality_score": signal_snapshot.quality_score,
-                "dropout_detected": signal_snapshot.dropout_detected,
-                "silence_run_sec": signal_snapshot.silence_run_sec,
-            },
-            ts_monotonic_sec=time.monotonic(),
-            session_tick=self.stats.ticks,
-        )
-
-        if progress is not None:
-            self.event_logger.log(
-                "progress_snapshot",
-                {
-                    "estimated_ref_idx": progress.estimated_ref_idx,
-                    "estimated_ref_time_sec": progress.estimated_ref_time_sec,
-                    "tracking_mode": progress.tracking_mode.value,
-                    "tracking_quality": progress.tracking_quality,
-                    "confidence": progress.confidence,
-                    "active_speaking": progress.active_speaking,
-                    "user_state": progress.user_state.value,
-                    "progress_age_sec": progress.progress_age_sec,
-                    "recently_progressed": progress.recently_progressed,
-                    "playback_generation": self.player.get_status().generation,
-                },
-                ts_monotonic_sec=time.monotonic(),
-                session_tick=self.stats.ticks,
-            )
-
-        self.event_logger.log(
-            "control_decision",
-            {
-                "action": decision.action.value,
-                "reason": decision.reason,
-                "lead_sec": decision.lead_sec,
-                "target_time_sec": decision.target_time_sec,
-                "target_gain": decision.target_gain,
-                "confidence": decision.confidence,
-                "playback_generation": self.player.get_status().generation,
-            },
-            ts_monotonic_sec=time.monotonic(),
-            session_tick=self.stats.ticks,
-        )
+            if self._last_gain_sent is None or abs(float(desired_gain) - float(self._last_gain_sent)) >= 

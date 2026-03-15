@@ -1,0 +1,80 @@
+F401 [*] `typing.Optional` imported but unused
+  --> gpt_tools\create_snapshot.py:12:38
+   |
+10 | import logging
+11 | from pathlib import Path
+12 | from typing import List, Set, Tuple, Optional
+   |                                      ^^^^^^^^
+13 |
+14 | logging.basicConfig(
+   |
+help: Remove unused import: `typing.Optional`
+
+F841 Local variable `tok_str` is assigned to but never used
+  --> gpt_tools\create_snapshot.py:86:13
+   |
+84 |         for tok in tokens:
+85 |             tok_type = tok.type
+86 |             tok_str = tok.string
+   |             ^^^^^^^
+87 |
+88 |             if tok_type == tokenize.COMMENT:
+   |
+help: Remove assignment to unused variable `tok_str`
+
+invalid-syntax: Expected an expression
+   --> shadowing_app\src\shadowing\realtime\orchestrator.py:500:106
+    |
+498 |         desired_gain = decision.target_gain
+499 |         if desired_gain is not None:
+500 |             if self._last_gain_sent is None or abs(float(desired_gain) - float(self._last_gain_sent)) >= 
+    |                                                                                                          ^
+    |
+
+E701 Multiple statements on one line (colon)
+   --> shadowing_app\tools\create_snapshot.py:246:30
+    |
+244 |             try:
+245 |                 fsize = path.stat().st_size
+246 |                 if fsize == 0: continue
+    |                              ^
+247 |                 if fsize > MAX_FILE_SIZE_BYTES:
+248 |                     snapshot_chunks.append(f"---\n### {rel} (Skipped Large File)\n\n")
+    |
+
+E722 Do not use bare `except`
+   --> shadowing_app\tools\create_snapshot.py:250:13
+    |
+248 |                     snapshot_chunks.append(f"---\n### {rel} (Skipped Large File)\n\n")
+249 |                     continue
+250 |             except: continue
+    |             ^^^^^^
+251 |
+252 |             # 检查二进制
+    |
+
+E701 Multiple statements on one line (colon)
+   --> shadowing_app\tools\create_snapshot.py:250:19
+    |
+248 |                     snapshot_chunks.append(f"---\n### {rel} (Skipped Large File)\n\n")
+249 |                     continue
+250 |             except: continue
+    |                   ^
+251 |
+252 |             # 检查二进制
+    |
+
+F401 [*] `_bootstrap` imported but unused
+ --> shadowing_app\tools\run_shadowing.py:3:8
+  |
+1 | from __future__ import annotations
+2 |
+3 | import _bootstrap
+  |        ^^^^^^^^^^
+4 | import argparse
+5 | import json
+  |
+help: Remove unused import: `_bootstrap`
+
+Found 7 errors.
+[*] 2 fixable with the `--fix` option (1 hidden fix can be enabled with the `--unsafe-fixes` option).

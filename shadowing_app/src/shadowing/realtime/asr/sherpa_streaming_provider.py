@@ -31,12 +31,15 @@ class SherpaStreamingProvider(ASRProvider):
         self._recognizer: Any | None = None
         self._stream: Any | None = None
         self._running = False
+
         self._last_partial_text = ""
         self._last_final_text = ""
         self._last_emit_at = 0.0
+
         self._feed_counter = 0
         self._decode_counter = 0
         self._endpoint_count = 0
+        self._empty_endpoint_count = 0
         self._last_endpoint_at = 0.0
         self._final_emit_count = 0
 
@@ -46,22 +49,59 @@ class SherpaStreamingProvider(ASRProvider):
         self._last_ready_state = False
         self._last_endpoint_state = False
 
+        self._min_meaningful_text_len = int(self.model_config.get("min_meaningful_text_len", 2))
+        self._endpoint_min_interval_sec = float(self.model_config.get("endpoint_min_interval_sec", 0.35))
+        self._force_reset_after_empty_endpoints = int(
+            self.model_config.get("force_reset_after_empty_endpoints", 999999999)
+        )
+        self._reset_on_empty_endpoint = bool(self.model_config.get("reset_on_empty_endpoint", False))
+        self._preserve_stream_on_partial_only = bool(
+            self.model_config.get("preserve_stream_on_partial_only", True)
+        )
+
     def start(self) -> None:
         self._recognizer = self._build_recognizer()
         self._stream = self._recognizer.create_stream()
         self._running = True
+
         self._last_partial_text = ""
         self._last_final_text = ""
         self._last_emit_at = 0.0
         self._feed_counter = 0
         self._decode_counter = 0
         self._endpoint_count = 0
+        self._empty_endpoint_count = 0
         self._last_endpoint_at = 0.0
         self._final_emit_count = 0
         self._last_partial_log_text = ""
         self._last_summary_log_at = time.monotonic()
         self._last_ready_state = False
         self._last_endpoint_state = False
+
+        hotword_lines = self._parse_hotword_lines(self.hotwords)
+        preview = hotword_lines[:12]
+
+        print(
+            "[ASR-HOTWORDS] "
+            f"count={len(hotword_lines)} "
+            f"score={float(self.model_config.get('hotwords_score', 1.5)):.2f}"
+        )
+        if preview:
+            print("[ASR-HOTWORDS-PREVIEW] " + " | ".join(preview))
+        else:
+            print("[ASR-HOTWORDS-PREVIEW] <empty>")
+
+        if self.debug_feed:
+            print(
+                "[ASR-CONFIG] "
+                f"sample_rate={self.sample_rate} "
+                f"emit_partial_interval_sec={self.emit_partial_interval_sec:.3f} "
+                f"enable_endpoint={self.enable_endpoint} "
+                f"min_meaningful_text_len={self._min_meaningful_text_len} "
+                f"endpoint_min_interval_sec={self._endpoint_min_interval_sec:.3f} "
+                f"reset_on_empty_endpoint={self._reset_on_empty_endpoint} "
+                f"preserve_stream_on_partial_only={self._preserve_stream_on_partial_only}"
+            )
 
     def feed_pcm16(self, pcm_bytes: bytes) -> None:
         if not self._running or self._recognizer is None or self._stream is None or not pcm_bytes:
@@ -106,7 +146,7 @@ class SherpaStreamingProvider(ASRProvider):
             self._recognizer.decode_stream(self._stream)
             self._decode_counter += 1
 
-        partial_text = self._get_result_text().strip()
+        partial_text = self._normalize_text(self._get_result_text())
 
         if self.debug_feed and partial_text and partial_text != self._last_partial_log_text:
             print(f"[ASR-PARTIAL-RAW] {partial_text!r}")
@@ -137,14 +177,20 @@ class SherpaStreamingProvider(ASRProvider):
         self._last_endpoint_state = bool(endpoint_hit)
 
         if endpoint_hit:
+            if (now - self._last_endpoint_at) < self._endpoint_min_interval_sec:
+                self._maybe_log_summary()
+                return events
+
             self._endpoint_count += 1
             self._last_endpoint_at = now
-            final_text = self._get_result_text().strip()
+
+            final_text = self._normalize_text(self._get_result_text())
+            should_emit_final = self._is_meaningful_result(final_text)
 
             if self.debug_feed and final_text and final_text != self._last_final_text:
                 print(f"[ASR-FINAL-RAW] {final_text!r}")
 
-            if final_text and final_text != self._last_final_text:
+            if should_emit_final and final_text != self._last_final_text:
                 events.append(
                     RawAsrEvent(
                         event_type=AsrEventType.FINAL,
@@ -154,19 +200,57 @@ class SherpaStreamingProvider(ASRProvider):
                 )
                 self._last_final_text = final_text
                 self._final_emit_count += 1
+                self._empty_endpoint_count = 0
 
-            self._reset_stream_state_only()
-            self._last_partial_text = ""
-            self._last_partial_log_text = ""
-            self._last_ready_state = False
-            self._last_endpoint_state = False
+                self._reset_stream_state_only()
+                self._last_partial_text = ""
+                self._last_partial_log_text = ""
+                self._last_ready_state = False
+                self._last_endpoint_state = False
 
-            if self.debug_feed:
-                print(
-                    f"[ASR-ENDPOINT] count={self._endpoint_count} "
-                    f"final_count={self._final_emit_count} "
-                    f"last_endpoint_at={self._last_endpoint_at:.3f}"
-                )
+                if self.debug_feed:
+                    print(
+                        f"[ASR-ENDPOINT] count={self._endpoint_count} "
+                        f"final_count={self._final_emit_count} "
+                        f"last_endpoint_at={self._last_endpoint_at:.3f} "
+                        f"action=reset_after_final"
+                    )
+            else:
+                self._empty_endpoint_count += 1
+
+                if self.debug_feed:
+                    print(
+                        f"[ASR-ENDPOINT-IGNORED] count={self._endpoint_count} "
+                        f"empty_count={self._empty_endpoint_count} "
+                        f"partial_len={len(partial_text)} final_len={len(final_text)}"
+                    )
+
+                if self._reset_on_empty_endpoint:
+                    no_partial_context = not partial_text
+                    no_final_context = not final_text
+
+                    if self._preserve_stream_on_partial_only and partial_text and not final_text:
+                        no_partial_context = False
+
+                    if (
+                        no_partial_context
+                        and no_final_context
+                        and self._empty_endpoint_count >= self._force_reset_after_empty_endpoints
+                    ):
+                        self._reset_stream_state_only()
+                        self._last_partial_text = ""
+                        self._last_partial_log_text = ""
+                        self._last_ready_state = False
+                        self._last_endpoint_state = False
+                        self._empty_endpoint_count = 0
+
+                        if self.debug_feed:
+                            print(
+                                f"[ASR-ENDPOINT] count={self._endpoint_count} "
+                                f"final_count={self._final_emit_count} "
+                                f"last_endpoint_at={self._last_endpoint_at:.3f} "
+                                f"action=reset_after_empty_endpoint"
+                            )
 
         self._maybe_log_summary()
         return events
@@ -174,6 +258,7 @@ class SherpaStreamingProvider(ASRProvider):
     def reset(self) -> None:
         if self._recognizer is None:
             return
+
         self._reset_stream_state_only()
         self._last_partial_text = ""
         self._last_final_text = ""
@@ -181,6 +266,7 @@ class SherpaStreamingProvider(ASRProvider):
         self._feed_counter = 0
         self._decode_counter = 0
         self._endpoint_count = 0
+        self._empty_endpoint_count = 0
         self._last_endpoint_at = 0.0
         self._final_emit_count = 0
         self._last_partial_log_text = ""
@@ -188,10 +274,24 @@ class SherpaStreamingProvider(ASRProvider):
         self._last_ready_state = False
         self._last_endpoint_state = False
 
+        if self.debug_feed:
+            print("[ASR-RESET] stream reset by external request")
+
     def close(self) -> None:
         self._running = False
         self._stream = None
         self._recognizer = None
+
+    def _normalize_text(self, text: str) -> str:
+        return str(text or "").strip()
+
+    def _is_meaningful_result(self, text: str) -> bool:
+        text = self._normalize_text(text)
+        if not text:
+            return False
+        if len(text) < self._min_meaningful_text_len:
+            return False
+        return True
 
     def _get_result_text(self) -> str:
         result = self._recognizer.get_result(self._stream)
@@ -217,6 +317,17 @@ class SherpaStreamingProvider(ASRProvider):
         if self._recognizer is not None:
             self._stream = self._recognizer.create_stream()
 
+    def _parse_hotword_lines(self, hotwords: str) -> list[str]:
+        lines = [line.strip() for line in str(hotwords or "").splitlines() if line.strip()]
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for line in lines:
+            if line in seen:
+                continue
+            seen.add(line)
+            deduped.append(line)
+        return deduped
+
     def _maybe_log_summary(self) -> None:
         if not self.debug_feed:
             return
@@ -225,12 +336,16 @@ class SherpaStreamingProvider(ASRProvider):
         if (now - self._last_summary_log_at) < self._summary_interval_sec:
             return
 
-        current_text = self._get_result_text().strip() if self._recognizer is not None and self._stream is not None else ""
+        current_text = ""
+        if self._recognizer is not None and self._stream is not None:
+            current_text = self._get_result_text().strip()
+
         preview = current_text[:32]
         print(
             f"[ASR-SUMMARY] feeds={self._feed_counter} decodes={self._decode_counter} "
             f"partials_len={len(self._last_partial_text)} finals={self._final_emit_count} "
-            f"endpoints={self._endpoint_count} preview={preview!r}"
+            f"endpoints={self._endpoint_count} empty_endpoints={self._empty_endpoint_count} "
+            f"preview={preview!r}"
         )
         self._last_summary_log_at = now
 
@@ -242,6 +357,7 @@ class SherpaStreamingProvider(ASRProvider):
         encoder = cfg.get("encoder", "")
         decoder = cfg.get("decoder", "")
         joiner = cfg.get("joiner", "")
+
         missing = [
             name
             for name, value in (
@@ -255,6 +371,21 @@ class SherpaStreamingProvider(ASRProvider):
         if missing:
             raise ValueError("Missing sherpa model paths in config: " + ", ".join(missing))
 
+        hotwords = str(self.hotwords or cfg.get("hotwords", "")).strip()
+        hotwords_score = float(cfg.get("hotwords_score", 1.5))
+
+        if self.debug_feed:
+            hotword_lines = self._parse_hotword_lines(hotwords)
+            print(
+                "[ASR-BUILD] "
+                f"hotwords_count={len(hotword_lines)} "
+                f"hotwords_score={hotwords_score:.2f} "
+                f"provider={cfg.get('provider', 'cpu')} "
+                f"decoding_method={cfg.get('decoding_method', 'greedy_search')}"
+            )
+            if hotword_lines:
+                print("[ASR-BUILD-HOTWORDS] " + " | ".join(hotword_lines[:20]))
+
         base_kwargs = dict(
             tokens=tokens,
             encoder=encoder,
@@ -267,8 +398,8 @@ class SherpaStreamingProvider(ASRProvider):
             provider=cfg.get("provider", "cpu"),
         )
         hotword_kwargs = dict(
-            hotwords=self.hotwords or cfg.get("hotwords", ""),
-            hotwords_score=cfg.get("hotwords_score", 1.5),
+            hotwords=hotwords,
+            hotwords_score=hotwords_score,
         )
         endpoint_kwargs = dict(
             enable_endpoint_detection=self.enable_endpoint,
@@ -278,16 +409,31 @@ class SherpaStreamingProvider(ASRProvider):
         )
 
         try:
-            return sherpa_onnx.OnlineRecognizer.from_transducer(
+            recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
                 **base_kwargs,
                 **hotword_kwargs,
                 **endpoint_kwargs,
             )
-        except TypeError:
-            try:
-                return sherpa_onnx.OnlineRecognizer.from_transducer(
-                    **base_kwargs,
-                    **endpoint_kwargs,
-                )
-            except TypeError:
-                return sherpa_onnx.OnlineRecognizer.from_transducer(**base_kwargs)
+            if self.debug_feed:
+                print("[ASR-BUILD] recognizer_created mode=transducer+hotwords+endpoint")
+            return recognizer
+        except TypeError as e1:
+            if self.debug_feed:
+                print(f"[ASR-BUILD] hotwords kwargs not accepted, fallback 1: {e1}")
+
+        try:
+            recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+                **base_kwargs,
+                **endpoint_kwargs,
+            )
+            if self.debug_feed:
+                print("[ASR-BUILD] recognizer_created mode=transducer+endpoint")
+            return recognizer
+        except TypeError as e2:
+            if self.debug_feed:
+                print(f"[ASR-BUILD] endpoint kwargs not accepted, fallback 2: {e2}")
+
+        recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(**base_kwargs)
+        if self.debug_feed:
+            print("[ASR-BUILD] recognizer_created mode=transducer_basic")
+        return recognizer

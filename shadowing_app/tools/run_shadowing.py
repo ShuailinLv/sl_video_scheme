@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import _bootstrap  # noqa: F401
+import _bootstrap
 import argparse
 import json
 import os
@@ -15,6 +15,7 @@ from shadowing.audio.bluetooth_preflight import (
     should_run_bluetooth_preflight,
 )
 from shadowing.bootstrap import build_runtime
+from shadowing.llm.qwen_hotwords import extract_hotwords_with_qwen
 from shadowing.realtime.capture.device_utils import pick_working_input_config
 
 
@@ -181,6 +182,157 @@ def _run_bluetooth_preflight_or_fail(
     return result.input_device_index, result.output_device_index
 
 
+def _normalize_for_hotwords(text: str) -> str:
+    text = str(text or "").strip()
+    text = text.replace("\u3000", " ")
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[，。！？；：、“”‘’\"'（）()\[\]【】<>\-—…,.!?;:/\\|`~@#$%^&*_+=]+", "", text)
+    return text
+
+
+def _looks_like_bad_hotword(term: str) -> bool:
+    if not term:
+        return True
+    n = len(term)
+    if n < 4 or n > 24:
+        return True
+    if term[0] in "的了在和与及并就也又把被将呢啊吗呀":
+        return True
+    if term[-1] in "的了在和与及并就也又呢啊吗呀":
+        return True
+    if re.fullmatch(r"[A-Za-z]+", term):
+        return True
+    if re.search(r"[A-Za-z]", term):
+        if not re.fullmatch(r"[A-Za-z0-9一-龥]+", term):
+            return True
+    return False
+
+
+def _split_text_to_sentences(text: str) -> list[str]:
+    parts = re.split(r"[。！？!?；;：:\n\r]+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _split_sentence_to_clauses(text: str) -> list[str]:
+    parts = re.split(r"[，,、]+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _score_hotword(term: str, whole_sentence: str) -> float:
+    score = 0.0
+    n = len(term)
+
+    if 5 <= n <= 14:
+        score += 5.0
+    elif 4 <= n <= 18:
+        score += 3.0
+    else:
+        score += 1.0
+
+    if term == whole_sentence:
+        score += 0.8
+
+    if any(k in term for k in ["华为", "座舱", "车机", "微信", "周杰伦", "支付宝", "PPT", "bug"]):
+        score += 2.0
+
+    if any(k in term for k in ["技术小组", "智能座舱", "原型车", "红尾灯", "语音助手", "晚高峰"]):
+        score += 2.0
+
+    if re.search(r"\d", term):
+        score += 0.8
+
+    if _looks_like_bad_hotword(term):
+        score -= 10.0
+
+    return score
+
+
+def _dedupe_by_containment(terms: list[str], max_terms: int) -> list[str]:
+    kept: list[str] = []
+    for term in terms:
+        if any(term in existed for existed in kept if existed != term):
+            continue
+        kept.append(term)
+        if len(kept) >= max_terms:
+            break
+    return kept
+
+
+def _build_hotwords_from_lesson_text_local(
+    lesson_text: str,
+    *,
+    max_terms: int = 20,
+) -> list[str]:
+    normalized_full = _normalize_for_hotwords(lesson_text)
+    if not normalized_full:
+        return []
+
+    candidates: dict[str, float] = {}
+
+    def add(term: str, whole_sentence: str = "") -> None:
+        norm = _normalize_for_hotwords(term)
+        if not norm:
+            return
+        if _looks_like_bad_hotword(norm):
+            return
+        score = _score_hotword(norm, _normalize_for_hotwords(whole_sentence or norm))
+        old = candidates.get(norm)
+        if old is None or score > old:
+            candidates[norm] = score
+
+    sentences = _split_text_to_sentences(lesson_text)
+    for sent in sentences:
+        sent_norm = _normalize_for_hotwords(sent)
+        if not sent_norm:
+            continue
+
+        if 6 <= len(sent_norm) <= 20:
+            add(sent_norm, sent_norm)
+
+        clauses = _split_sentence_to_clauses(sent)
+        for clause in clauses:
+            clause_norm = _normalize_for_hotwords(clause)
+            if 4 <= len(clause_norm) <= 16:
+                add(clause_norm, sent_norm)
+
+    ranked = sorted(candidates.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
+    ranked_terms = [k for k, _ in ranked]
+    ranked_terms = _dedupe_by_containment(ranked_terms, max_terms=max_terms)
+    return ranked_terms[:max_terms]
+
+
+def _merge_hotwords(
+    auto_terms: list[str],
+    user_terms_raw: str,
+    *,
+    max_terms: int = 32,
+) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    def add(term: str) -> None:
+        norm = _normalize_for_hotwords(term)
+        if not norm:
+            return
+        if _looks_like_bad_hotword(norm):
+            return
+        if norm in seen:
+            return
+        seen.add(norm)
+        merged.append(norm)
+
+    for term in auto_terms:
+        add(term)
+
+    if user_terms_raw.strip():
+        for term in re.split(r"[,，;\n]+", user_terms_raw):
+            add(term)
+
+    merged = sorted(merged, key=lambda x: (-len(x), x))
+    merged = _dedupe_by_containment(merged, max_terms=max_terms)
+    return merged[:max_terms]
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run shadowing realtime pipeline")
 
@@ -188,23 +340,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lesson-base-dir", type=str, default="assets/lessons")
 
     parser.add_argument("--asr", type=str, default="sherpa", choices=["fake", "sherpa"])
-
     parser.add_argument("--output-device", type=int, default=None)
     parser.add_argument("--input-device", type=str, default=None)
     parser.add_argument("--input-samplerate", type=int, default=None)
-    parser.add_argument(
-        "--capture-backend",
-        type=str,
-        default="sounddevice",
-        choices=["sounddevice", "soundcard"],
-    )
+    parser.add_argument("--capture-backend", type=str, default="sounddevice", choices=["sounddevice", "soundcard"])
 
     parser.add_argument("--bluetooth-offset-sec", type=float, default=0.18)
     parser.add_argument("--playback-latency", type=str, default="high")
-    parser.add_argument("--playback-blocksize", type=int, default=2048)
+    parser.add_argument("--playback-blocksize", type=int, default=4096)
 
     parser.add_argument("--aligner-debug", action="store_true")
-
     parser.add_argument("--asr-debug-feed", action="store_true")
     parser.add_argument("--asr-debug-feed-every", type=int, default=20)
 
@@ -216,15 +361,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-dir", type=str, default="runtime/latest_session")
     parser.add_argument("--event-logging", action="store_true")
 
-    parser.add_argument("--startup-grace-sec", type=float, default=0.80)
-    parser.add_argument("--low-confidence-hold-sec", type=float, default=0.60)
-    parser.add_argument("--guide-play-sec", type=float, default=2.20)
-    parser.add_argument("--no-progress-hold-min-play-sec", type=float, default=4.00)
-    parser.add_argument("--progress-stale-sec", type=float, default=1.10)
-    parser.add_argument("--hold-trend-sec", type=float, default=0.75)
-    parser.add_argument("--tracking-quality-hold-min", type=float, default=0.60)
-    parser.add_argument("--tracking-quality-seek-min", type=float, default=0.72)
-    parser.add_argument("--resume-from-hold-speaking-lead-slack-sec", type=float, default=0.45)
+    parser.add_argument("--startup-grace-sec", type=float, default=2.0)
+    parser.add_argument("--low-confidence-hold-sec", type=float, default=1.5)
+
+    parser.add_argument("--hotwords", type=str, default="")
+    parser.add_argument("--hotwords-score", type=float, default=1.8)
+    parser.add_argument("--disable-auto-hotwords", action="store_true")
+    parser.add_argument("--print-hotwords", action="store_true")
+
+    parser.add_argument(
+        "--hotwords-source",
+        type=str,
+        default="qwen",
+        choices=["qwen", "local", "none"],
+        help="热词来源：qwen / local / none",
+    )
+    parser.add_argument(
+        "--qwen-api-key",
+        type=str,
+        default=os.getenv("DASHSCOPE_API_KEY", ""),
+        help="DashScope API Key，默认读环境变量 DASHSCOPE_API_KEY",
+    )
+    parser.add_argument(
+        "--qwen-model",
+        type=str,
+        default=os.getenv("QWEN_CHAT_MODEL", "qwen-plus"),
+        help="Qwen 模型名，默认 qwen-plus",
+    )
+    parser.add_argument(
+        "--qwen-max-hotwords",
+        type=int,
+        default=24,
+        help="Qwen 提取热词最大数量",
+    )
 
     return parser
 
@@ -286,6 +455,39 @@ def main() -> None:
     input_device_name = _resolve_input_device_name(effective_input_device)
     output_device_name = _resolve_output_device_name(effective_output_device)
 
+    auto_hotwords: list[str] = []
+    if not args.disable_auto_hotwords and args.hotwords_source != "none":
+        if args.hotwords_source == "qwen":
+            if args.qwen_api_key.strip():
+                auto_hotwords = extract_hotwords_with_qwen(
+                    lesson_text=lesson_text,
+                    api_key=args.qwen_api_key.strip(),
+                    model=args.qwen_model.strip(),
+                    max_terms=int(args.qwen_max_hotwords),
+                )
+                if not auto_hotwords:
+                    auto_hotwords = _build_hotwords_from_lesson_text_local(
+                        lesson_text,
+                        max_terms=min(20, int(args.qwen_max_hotwords)),
+                    )
+            else:
+                auto_hotwords = _build_hotwords_from_lesson_text_local(
+                    lesson_text,
+                    max_terms=min(20, int(args.qwen_max_hotwords)),
+                )
+        elif args.hotwords_source == "local":
+            auto_hotwords = _build_hotwords_from_lesson_text_local(
+                lesson_text,
+                max_terms=min(20, int(args.qwen_max_hotwords)),
+            )
+
+    merged_hotwords = _merge_hotwords(
+        auto_hotwords,
+        str(args.hotwords or ""),
+        max_terms=max(16, min(32, int(args.qwen_max_hotwords))),
+    )
+    hotwords_str = "\n".join(merged_hotwords)
+
     print(
         "[RUN-CONFIG] "
         f"lesson_id={lesson_id} "
@@ -300,6 +502,25 @@ def main() -> None:
         f"playback_blocksize={int(args.playback_blocksize)} "
         f"aligner_debug={bool(args.aligner_debug)}"
     )
+
+    print(
+        "[HOTWORDS] "
+        f"count={len(merged_hotwords)} "
+        f"score={float(args.hotwords_score):.2f} "
+        f"auto_enabled={not bool(args.disable_auto_hotwords)} "
+        f"source={args.hotwords_source}"
+    )
+    if merged_hotwords:
+        preview = merged_hotwords[:20]
+        print("[HOTWORDS-PREVIEW] " + " | ".join(preview))
+    else:
+        print("[HOTWORDS-PREVIEW] <empty>")
+
+    if args.print_hotwords and merged_hotwords:
+        print("=== HOTWORDS FULL LIST BEGIN ===")
+        for term in merged_hotwords:
+            print(term)
+        print("=== HOTWORDS FULL LIST END ===")
 
     runtime = build_runtime(
         {
@@ -340,6 +561,13 @@ def main() -> None:
                 "rule1_min_trailing_silence": 1.2,
                 "rule2_min_trailing_silence": 0.8,
                 "rule3_min_utterance_length": 12.0,
+                "hotwords": hotwords_str,
+                "hotwords_score": float(args.hotwords_score),
+                "min_meaningful_text_len": 2,
+                "endpoint_min_interval_sec": 0.35,
+                "reset_on_empty_endpoint": False,
+                "preserve_stream_on_partial_only": True,
+                "force_reset_after_empty_endpoints": 999999999,
             },
             "alignment": {
                 "window_back": 8,
@@ -351,28 +579,29 @@ def main() -> None:
                 "cross_clause_backward_extra_penalty": 0.20,
                 "debug": bool(args.aligner_debug),
                 "max_hyp_tokens": 16,
+                "weak_commit_min_conf": 0.82,
+                "weak_commit_min_local_match": 0.80,
+                "weak_commit_min_advance": 3,
             },
             "control": {
                 "target_lead_sec": 0.15,
                 "hold_if_lead_sec": 0.90,
                 "resume_if_lead_sec": 0.28,
                 "seek_if_lag_sec": -1.80,
-                "min_confidence": 0.75,
+                "min_confidence": 0.72,
                 "seek_cooldown_sec": 1.20,
                 "gain_following": 0.55,
                 "gain_transition": 0.80,
                 "gain_soft_duck": 0.42,
                 "startup_grace_sec": float(args.startup_grace_sec),
                 "low_confidence_hold_sec": float(args.low_confidence_hold_sec),
-                "guide_play_sec": float(args.guide_play_sec),
-                "no_progress_hold_min_play_sec": float(args.no_progress_hold_min_play_sec),
-                "progress_stale_sec": float(args.progress_stale_sec),
-                "hold_trend_sec": float(args.hold_trend_sec),
-                "tracking_quality_hold_min": float(args.tracking_quality_hold_min),
-                "tracking_quality_seek_min": float(args.tracking_quality_seek_min),
-                "resume_from_hold_speaking_lead_slack_sec": float(
-                    args.resume_from_hold_speaking_lead_slack_sec
-                ),
+                "guide_play_sec": 2.20,
+                "no_progress_hold_min_play_sec": 4.00,
+                "progress_stale_sec": 1.10,
+                "hold_trend_sec": 0.75,
+                "tracking_quality_hold_min": 0.56,
+                "tracking_quality_seek_min": 0.68,
+                "resume_from_hold_speaking_lead_slack_sec": 0.45,
                 "disable_seek": False,
             },
             "runtime": {

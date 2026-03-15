@@ -1,19 +1,19 @@
 {
   "lesson_id": "演讲稿3",
   "metrics": {
-    "first_signal_active_time_sec": 3.4530000000086147,
-    "first_asr_partial_time_sec": 4.672000000020489,
-    "first_reliable_progress_time_sec": 5.609000000025844,
+    "first_signal_active_time_sec": 6.25,
+    "first_asr_partial_time_sec": 11.01600000000326,
+    "first_reliable_progress_time_sec": 11.01600000000326,
     "startup_false_hold_count": 0,
     "hold_count": 2,
     "resume_count": 1,
-    "soft_duck_count": 10,
+    "soft_duck_count": 11,
     "seek_count": 0,
-    "lost_count": 1,
+    "lost_count": 0,
     "reacquire_count": 2,
-    "max_tracking_quality": 0.8705309096257098,
-    "mean_tracking_quality": 0.6324286514762524,
-    "total_progress_updates": 17
+    "max_tracking_quality": 0.8889252783460396,
+    "mean_tracking_quality": 0.7012982515172513,
+    "total_progress_updates": 16
   },
   "latency_calibration": {
     "estimated_input_latency_ms": 140.0,
@@ -30,16 +30,21 @@
     "output_sample_rate": 44100,
     "estimated_input_latency_ms": 140.0,
     "estimated_output_latency_ms": 180.0,
-    "noise_floor_rms": 0.012157650212479422,
+    "noise_floor_rms": 0.0005369500626787854,
     "input_gain_hint": "normal",
     "reliability_tier": "low"
   },
   "stats": {
-    "audio_enqueued": 695,
+    "audio_enqueued": 2255,
     "audio_dropped": 0,
     "audio_q_high_watermark": 4,
-    "raw_asr_events": 17,
-    "normalized_asr_events": 17,
-    "ticks": 238
+    "raw_asr_events": 16,
+    "normalized_asr_events": 16,
+    "ticks": 851,
+    "asr_frames_fed": 882,
+    "asr_frames_skipped": 1370,
+    "asr_gate_open_count": 12,
+    "asr_gate_close_count": 11,
+    "asr_resets_from_silence": 15
   }
 }

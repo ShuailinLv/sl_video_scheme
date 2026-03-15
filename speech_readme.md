@@ -13,6 +13,9 @@ set SHERPA_JOINER=D:\sl_video_scheme\sherpa-onnx-streaming-zipformer-zh-14M\join
 
 
 
+set DASHSCOPE_API_KEY=你的key
+set QWEN_CHAT_MODEL=qwen-plus
 
 
-python tools/run_shadowing.py --text-file "D:\sl_video_scheme\shadowing_app\assets\raw_texts\演讲稿3.txt" --asr sherpa --aligner-debug --startup-grace-sec 2.0 --low-confidence-hold-sec 1.5 --output-device 4 --playback-latency high --playback-blocksize 4096 --capture-backend sounddevice --input-device "耳机" --input-samplerate 48000 --asr-debug-feed --asr-debug-feed-every 10 --event-logging
+
+python tools/run_shadowing.py --text-file "D:\sl_video_scheme\shadowing_app\assets\raw_texts\演讲稿3.txt" --asr sherpa --output-device 4 --capture-backend sounddevice --input-device "耳机" --input-samplerate 48000 --playback-latency high --playback-blocksize 4096 --startup-grace-sec 2.8 --low-confidence-hold-sec 2.0 --tick-sleep-sec 0.03 --event-logging --hotwords-source qwen --qwen-max-hotwords 20 --hotwords-score 1.35 --aligner-debug --asr-debug-feed --asr-debug-feed-every 20
