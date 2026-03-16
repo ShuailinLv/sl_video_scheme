@@ -78,6 +78,14 @@ class ProfileStore:
         signal = dict(entry.get("recommended_signal", {}))
         latency = dict(entry.get("recommended_latency", {}))
 
+        # 双层校准 warm start：优先加载稳态基线
+        stable_target_lead_sec = float(entry.get("stable_target_lead_sec", 0.0) or 0.0)
+        startup_target_lead_sec = float(entry.get("startup_target_lead_sec", 0.0) or 0.0)
+        if stable_target_lead_sec > 0.0:
+            latency["stable_target_lead_sec"] = stable_target_lead_sec
+        if startup_target_lead_sec > 0.0:
+            latency["startup_target_lead_sec"] = startup_target_lead_sec
+
         return {
             "control": control,
             "playback": playback,
@@ -184,6 +192,19 @@ class ProfileStore:
         runtime_output_drift_ms = float(lc.get("runtime_output_drift_ms", prev.get("runtime_output_drift_ms", 0.0)))
         runtime_input_drift_ms = float(lc.get("runtime_input_drift_ms", prev.get("runtime_input_drift_ms", 0.0)))
 
+        stable_target_lead_sec = float(
+            lc.get(
+                "stable_target_lead_sec",
+                prev.get("stable_target_lead_sec", 0.35 if bluetooth_mode else 0.15),
+            )
+        )
+        startup_target_lead_sec = float(
+            lc.get(
+                "startup_target_lead_sec",
+                prev.get("startup_target_lead_sec", 0.28 if bluetooth_mode else 0.15),
+            )
+        )
+
         recommended_control = self._derive_recommended_control(
             avg_first_reliable_progress_time_sec=avg_first_reliable,
             avg_startup_false_hold_count=avg_startup_false_hold,
@@ -197,7 +218,10 @@ class ProfileStore:
             bluetooth_mode=bool(bluetooth_mode),
         )
         recommended_playback = {
-            "bluetooth_output_offset_sec": max(0.0, (estimated_output_latency_ms + runtime_output_drift_ms) / 1000.0)
+            "bluetooth_output_offset_sec": max(
+                0.0,
+                (estimated_output_latency_ms + runtime_output_drift_ms) / 1000.0,
+            )
         }
         recommended_signal = self._derive_recommended_signal(
             reliability_tier=str(device_profile.get("reliability_tier", "medium")),
@@ -210,6 +234,8 @@ class ProfileStore:
             "estimated_input_latency_ms": round(estimated_input_latency_ms, 3),
             "runtime_output_drift_ms": round(runtime_output_drift_ms, 3),
             "runtime_input_drift_ms": round(runtime_input_drift_ms, 3),
+            "stable_target_lead_sec": round(stable_target_lead_sec, 3),
+            "startup_target_lead_sec": round(startup_target_lead_sec, 3),
         }
 
         devices[key] = {
@@ -232,6 +258,8 @@ class ProfileStore:
             "estimated_input_latency_ms": estimated_input_latency_ms,
             "runtime_output_drift_ms": runtime_output_drift_ms,
             "runtime_input_drift_ms": runtime_input_drift_ms,
+            "stable_target_lead_sec": stable_target_lead_sec,
+            "startup_target_lead_sec": startup_target_lead_sec,
             "recommended_control": recommended_control,
             "recommended_playback": recommended_playback,
             "recommended_signal": recommended_signal,
@@ -306,6 +334,7 @@ class ProfileStore:
             progress_stale_sec += 0.08
             tracking_quality_seek_min += 0.05
             seek_cooldown_sec += 0.40
+            resume_from_hold_speaking_lead_slack_sec += 0.06
 
         if input_gain_hint == "high":
             tracking_quality_hold_min -= 0.02
@@ -342,16 +371,13 @@ class ProfileStore:
         if reliability_tier == "low":
             min_vad_rms += 0.001
             vad_noise_multiplier += 0.2
-
         if bluetooth_mode:
             min_vad_rms += 0.0005
             vad_noise_multiplier += 0.15
-
         if input_gain_hint == "high":
             min_vad_rms -= 0.001
         elif input_gain_hint == "low":
             min_vad_rms += 0.001
-
         if noise_floor_rms >= 0.004:
             min_vad_rms += 0.001
             vad_noise_multiplier += 0.25
