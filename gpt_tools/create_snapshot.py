@@ -249,7 +249,7 @@ def main():
     project_root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parent.parent
     output_file = Path(args.output).resolve() if os.path.isabs(args.output) else project_root / args.output
 
-    max_file_size_bytes = 10 * 1024 * 1024
+    max_file_size_bytes = 10 * 1024 * 1024*10
 
     hard_exclude_dirs = {
         "__pycache__", ".git", ".idea", ".vscode", "logs", "venv", ".venv", "env",
@@ -280,7 +280,7 @@ def main():
         ".xlsx", ".wav", ".webm", ".mp3", ".ogg", ".log",
         ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".bmp", ".tif",
         ".zip", ".rar", ".7z", ".gz", ".tar", ".bz2",
-        ".pdf", ".doc", ".docx", ".xls", ".ppt", ".pptx",
+        ".pdf", ".doc", ".docx", ".xls", ".ppt", ".pptx", ".jsonl",
         ".db", ".sqlite", ".sqlite3", ".exe", ".dll", ".so", ".a", ".lib", ".o", ".ruff",
         ".ttf", ".woff", ".woff2", ".eot", ".dat", ".cache", ".img", ".iso", ".md", ".txt", ".json"
     }

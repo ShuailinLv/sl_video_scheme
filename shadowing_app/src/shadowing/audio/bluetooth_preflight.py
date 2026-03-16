@@ -7,67 +7,9 @@ from dataclasses import dataclass, field
 import numpy as np
 import sounddevice as sd
 
-
-@dataclass(slots=True)
-class ResolvedDevice:
-    index: int
-    name: str
-    max_input_channels: int
-    max_output_channels: int
-    default_samplerate: float
-    hostapi_name: str
-
-
-@dataclass(slots=True)
-class BluetoothPreflightConfig:
-    input_device: int | str | None
-    output_device: int | str | None
-
-    preferred_input_samplerate: int = 48000
-    preferred_output_samplerate: int = 44100
-
-    duration_sec: float = 4.0
-    warmup_ignore_sec: float = 0.9
-    blocksize: int = 0
-
-    probe_tone_hz: float = 880.0
-    probe_tone_amp: float = 0.05
-
-    min_mean_rms: float = 0.0015
-    min_peak: float = 0.0150
-    min_nonzero_ratio: float = 0.010
-    min_voiced_frame_ratio: float = 0.12
-
-    strong_rms: float = 0.0060
-    strong_peak: float = 0.0200
-    strong_voiced_frame_ratio: float = 0.22
-
-    max_status_events: int = 10
-
-
-@dataclass(slots=True)
-class BluetoothPreflightResult:
-    should_run: bool
-    passed: bool
-    input_device_index: int | None = None
-    input_device_name: str = ""
-    output_device_index: int | None = None
-    output_device_name: str = ""
-    samplerate: int = 0
-
-    mean_rms: float = 0.0
-    max_peak: float = 0.0
-    nonzero_ratio: float = 0.0
-    voiced_frame_ratio: float = 0.0
-
-    tail_mean_rms: float = 0.0
-    tail_max_peak: float = 0.0
-    tail_nonzero_ratio: float = 0.0
-    tail_voiced_frame_ratio: float = 0.0
-
-    status_events: int = 0
-    failure_reason: str = ""
-    notes: list[str] = field(default_factory=list)
+from shadowing.audio.device_profile import (
+    normalize_device_name,
+)
 
 
 _BLUETOOTH_KEYWORDS = (
@@ -95,7 +37,6 @@ def _device_family_key(name: str | None) -> str:
     text = str(name or "").strip().lower()
     if not text:
         return ""
-
     normalized = (
         text.replace("hands-free", "handsfree")
         .replace("hands free", "handsfree")
@@ -106,7 +47,6 @@ def _device_family_key(name: str | None) -> str:
         .replace("-", " ")
         .replace("_", " ")
     )
-
     for token in (
         "zero air",
         "airpods",
@@ -119,8 +59,72 @@ def _device_family_key(name: str | None) -> str:
     ):
         if token in normalized:
             return token
-
     return " ".join(normalized.split())
+
+
+@dataclass(slots=True)
+class ResolvedDevice:
+    index: int
+    name: str
+    normalized_name: str
+    family_key: str
+    max_input_channels: int
+    max_output_channels: int
+    default_samplerate: float
+    hostapi_name: str
+
+
+@dataclass(slots=True)
+class BluetoothPreflightConfig:
+    input_device: int | str | None
+    output_device: int | str | None
+    preferred_input_samplerate: int = 48000
+    preferred_output_samplerate: int = 44100
+    duration_sec: float = 4.0
+    warmup_ignore_sec: float = 0.9
+    blocksize: int = 0
+    probe_tone_hz: float = 880.0
+    probe_tone_amp: float = 0.05
+    min_mean_rms: float = 0.0015
+    min_peak: float = 0.0150
+    min_nonzero_ratio: float = 0.010
+    min_voiced_frame_ratio: float = 0.12
+    strong_rms: float = 0.0060
+    strong_peak: float = 0.0200
+    strong_voiced_frame_ratio: float = 0.22
+    max_status_events: int = 10
+
+
+@dataclass(slots=True)
+class BluetoothPreflightResult:
+    should_run: bool
+    passed: bool
+
+    input_device_index: int | None = None
+    input_device_name: str = ""
+    input_device_family_key: str = ""
+    input_hostapi_name: str = ""
+
+    output_device_index: int | None = None
+    output_device_name: str = ""
+    output_device_family_key: str = ""
+    output_hostapi_name: str = ""
+
+    samplerate: int = 0
+
+    mean_rms: float = 0.0
+    max_peak: float = 0.0
+    nonzero_ratio: float = 0.0
+    voiced_frame_ratio: float = 0.0
+
+    tail_mean_rms: float = 0.0
+    tail_max_peak: float = 0.0
+    tail_nonzero_ratio: float = 0.0
+    tail_voiced_frame_ratio: float = 0.0
+
+    status_events: int = 0
+    failure_reason: str = ""
+    notes: list[str] = field(default_factory=list)
 
 
 def _resolve_hostapi_name(dev: dict) -> str:
@@ -129,9 +133,12 @@ def _resolve_hostapi_name(dev: dict) -> str:
 
 
 def _build_resolved_device(idx: int, dev: dict) -> ResolvedDevice:
+    name = str(dev["name"])
     return ResolvedDevice(
         index=int(idx),
-        name=str(dev["name"]),
+        name=name,
+        normalized_name=normalize_device_name(name),
+        family_key=_device_family_key(name),
         max_input_channels=int(dev["max_input_channels"]),
         max_output_channels=int(dev["max_output_channels"]),
         default_samplerate=float(dev["default_samplerate"]),
@@ -145,7 +152,9 @@ def _resolve_input_device(device: int | str | None) -> ResolvedDevice:
     if isinstance(device, int):
         dev = sd.query_devices(device)
         if int(dev["max_input_channels"]) <= 0:
-            raise RuntimeError(f"Resolved input device is not an input device: idx={device}, name={dev['name']}")
+            raise RuntimeError(
+                f"Resolved input device is not an input device: idx={device}, name={dev['name']}"
+            )
         return _build_resolved_device(int(device), dev)
 
     if device is None:
@@ -154,7 +163,9 @@ def _resolve_input_device(device: int | str | None) -> ResolvedDevice:
             raise RuntimeError("No default input device available for bluetooth preflight.")
         dev = sd.query_devices(int(default_in))
         if int(dev["max_input_channels"]) <= 0:
-            raise RuntimeError(f"Default input device is invalid: idx={default_in}, name={dev['name']}")
+            raise RuntimeError(
+                f"Default input device is invalid: idx={default_in}, name={dev['name']}"
+            )
         return _build_resolved_device(int(default_in), dev)
 
     target = str(device).strip().lower()
@@ -173,7 +184,9 @@ def _resolve_output_device(device: int | str | None) -> ResolvedDevice:
     if isinstance(device, int):
         dev = sd.query_devices(device)
         if int(dev["max_output_channels"]) <= 0:
-            raise RuntimeError(f"Resolved output device is not an output device: idx={device}, name={dev['name']}")
+            raise RuntimeError(
+                f"Resolved output device is not an output device: idx={device}, name={dev['name']}"
+            )
         return _build_resolved_device(int(device), dev)
 
     if device is None:
@@ -182,7 +195,9 @@ def _resolve_output_device(device: int | str | None) -> ResolvedDevice:
             raise RuntimeError("No default output device available for bluetooth preflight.")
         dev = sd.query_devices(int(default_out))
         if int(dev["max_output_channels"]) <= 0:
-            raise RuntimeError(f"Default output device is invalid: idx={default_out}, name={dev['name']}")
+            raise RuntimeError(
+                f"Default output device is invalid: idx={default_out}, name={dev['name']}"
+            )
         return _build_resolved_device(int(default_out), dev)
 
     target = str(device).strip().lower()
@@ -195,7 +210,10 @@ def _resolve_output_device(device: int | str | None) -> ResolvedDevice:
     raise RuntimeError(f"No matching output device found for bluetooth preflight: {device!r}")
 
 
-def should_run_bluetooth_preflight(input_device: int | str | None, output_device: int | str | None) -> bool:
+def should_run_bluetooth_preflight(
+    input_device: int | str | None,
+    output_device: int | str | None,
+) -> bool:
     try:
         input_resolved = _resolve_input_device(input_device)
         output_resolved = _resolve_output_device(output_device)
@@ -207,9 +225,11 @@ def should_run_bluetooth_preflight(input_device: int | str | None, output_device
     if not (input_is_bt and output_is_bt):
         return False
 
-    input_family = _device_family_key(input_resolved.name)
-    output_family = _device_family_key(output_resolved.name)
-    if input_family and output_family and input_family != output_family:
+    if (
+        input_resolved.family_key
+        and output_resolved.family_key
+        and input_resolved.family_key != output_resolved.family_key
+    ):
         return False
 
     return True
@@ -225,14 +245,14 @@ def _pick_duplex_samplerate(
 
     for sr in (
         preferred_input_sr,
+        preferred_output_sr,
         48000,
+        44100,
         32000,
         24000,
         16000,
-        preferred_output_sr,
         int(input_dev.default_samplerate),
         int(output_dev.default_samplerate),
-        44100,
     ):
         if sr > 0 and sr not in candidates:
             candidates.append(int(sr))
@@ -271,7 +291,9 @@ def _safe_max(values: list[float]) -> float:
     return float(np.max(values)) if values else 0.0
 
 
-def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> BluetoothPreflightResult:
+def run_bluetooth_duplex_preflight(
+    config: BluetoothPreflightConfig,
+) -> BluetoothPreflightResult:
     if not should_run_bluetooth_preflight(config.input_device, config.output_device):
         return BluetoothPreflightResult(
             should_run=False,
@@ -293,9 +315,13 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
         should_run=True,
         passed=False,
         input_device_index=input_dev.index,
-        input_device_name=input_dev.name,
+        input_device_name=input_dev.normalized_name,
+        input_device_family_key=input_dev.family_key,
+        input_hostapi_name=input_dev.hostapi_name,
         output_device_index=output_dev.index,
-        output_device_name=output_dev.name,
+        output_device_name=output_dev.normalized_name,
+        output_device_family_key=output_dev.family_key,
+        output_hostapi_name=output_dev.hostapi_name,
         samplerate=samplerate,
     )
 
@@ -317,6 +343,7 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
 
     def callback(indata, outdata, frames, time_info, status) -> None:
         nonlocal status_events, tone_phase
+        _ = time_info
 
         now = time.monotonic()
         elapsed = now - started_at
@@ -344,7 +371,10 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
                 tail_voiced_flags.append(voiced)
 
         t = (np.arange(frames, dtype=np.float32) + tone_phase) / float(samplerate)
-        tone = config.probe_tone_amp * np.sin(2.0 * np.pi * config.probe_tone_hz * t).astype(np.float32, copy=False)
+        tone = config.probe_tone_amp * np.sin(2.0 * np.pi * config.probe_tone_hz * t).astype(
+            np.float32,
+            copy=False,
+        )
         tone_phase += frames
 
         outdata.fill(0.0)
@@ -364,10 +394,6 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
             device=(input_dev.index, output_dev.index),
             latency="low",
         ):
-            print(
-                "[BT-PREFLIGHT] 已进入蓝牙耳机双工预检。"
-                "请在接下来 4 秒内持续说话，同时确认耳机中能听到轻微提示音。"
-            )
             finished = done.wait(timeout=max(1.0, float(config.duration_sec) + 1.5))
             if not finished:
                 result.failure_reason = "bluetooth_duplex_preflight_timeout"
@@ -390,6 +416,7 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
         result.tail_max_peak = _safe_max(tail_peak_values)
         result.tail_nonzero_ratio = _safe_mean(tail_nonzero_ratios)
         result.tail_voiced_frame_ratio = _safe_mean(tail_voiced_flags)
+
         result.status_events = int(status_events)
 
     failure_reasons: list[str] = []
@@ -418,13 +445,11 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
             failure_reasons.append(
                 f"tail_peak_too_low(tail_max_peak={result.tail_max_peak:.6f})"
             )
-
         if result.tail_voiced_frame_ratio < config.min_voiced_frame_ratio:
             failure_reasons.append(
                 "tail_voice_activity_too_low("
                 f"tail_voiced_frame_ratio={result.tail_voiced_frame_ratio:.6f})"
             )
-
         if (
             result.tail_nonzero_ratio < config.min_nonzero_ratio
             and result.tail_mean_rms < config.min_mean_rms

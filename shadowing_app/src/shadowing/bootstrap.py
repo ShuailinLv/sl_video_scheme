@@ -23,8 +23,42 @@ from shadowing.realtime.runtime import RealtimeRuntimeConfig, ShadowingRuntime
 from shadowing.telemetry.event_logger import EventLogger
 
 
+def _normalize_device_context(raw: dict[str, Any] | None, *, capture_backend: str) -> dict[str, Any]:
+    ctx = dict(raw or {})
+    ctx["capture_backend"] = str(capture_backend or "").strip().lower()
+
+    def _int_or(default: int, value: Any) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    def _float_or(default: float, value: Any) -> float:
+        try:
+            out = float(value)
+        except Exception:
+            return float(default)
+        if out != out:
+            return float(default)
+        return float(out)
+
+    ctx["input_sample_rate"] = _int_or(16000, ctx.get("input_sample_rate", 16000))
+    ctx["output_sample_rate"] = _int_or(0, ctx.get("output_sample_rate", 0))
+    ctx["noise_floor_rms"] = _float_or(0.0025, ctx.get("noise_floor_rms", 0.0025))
+    ctx["hostapi_name"] = str(ctx.get("hostapi_name", "") or "").strip()
+    ctx["input_device_name"] = str(ctx.get("input_device_name", "unknown") or "unknown")
+    ctx["output_device_name"] = str(ctx.get("output_device_name", "unknown") or "unknown")
+    ctx["input_device_id"] = str(ctx.get("input_device_id", "") or "").strip()
+    ctx["output_device_id"] = str(ctx.get("output_device_id", "") or "").strip()
+    ctx["bluetooth_mode"] = bool(ctx.get("bluetooth_mode", False))
+    ctx["bluetooth_long_session_mode"] = bool(ctx.get("bluetooth_long_session_mode", False))
+
+    return ctx
+
+
 def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
     lesson_base_dir = str(config.get("lesson_base_dir", "assets/lessons"))
+
     playback_cfg = dict(config.get("playback", {}))
     capture_cfg = dict(config.get("capture", {}))
     asr_cfg = dict(config.get("asr", {}))
@@ -137,14 +171,15 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
     )
 
     audio_behavior_classifier = AudioBehaviorClassifier()
-
     evidence_fuser = EvidenceFuser(
         text_priority_threshold=float(audio_match_cfg.get("text_priority_threshold", 0.72)),
         audio_takeover_threshold=float(audio_match_cfg.get("audio_takeover_threshold", 0.62)),
     )
 
-    enriched_device_context = dict(device_context)
-    enriched_device_context["capture_backend"] = capture_backend
+    enriched_device_context = _normalize_device_context(
+        device_context,
+        capture_backend=capture_backend,
+    )
     enriched_device_context["session_dir"] = str(Path(session_dir).expanduser().resolve())
 
     orchestrator = ShadowingOrchestrator(

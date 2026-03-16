@@ -44,7 +44,6 @@ class BehaviorInterpreter:
         repeat_penalty = tracking.repeat_penalty if tracking is not None else 0.0
         forward_delta = int(candidate_idx) - int(estimated_idx)
 
-        # 1) pause 优先判定：静音足够长且最近没推进
         if (
             silence_run >= self.pause_silence_sec
             and progress_age > min(1.15, self.recent_progress_sec + 0.15)
@@ -52,45 +51,39 @@ class BehaviorInterpreter:
         ):
             return UserReadState.PAUSED
 
-        # 2) lost / reacquiring
         if tracking_mode == TrackingMode.LOST:
-            if signal_speaking or audio_support_strength >= 0.60:
+            if signal_speaking or audio_support_strength >= 0.60 or audio_confidence >= 0.62:
                 return UserReadState.REJOINING
             return UserReadState.LOST
 
         if tracking_mode == TrackingMode.REACQUIRING:
-            if signal_speaking or audio_support_strength >= 0.58:
+            if signal_speaking or audio_support_strength >= 0.58 or audio_confidence >= 0.60:
                 return UserReadState.REJOINING
             return UserReadState.HESITATING
 
-        # 3) repeat
         if (
             repeat_penalty >= self.repeat_penalty_threshold
             and (signal_speaking or audio_support_strength >= 0.58)
         ):
             return UserReadState.REPEATING
 
-        # 4) skip
         if forward_delta >= self.skip_forward_tokens and tracking_quality >= 0.72:
             return UserReadState.SKIPPING
 
-        # 5) recently progressed
         if progress_age <= self.recent_progress_sec:
             if tracking_quality >= 0.60 or audio_support_strength >= 0.64:
                 return UserReadState.FOLLOWING
-            if signal_speaking:
+            if signal_speaking or audio_confidence >= 0.58:
                 return UserReadState.HESITATING
             return UserReadState.WARMING_UP
 
-        # 6) 短暂停顿后重入
         if (
             silence_run <= self.rejoin_signal_sec
-            and (signal_speaking or audio_support_strength >= 0.60)
+            and (signal_speaking or audio_support_strength >= 0.60 or audio_confidence >= 0.60)
             and tracking_quality >= 0.36
         ):
             return UserReadState.REJOINING
 
-        # 7) 跟读中但文本证据较弱
         if (
             (signal_speaking and tracking_quality >= 0.42)
             or audio_support_strength >= 0.64
@@ -98,8 +91,7 @@ class BehaviorInterpreter:
         ):
             return UserReadState.HESITATING
 
-        # 8) warming up
-        if signal_weak_speaking or audio_support_strength >= 0.46:
+        if signal_weak_speaking or audio_support_strength >= 0.46 or audio_confidence >= 0.48:
             return UserReadState.WARMING_UP
 
         return UserReadState.NOT_STARTED

@@ -39,14 +39,13 @@ def list_input_devices() -> list[InputDeviceInfo]:
 def print_input_devices() -> None:
     devices = list_input_devices()
     if not devices:
-        print("No input devices found.")
         return
     for d in devices:
         print(
             f"[{d.index}] {d.name} | "
-            f"in={d.max_input_channels} | "
-            f"default_sr={int(d.default_samplerate)} | "
-            f"hostapi={d.hostapi_name}"
+            f"hostapi={d.hostapi_name} | "
+            f"max_input_channels={d.max_input_channels} | "
+            f"default_sr={d.default_samplerate}"
         )
 
 
@@ -131,5 +130,4 @@ def pick_working_input_config(
                 "channels": int(channels),
                 "dtype": str(dtype),
             }
-
     return None

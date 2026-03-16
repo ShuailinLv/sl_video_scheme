@@ -1,31 +1,96 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from shadowing.audio.device_profile import normalize_device_name
+
 
 class ProfileStore:
+    _DEFAULT_DATA = {
+        "schema_version": 2,
+        "devices": {},
+    }
+
     def __init__(self, profile_path: str) -> None:
         self.profile_path = Path(profile_path)
         self.profile_path.parent.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> dict[str, Any]:
         if not self.profile_path.exists():
-            return {"devices": {}}
+            return dict(self._DEFAULT_DATA)
+
         try:
-            return json.loads(self.profile_path.read_text(encoding="utf-8"))
+            raw = json.loads(self.profile_path.read_text(encoding="utf-8"))
         except Exception:
-            return {"devices": {}}
+            return dict(self._DEFAULT_DATA)
+
+        if not isinstance(raw, dict):
+            return dict(self._DEFAULT_DATA)
+
+        devices = raw.get("devices", {})
+        if not isinstance(devices, dict):
+            devices = {}
+
+        schema_version = raw.get("schema_version", 1)
+        try:
+            schema_version = int(schema_version)
+        except Exception:
+            schema_version = 1
+
+        return {
+            "schema_version": schema_version,
+            "devices": devices,
+        }
 
     def save(self, data: dict[str, Any]) -> None:
+        payload = dict(data or {})
+        devices = payload.get("devices", {})
+        if not isinstance(devices, dict):
+            devices = {}
+
+        payload["schema_version"] = 2
+        payload["devices"] = devices
+
         self.profile_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
 
-    def _device_key(
+    def _normalized_scalar_text(self, value: Any, default: str = "unknown") -> str:
+        text = str(value or "").strip().lower()
+        return text if text else default
+
+    def _normalized_device_id(self, value: Any) -> str:
+        text = normalize_device_name(value)
+        return text if text else "unknown"
+
+    def _canonical_device_key(
+        self,
+        *,
+        input_device_id: str,
+        output_device_id: str,
+        hostapi_name: str = "",
+        capture_backend: str = "",
+        duplex_sample_rate: int | None = None,
+        reliability_tier: str = "",
+        bluetooth_mode: bool = False,
+    ) -> str:
+        return " | ".join(
+            [
+                f"in={self._normalized_device_id(input_device_id)}",
+                f"out={self._normalized_device_id(output_device_id)}",
+                f"hostapi={self._normalized_scalar_text(hostapi_name)}",
+                f"backend={self._normalized_scalar_text(capture_backend)}",
+                f"duplex_sr={max(0, int(duplex_sample_rate or 0))}",
+                f"risk={self._normalized_scalar_text(reliability_tier)}",
+                f"bt={int(bool(bluetooth_mode))}",
+            ]
+        )
+
+    def _legacy_device_key(
         self,
         *,
         input_device_id: str,
@@ -48,6 +113,54 @@ class ProfileStore:
             ]
         )
 
+    def _candidate_keys(
+        self,
+        *,
+        input_device_id: str,
+        output_device_id: str,
+        hostapi_name: str = "",
+        capture_backend: str = "",
+        duplex_sample_rate: int | None = None,
+        reliability_tier: str = "",
+        bluetooth_mode: bool = False,
+    ) -> list[str]:
+        canonical = self._canonical_device_key(
+            input_device_id=input_device_id,
+            output_device_id=output_device_id,
+            hostapi_name=hostapi_name,
+            capture_backend=capture_backend,
+            duplex_sample_rate=duplex_sample_rate,
+            reliability_tier=reliability_tier,
+            bluetooth_mode=bluetooth_mode,
+        )
+        legacy = self._legacy_device_key(
+            input_device_id=input_device_id,
+            output_device_id=output_device_id,
+            hostapi_name=hostapi_name,
+            capture_backend=capture_backend,
+            duplex_sample_rate=duplex_sample_rate,
+            reliability_tier=reliability_tier,
+            bluetooth_mode=bluetooth_mode,
+        )
+        if canonical == legacy:
+            return [canonical]
+        return [canonical, legacy]
+
+    def _to_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            out = float(value)
+        except Exception:
+            return float(default)
+        if out != out:
+            return float(default)
+        return float(out)
+
+    def _to_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
     def load_warm_start(
         self,
         *,
@@ -60,7 +173,13 @@ class ProfileStore:
         bluetooth_mode: bool = False,
     ) -> dict[str, Any]:
         data = self.load()
-        key = self._device_key(
+        devices = data.get("devices", {})
+        if not isinstance(devices, dict):
+            return {}
+
+        key = ""
+        entry: dict[str, Any] | None = None
+        for candidate_key in self._candidate_keys(
             input_device_id=input_device_id,
             output_device_id=output_device_id,
             hostapi_name=hostapi_name,
@@ -68,8 +187,13 @@ class ProfileStore:
             duplex_sample_rate=duplex_sample_rate,
             reliability_tier=reliability_tier,
             bluetooth_mode=bluetooth_mode,
-        )
-        entry = data.get("devices", {}).get(key)
+        ):
+            maybe = devices.get(candidate_key)
+            if isinstance(maybe, dict):
+                key = candidate_key
+                entry = maybe
+                break
+
         if not isinstance(entry, dict):
             return {}
 
@@ -78,9 +202,9 @@ class ProfileStore:
         signal = dict(entry.get("recommended_signal", {}))
         latency = dict(entry.get("recommended_latency", {}))
 
-        # 双层校准 warm start：优先加载稳态基线
-        stable_target_lead_sec = float(entry.get("stable_target_lead_sec", 0.0) or 0.0)
-        startup_target_lead_sec = float(entry.get("startup_target_lead_sec", 0.0) or 0.0)
+        stable_target_lead_sec = self._to_float(entry.get("stable_target_lead_sec", 0.0), 0.0)
+        startup_target_lead_sec = self._to_float(entry.get("startup_target_lead_sec", 0.0), 0.0)
+
         if stable_target_lead_sec > 0.0:
             latency["stable_target_lead_sec"] = stable_target_lead_sec
         if startup_target_lead_sec > 0.0:
@@ -92,8 +216,8 @@ class ProfileStore:
             "signal": signal,
             "latency": latency,
             "meta": {
-                "sessions": int(entry.get("sessions", 0)),
-                "last_updated_at": entry.get("last_updated_at", ""),
+                "sessions": self._to_int(entry.get("sessions", 0), 0),
+                "last_updated_at": str(entry.get("last_updated_at", "")),
                 "key": key,
             },
         }
@@ -113,19 +237,34 @@ class ProfileStore:
     ) -> None:
         data = self.load()
         devices = data.setdefault("devices", {})
+        if not isinstance(devices, dict):
+            devices = {}
+            data["devices"] = devices
 
-        key = self._device_key(
+        reliability_tier = str(device_profile.get("reliability_tier", "medium"))
+
+        candidate_keys = self._candidate_keys(
             input_device_id=input_device_id,
             output_device_id=output_device_id,
             hostapi_name=hostapi_name,
             capture_backend=capture_backend,
             duplex_sample_rate=duplex_sample_rate,
-            reliability_tier=str(device_profile.get("reliability_tier", "medium")),
+            reliability_tier=reliability_tier,
             bluetooth_mode=bluetooth_mode,
         )
+        key = candidate_keys[0]
 
-        prev = devices.get(key, {})
-        sessions = int(prev.get("sessions", 0))
+        prev: dict[str, Any] = {}
+        matched_legacy_key: str | None = None
+        for candidate_key in candidate_keys:
+            maybe = devices.get(candidate_key)
+            if isinstance(maybe, dict):
+                prev = maybe
+                if candidate_key != key:
+                    matched_legacy_key = candidate_key
+                break
+
+        sessions = self._to_int(prev.get("sessions", 0), 0)
         new_sessions = sessions + 1
 
         def ema(prev_value: float, new_value: float, n: int) -> float:
@@ -135,74 +274,86 @@ class ProfileStore:
             return (1.0 - alpha) * float(prev_value) + alpha * float(new_value)
 
         avg_first_reliable = ema(
-            float(prev.get("avg_first_reliable_progress_time_sec", 3.6)),
-            float(metrics.get("first_reliable_progress_time_sec") or 6.0),
+            self._to_float(prev.get("avg_first_reliable_progress_time_sec", 3.6), 3.6),
+            self._to_float(metrics.get("first_reliable_progress_time_sec"), 6.0),
             new_sessions,
         )
         avg_startup_false_hold = ema(
-            float(prev.get("avg_startup_false_hold_count", 0.0)),
-            float(metrics.get("startup_false_hold_count", 0)),
+            self._to_float(prev.get("avg_startup_false_hold_count", 0.0), 0.0),
+            self._to_float(metrics.get("startup_false_hold_count", 0), 0.0),
             new_sessions,
         )
         avg_hold_count = ema(
-            float(prev.get("avg_hold_count", 0.0)),
-            float(metrics.get("hold_count", 0)),
+            self._to_float(prev.get("avg_hold_count", 0.0), 0.0),
+            self._to_float(metrics.get("hold_count", 0), 0.0),
             new_sessions,
         )
         avg_lost_count = ema(
-            float(prev.get("avg_lost_count", 0.0)),
-            float(metrics.get("lost_count", 0)),
+            self._to_float(prev.get("avg_lost_count", 0.0), 0.0),
+            self._to_float(metrics.get("lost_count", 0), 0.0),
             new_sessions,
         )
         avg_tracking_quality = ema(
-            float(prev.get("avg_mean_tracking_quality", 0.55)),
-            float(metrics.get("mean_tracking_quality", 0.0)),
+            self._to_float(prev.get("avg_mean_tracking_quality", 0.55), 0.55),
+            self._to_float(metrics.get("mean_tracking_quality", 0.0), 0.0),
             new_sessions,
         )
         avg_reacquire_count = ema(
-            float(prev.get("avg_reacquire_count", 0.0)),
-            float(metrics.get("reacquire_count", 0)),
+            self._to_float(prev.get("avg_reacquire_count", 0.0), 0.0),
+            self._to_float(metrics.get("reacquire_count", 0), 0.0),
             new_sessions,
         )
         avg_seek_count = ema(
-            float(prev.get("avg_seek_count", 0.0)),
-            float(metrics.get("seek_count", 0)),
+            self._to_float(prev.get("avg_seek_count", 0.0), 0.0),
+            self._to_float(metrics.get("seek_count", 0), 0.0),
             new_sessions,
         )
 
         lc = latency_calibration or {}
-        estimated_output_latency_ms = float(
+
+        estimated_output_latency_ms = self._to_float(
             lc.get(
                 "estimated_output_latency_ms",
                 prev.get(
                     "estimated_output_latency_ms",
-                    float(device_profile.get("estimated_output_latency_ms", 180.0)),
+                    device_profile.get("estimated_output_latency_ms", 180.0),
                 ),
-            )
+            ),
+            180.0,
         )
-        estimated_input_latency_ms = float(
+        estimated_input_latency_ms = self._to_float(
             lc.get(
                 "estimated_input_latency_ms",
                 prev.get(
                     "estimated_input_latency_ms",
-                    float(device_profile.get("estimated_input_latency_ms", 50.0)),
+                    device_profile.get("estimated_input_latency_ms", 50.0),
                 ),
-            )
+            ),
+            50.0,
         )
-        runtime_output_drift_ms = float(lc.get("runtime_output_drift_ms", prev.get("runtime_output_drift_ms", 0.0)))
-        runtime_input_drift_ms = float(lc.get("runtime_input_drift_ms", prev.get("runtime_input_drift_ms", 0.0)))
 
-        stable_target_lead_sec = float(
+        runtime_output_drift_ms = self._to_float(
+            lc.get("runtime_output_drift_ms", prev.get("runtime_output_drift_ms", 0.0)),
+            0.0,
+        )
+        runtime_input_drift_ms = self._to_float(
+            lc.get("runtime_input_drift_ms", prev.get("runtime_input_drift_ms", 0.0)),
+            0.0,
+        )
+
+        stable_target_lead_sec = self._to_float(
             lc.get(
                 "stable_target_lead_sec",
                 prev.get("stable_target_lead_sec", 0.35 if bluetooth_mode else 0.15),
-            )
+            ),
+            0.35 if bluetooth_mode else 0.15,
         )
-        startup_target_lead_sec = float(
+        startup_target_lead_sec = self._to_float(
             lc.get(
                 "startup_target_lead_sec",
                 prev.get("startup_target_lead_sec", 0.28 if bluetooth_mode else 0.15),
-            )
+            ),
+            0.28 if bluetooth_mode else 0.15,
         )
 
         recommended_control = self._derive_recommended_control(
@@ -213,22 +364,25 @@ class ProfileStore:
             avg_mean_tracking_quality=avg_tracking_quality,
             avg_reacquire_count=avg_reacquire_count,
             avg_seek_count=avg_seek_count,
-            reliability_tier=str(device_profile.get("reliability_tier", "medium")),
+            reliability_tier=reliability_tier,
             input_gain_hint=str(device_profile.get("input_gain_hint", "normal")),
             bluetooth_mode=bool(bluetooth_mode),
         )
+
         recommended_playback = {
             "bluetooth_output_offset_sec": max(
                 0.0,
                 (estimated_output_latency_ms + runtime_output_drift_ms) / 1000.0,
             )
         }
+
         recommended_signal = self._derive_recommended_signal(
-            reliability_tier=str(device_profile.get("reliability_tier", "medium")),
+            reliability_tier=reliability_tier,
             input_gain_hint=str(device_profile.get("input_gain_hint", "normal")),
-            noise_floor_rms=float(device_profile.get("noise_floor_rms", 0.0025)),
+            noise_floor_rms=self._to_float(device_profile.get("noise_floor_rms", 0.0025), 0.0025),
             bluetooth_mode=bool(bluetooth_mode),
         )
+
         recommended_latency = {
             "estimated_output_latency_ms": round(estimated_output_latency_ms, 3),
             "estimated_input_latency_ms": round(estimated_input_latency_ms, 3),
@@ -238,15 +392,19 @@ class ProfileStore:
             "startup_target_lead_sec": round(startup_target_lead_sec, 3),
         }
 
+        normalized_input_device_id = self._normalized_device_id(input_device_id)
+        normalized_output_device_id = self._normalized_device_id(output_device_id)
+
         devices[key] = {
+            "schema_version": 2,
             "sessions": new_sessions,
-            "input_device_id": input_device_id,
-            "output_device_id": output_device_id,
-            "hostapi_name": hostapi_name,
-            "capture_backend": capture_backend,
-            "duplex_sample_rate": int(duplex_sample_rate or 0),
+            "input_device_id": normalized_input_device_id,
+            "output_device_id": normalized_output_device_id,
+            "hostapi_name": self._normalized_scalar_text(hostapi_name),
+            "capture_backend": self._normalized_scalar_text(capture_backend),
+            "duplex_sample_rate": max(0, int(duplex_sample_rate or 0)),
             "bluetooth_mode": bool(bluetooth_mode),
-            "device_profile": device_profile,
+            "device_profile": dict(device_profile),
             "avg_first_reliable_progress_time_sec": avg_first_reliable,
             "avg_startup_false_hold_count": avg_startup_false_hold,
             "avg_hold_count": avg_hold_count,
@@ -264,8 +422,15 @@ class ProfileStore:
             "recommended_playback": recommended_playback,
             "recommended_signal": recommended_signal,
             "recommended_latency": recommended_latency,
-            "last_updated_at": datetime.now().isoformat(timespec="seconds"),
+            "last_updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
+
+        if matched_legacy_key is not None and matched_legacy_key in devices and matched_legacy_key != key:
+            try:
+                del devices[matched_legacy_key]
+            except Exception:
+                pass
+
         self.save(data)
 
     def _derive_recommended_control(
@@ -371,13 +536,16 @@ class ProfileStore:
         if reliability_tier == "low":
             min_vad_rms += 0.001
             vad_noise_multiplier += 0.2
+
         if bluetooth_mode:
             min_vad_rms += 0.0005
             vad_noise_multiplier += 0.15
+
         if input_gain_hint == "high":
             min_vad_rms -= 0.001
         elif input_gain_hint == "low":
             min_vad_rms += 0.001
+
         if noise_floor_rms >= 0.004:
             min_vad_rms += 0.001
             vad_noise_multiplier += 0.25

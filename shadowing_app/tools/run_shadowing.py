@@ -14,6 +14,7 @@ from shadowing.audio.bluetooth_preflight import (
     run_bluetooth_duplex_preflight,
     should_run_bluetooth_preflight,
 )
+from shadowing.audio.device_profile import normalize_device_id
 from shadowing.bootstrap import build_runtime
 from shadowing.llm.qwen_hotwords import extract_hotwords_with_qwen
 from shadowing.realtime.capture.device_utils import pick_working_input_config
@@ -59,6 +60,7 @@ def collect_sherpa_paths() -> dict:
 def validate_sherpa_paths(paths: dict) -> None:
     missing_keys: list[str] = []
     missing_files: list[str] = []
+
     env_map = {
         "tokens": "SHERPA_TOKENS",
         "encoder": "SHERPA_ENCODER",
@@ -105,46 +107,116 @@ def _parse_output_device_arg(raw_value: str | None) -> int | str | None:
     return raw
 
 
-def _resolve_output_device_name(device_value: int | str | None) -> str:
+def _query_input_device_info(device_value: int | str | None) -> dict[str, object]:
     devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+
+    if device_value is None:
+        default_in, _ = sd.default.device
+        if default_in is None or int(default_in) < 0:
+            return {
+                "index": None,
+                "name": "unknown",
+                "hostapi_name": "",
+                "device_id": "",
+            }
+        device_value = int(default_in)
+
+    if isinstance(device_value, int):
+        dev = sd.query_devices(int(device_value))
+        hostapi_name = str(hostapis[int(dev["hostapi"])]["name"])
+        name = str(dev["name"])
+        return {
+            "index": int(device_value),
+            "name": name,
+            "hostapi_name": hostapi_name,
+            "device_id": normalize_device_id(
+                device_name=name,
+                hostapi_name=hostapi_name,
+                device_index=int(device_value),
+            ),
+        }
+
+    target = str(device_value).strip().lower()
+    for idx, dev in enumerate(devices):
+        if int(dev["max_input_channels"]) <= 0:
+            continue
+        if target in str(dev["name"]).lower():
+            hostapi_name = str(hostapis[int(dev["hostapi"])]["name"])
+            name = str(dev["name"])
+            return {
+                "index": int(idx),
+                "name": name,
+                "hostapi_name": hostapi_name,
+                "device_id": normalize_device_id(
+                    device_name=name,
+                    hostapi_name=hostapi_name,
+                    device_index=int(idx),
+                ),
+            }
+
+    return {
+        "index": None,
+        "name": str(device_value),
+        "hostapi_name": "",
+        "device_id": normalize_device_id(device_name=str(device_value), hostapi_name=""),
+    }
+
+
+def _query_output_device_info(device_value: int | str | None) -> dict[str, object]:
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
 
     if device_value is None:
         _, default_out = sd.default.device
         if default_out is None or int(default_out) < 0:
-            return "unknown"
-        return str(sd.query_devices(int(default_out))["name"])
+            return {
+                "index": None,
+                "name": "unknown",
+                "hostapi_name": "",
+                "device_id": "",
+            }
+        device_value = int(default_out)
 
     if isinstance(device_value, int):
-        return str(sd.query_devices(int(device_value))["name"])
+        dev = sd.query_devices(int(device_value))
+        hostapi_name = str(hostapis[int(dev["hostapi"])]["name"])
+        name = str(dev["name"])
+        return {
+            "index": int(device_value),
+            "name": name,
+            "hostapi_name": hostapi_name,
+            "device_id": normalize_device_id(
+                device_name=name,
+                hostapi_name=hostapi_name,
+                device_index=int(device_value),
+            ),
+        }
 
     target = str(device_value).strip().lower()
-    for dev in devices:
+    for idx, dev in enumerate(devices):
         if int(dev["max_output_channels"]) <= 0:
             continue
         if target in str(dev["name"]).lower():
-            return str(dev["name"])
+            hostapi_name = str(hostapis[int(dev["hostapi"])]["name"])
+            name = str(dev["name"])
+            return {
+                "index": int(idx),
+                "name": name,
+                "hostapi_name": hostapi_name,
+                "device_id": normalize_device_id(
+                    device_name=name,
+                    hostapi_name=hostapi_name,
+                    device_index=int(idx),
+                ),
+            }
 
-    return str(device_value)
-
-
-def _resolve_input_device_name(device_value: int | str | None) -> str:
-    if device_value is None:
-        default_in, _ = sd.default.device
-        if default_in is None or int(default_in) < 0:
-            return "unknown"
-        return str(sd.query_devices(int(default_in))["name"])
-
-    if isinstance(device_value, int):
-        return str(sd.query_devices(device_value)["name"])
-
-    target = str(device_value).strip().lower()
-    for _, dev in enumerate(sd.query_devices()):
-        if int(dev["max_input_channels"]) <= 0:
-            continue
-        if target in str(dev["name"]).lower():
-            return str(dev["name"])
-
-    return str(device_value)
+    return {
+        "index": None,
+        "name": str(device_value),
+        "hostapi_name": "",
+        "device_id": normalize_device_id(device_name=str(device_value), hostapi_name=""),
+    }
 
 
 def _run_bluetooth_preflight_or_fail(
@@ -155,16 +227,16 @@ def _run_bluetooth_preflight_or_fail(
     playback_sample_rate: int,
     preflight_duration_sec: float,
     skip_bluetooth_preflight: bool,
-) -> tuple[int | str | None, int | str | None]:
+) -> tuple[int | str | None, int | str | None, dict[str, object]]:
     if skip_bluetooth_preflight:
-        return input_device, output_device
+        return input_device, output_device, {"ran": False}
 
     should_run = should_run_bluetooth_preflight(
         input_device=input_device,
         output_device=output_device,
     )
     if not should_run:
-        return input_device, output_device
+        return input_device, output_device, {"ran": False}
 
     result = run_bluetooth_duplex_preflight(
         BluetoothPreflightConfig(
@@ -186,7 +258,20 @@ def _run_bluetooth_preflight_or_fail(
             f"{notes}"
         )
 
-    return result.input_device_index, result.output_device_index
+    return (
+        result.input_device_index,
+        result.output_device_index,
+        {
+            "ran": True,
+            "input_device_name": result.input_device_name,
+            "output_device_name": result.output_device_name,
+            "input_hostapi_name": result.input_hostapi_name,
+            "output_hostapi_name": result.output_hostapi_name,
+            "input_family_key": result.input_device_family_key,
+            "output_family_key": result.output_device_family_key,
+            "samplerate": result.samplerate,
+        },
+    )
 
 
 def _normalize_for_hotwords(text: str) -> str:
@@ -241,10 +326,8 @@ def _score_hotword(term: str, whole_sentence: str) -> float:
 
     if any(k in term for k in ["华为", "座舱", "车机", "微信", "周杰伦", "支付宝", "PPT", "bug"]):
         score += 2.0
-
     if any(k in term for k in ["技术小组", "智能座舱", "原型车", "红尾灯", "语音助手", "晚高峰"]):
         score += 2.0
-
     if re.search(r"\d", term):
         score += 0.8
 
@@ -360,8 +443,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile-path", type=str, default="runtime/device_profiles.json")
     parser.add_argument("--session-dir", type=str, default="runtime/latest_session")
     parser.add_argument("--event-logging", action="store_true")
-    parser.add_argument("--startup-grace-sec", type=float, default=2.8)
-    parser.add_argument("--low-confidence-hold-sec", type=float, default=1.8)
+    parser.add_argument("--startup-grace-sec", type=float, default=3.2)
+    parser.add_argument("--low-confidence-hold-sec", type=float, default=2.2)
     parser.add_argument("--hotwords", type=str, default="")
     parser.add_argument("--hotwords-score", type=float, default=1.8)
     parser.add_argument("--disable-auto-hotwords", action="store_true")
@@ -405,8 +488,8 @@ def main() -> None:
     lesson_id = slugify_filename_stem(text_path.stem)
     lesson_base_dir = Path(args.lesson_base_dir).resolve()
     lesson_dir = lesson_base_dir / lesson_id
-
     validate_lesson_assets(lesson_dir)
+
     manifest = load_manifest(lesson_dir)
     playback_sample_rate = int(manifest["sample_rate_out"])
 
@@ -436,7 +519,7 @@ def main() -> None:
     if args.asr == "sherpa":
         validate_sherpa_paths(sherpa_paths)
 
-    effective_input_device, effective_output_device = _run_bluetooth_preflight_or_fail(
+    effective_input_device, effective_output_device, preflight_meta = _run_bluetooth_preflight_or_fail(
         input_device=effective_input_device,
         output_device=parsed_output_device,
         input_samplerate=effective_input_samplerate,
@@ -445,8 +528,34 @@ def main() -> None:
         skip_bluetooth_preflight=bool(args.skip_bluetooth_preflight),
     )
 
-    input_device_name = _resolve_input_device_name(effective_input_device)
-    output_device_name = _resolve_output_device_name(effective_output_device)
+    input_info = _query_input_device_info(effective_input_device)
+    output_info = _query_output_device_info(effective_output_device)
+
+    if bool(preflight_meta.get("ran", False)):
+        if str(preflight_meta.get("input_device_name", "")).strip():
+            input_info["name"] = str(preflight_meta["input_device_name"])
+        if str(preflight_meta.get("output_device_name", "")).strip():
+            output_info["name"] = str(preflight_meta["output_device_name"])
+
+        preflight_hostapi = str(preflight_meta.get("input_hostapi_name", "")).strip()
+        if preflight_hostapi:
+            input_info["hostapi_name"] = preflight_hostapi
+            if not str(output_info.get("hostapi_name", "")).strip():
+                output_info["hostapi_name"] = preflight_hostapi
+
+    input_device_name = str(input_info.get("name", "unknown"))
+    output_device_name = str(output_info.get("name", "unknown"))
+    hostapi_name = str(input_info.get("hostapi_name", "") or output_info.get("hostapi_name", "") or "").strip()
+
+    input_device_id = str(input_info.get("device_id", "")).strip()
+    output_device_id = str(output_info.get("device_id", "")).strip()
+
+    bluetooth_mode = bool(
+        should_run_bluetooth_preflight(
+            input_device=effective_input_device,
+            output_device=effective_output_device,
+        )
+    )
 
     auto_hotwords: list[str] = []
     if not args.disable_auto_hotwords and args.hotwords_source != "none":
@@ -482,10 +591,8 @@ def main() -> None:
     hotwords_str = "\n".join(merged_hotwords)
 
     if args.print_hotwords and merged_hotwords:
-        print("=== Hotwords ===")
         for term in merged_hotwords:
             print(term)
-        print("=== /Hotwords ===")
 
     runtime = build_runtime(
         {
@@ -546,38 +653,38 @@ def main() -> None:
                 "debug": bool(args.aligner_debug),
             },
             "control": {
-                "target_lead_sec": 0.15,
-                "hold_if_lead_sec": 0.90,
-                "resume_if_lead_sec": 0.28,
-                "seek_if_lag_sec": -1.80,
-                "min_confidence": 0.72,
-                "seek_cooldown_sec": 1.20,
-                "gain_following": 0.55,
-                "gain_transition": 0.80,
-                "gain_soft_duck": 0.42,
+                "target_lead_sec": 0.18,
+                "hold_if_lead_sec": 1.05,
+                "resume_if_lead_sec": 0.36,
+                "seek_if_lag_sec": -2.60,
+                "min_confidence": 0.70,
+                "seek_cooldown_sec": 2.20,
+                "gain_following": 0.52,
+                "gain_transition": 0.72,
+                "gain_soft_duck": 0.36,
                 "startup_grace_sec": float(args.startup_grace_sec),
                 "low_confidence_hold_sec": float(args.low_confidence_hold_sec),
-                "guide_play_sec": 3.00,
-                "no_progress_hold_min_play_sec": 5.20,
-                "progress_stale_sec": 1.35,
-                "hold_trend_sec": 0.95,
-                "tracking_quality_hold_min": 0.62,
-                "tracking_quality_seek_min": 0.80,
-                "resume_from_hold_speaking_lead_slack_sec": 0.62,
+                "guide_play_sec": 3.20,
+                "no_progress_hold_min_play_sec": 5.80,
+                "progress_stale_sec": 1.45,
+                "hold_trend_sec": 1.00,
+                "tracking_quality_hold_min": 0.60,
+                "tracking_quality_seek_min": 0.84,
+                "resume_from_hold_speaking_lead_slack_sec": 0.72,
                 "disable_seek": False,
-                "bluetooth_long_session_target_lead_sec": 0.35,
-                "bluetooth_long_session_hold_if_lead_sec": 1.20,
-                "bluetooth_long_session_resume_if_lead_sec": 0.22,
-                "bluetooth_long_session_seek_if_lag_sec": -2.80,
-                "bluetooth_long_session_seek_cooldown_sec": 2.60,
-                "bluetooth_long_session_progress_stale_sec": 1.45,
-                "bluetooth_long_session_hold_trend_sec": 1.00,
-                "bluetooth_long_session_tracking_quality_hold_min": 0.64,
-                "bluetooth_long_session_tracking_quality_seek_min": 0.82,
-                "bluetooth_long_session_resume_from_hold_speaking_lead_slack_sec": 0.62,
-                "bluetooth_long_session_gain_following": 0.52,
-                "bluetooth_long_session_gain_transition": 0.72,
-                "bluetooth_long_session_gain_soft_duck": 0.36,
+                "bluetooth_long_session_target_lead_sec": 0.38,
+                "bluetooth_long_session_hold_if_lead_sec": 1.35,
+                "bluetooth_long_session_resume_if_lead_sec": 0.30,
+                "bluetooth_long_session_seek_if_lag_sec": -3.20,
+                "bluetooth_long_session_seek_cooldown_sec": 3.20,
+                "bluetooth_long_session_progress_stale_sec": 1.75,
+                "bluetooth_long_session_hold_trend_sec": 1.15,
+                "bluetooth_long_session_tracking_quality_hold_min": 0.58,
+                "bluetooth_long_session_tracking_quality_seek_min": 0.88,
+                "bluetooth_long_session_resume_from_hold_speaking_lead_slack_sec": 0.82,
+                "bluetooth_long_session_gain_following": 0.50,
+                "bluetooth_long_session_gain_transition": 0.66,
+                "bluetooth_long_session_gain_soft_duck": 0.32,
             },
             "runtime": {
                 "audio_queue_maxsize": 150,
@@ -598,9 +705,15 @@ def main() -> None:
             "device_context": {
                 "input_device_name": input_device_name,
                 "output_device_name": output_device_name,
-                "input_sample_rate": effective_input_samplerate,
+                "input_device_id": input_device_id,
+                "output_device_id": output_device_id,
+                "hostapi_name": hostapi_name,
+                "input_sample_rate": int(effective_input_samplerate),
+                "output_sample_rate": int(playback_sample_rate),
                 "noise_floor_rms": 0.0025,
+                "bluetooth_mode": bluetooth_mode,
                 "bluetooth_long_session_mode": bool(args.force_bluetooth_long_session_mode),
+                "preflight_ran": bool(preflight_meta.get("ran", False)),
             },
             "debug": {
                 "enabled": False,

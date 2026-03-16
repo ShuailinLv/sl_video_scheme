@@ -3,34 +3,84 @@
 自动生成。已移除 Python 注释、docstring、print 和空行。
 
 ---
-### shadowing_app/runtime/latest_session/events.jsonl (Skipped Large File)
-
----
 ### 文件: `shadowing_app/src/shadowing/adaptation/profile_store.py`
 
 ```python
 from __future__ import annotations
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from shadowing.audio.device_profile import normalize_device_name
 class ProfileStore:
+    _DEFAULT_DATA = {
+        "schema_version": 2,
+        "devices": {},
+    }
     def __init__(self, profile_path: str) -> None:
         self.profile_path = Path(profile_path)
         self.profile_path.parent.mkdir(parents=True, exist_ok=True)
     def load(self) -> dict[str, Any]:
         if not self.profile_path.exists():
-            return {"devices": {}}
+            return dict(self._DEFAULT_DATA)
         try:
-            return json.loads(self.profile_path.read_text(encoding="utf-8"))
+            raw = json.loads(self.profile_path.read_text(encoding="utf-8"))
         except Exception:
-            return {"devices": {}}
+            return dict(self._DEFAULT_DATA)
+        if not isinstance(raw, dict):
+            return dict(self._DEFAULT_DATA)
+        devices = raw.get("devices", {})
+        if not isinstance(devices, dict):
+            devices = {}
+        schema_version = raw.get("schema_version", 1)
+        try:
+            schema_version = int(schema_version)
+        except Exception:
+            schema_version = 1
+        return {
+            "schema_version": schema_version,
+            "devices": devices,
+        }
     def save(self, data: dict[str, Any]) -> None:
+        payload = dict(data or {})
+        devices = payload.get("devices", {})
+        if not isinstance(devices, dict):
+            devices = {}
+        payload["schema_version"] = 2
+        payload["devices"] = devices
         self.profile_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-    def _device_key(
+    def _normalized_scalar_text(self, value: Any, default: str = "unknown") -> str:
+        text = str(value or "").strip().lower()
+        return text if text else default
+    def _normalized_device_id(self, value: Any) -> str:
+        text = normalize_device_name(value)
+        return text if text else "unknown"
+    def _canonical_device_key(
+        self,
+        *,
+        input_device_id: str,
+        output_device_id: str,
+        hostapi_name: str = "",
+        capture_backend: str = "",
+        duplex_sample_rate: int | None = None,
+        reliability_tier: str = "",
+        bluetooth_mode: bool = False,
+    ) -> str:
+        return " | ".join(
+            [
+                f"in={self._normalized_device_id(input_device_id)}",
+                f"out={self._normalized_device_id(output_device_id)}",
+                f"hostapi={self._normalized_scalar_text(hostapi_name)}",
+                f"backend={self._normalized_scalar_text(capture_backend)}",
+                f"duplex_sr={max(0, int(duplex_sample_rate or 0))}",
+                f"risk={self._normalized_scalar_text(reliability_tier)}",
+                f"bt={int(bool(bluetooth_mode))}",
+            ]
+        )
+    def _legacy_device_key(
         self,
         *,
         input_device_id: str,
@@ -52,6 +102,51 @@ class ProfileStore:
                 f"bt={int(bool(bluetooth_mode))}",
             ]
         )
+    def _candidate_keys(
+        self,
+        *,
+        input_device_id: str,
+        output_device_id: str,
+        hostapi_name: str = "",
+        capture_backend: str = "",
+        duplex_sample_rate: int | None = None,
+        reliability_tier: str = "",
+        bluetooth_mode: bool = False,
+    ) -> list[str]:
+        canonical = self._canonical_device_key(
+            input_device_id=input_device_id,
+            output_device_id=output_device_id,
+            hostapi_name=hostapi_name,
+            capture_backend=capture_backend,
+            duplex_sample_rate=duplex_sample_rate,
+            reliability_tier=reliability_tier,
+            bluetooth_mode=bluetooth_mode,
+        )
+        legacy = self._legacy_device_key(
+            input_device_id=input_device_id,
+            output_device_id=output_device_id,
+            hostapi_name=hostapi_name,
+            capture_backend=capture_backend,
+            duplex_sample_rate=duplex_sample_rate,
+            reliability_tier=reliability_tier,
+            bluetooth_mode=bluetooth_mode,
+        )
+        if canonical == legacy:
+            return [canonical]
+        return [canonical, legacy]
+    def _to_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            out = float(value)
+        except Exception:
+            return float(default)
+        if out != out:
+            return float(default)
+        return float(out)
+    def _to_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
     def load_warm_start(
         self,
         *,
@@ -64,7 +159,12 @@ class ProfileStore:
         bluetooth_mode: bool = False,
     ) -> dict[str, Any]:
         data = self.load()
-        key = self._device_key(
+        devices = data.get("devices", {})
+        if not isinstance(devices, dict):
+            return {}
+        key = ""
+        entry: dict[str, Any] | None = None
+        for candidate_key in self._candidate_keys(
             input_device_id=input_device_id,
             output_device_id=output_device_id,
             hostapi_name=hostapi_name,
@@ -72,16 +172,20 @@ class ProfileStore:
             duplex_sample_rate=duplex_sample_rate,
             reliability_tier=reliability_tier,
             bluetooth_mode=bluetooth_mode,
-        )
-        entry = data.get("devices", {}).get(key)
+        ):
+            maybe = devices.get(candidate_key)
+            if isinstance(maybe, dict):
+                key = candidate_key
+                entry = maybe
+                break
         if not isinstance(entry, dict):
             return {}
         control = dict(entry.get("recommended_control", {}))
         playback = dict(entry.get("recommended_playback", {}))
         signal = dict(entry.get("recommended_signal", {}))
         latency = dict(entry.get("recommended_latency", {}))
-        stable_target_lead_sec = float(entry.get("stable_target_lead_sec", 0.0) or 0.0)
-        startup_target_lead_sec = float(entry.get("startup_target_lead_sec", 0.0) or 0.0)
+        stable_target_lead_sec = self._to_float(entry.get("stable_target_lead_sec", 0.0), 0.0)
+        startup_target_lead_sec = self._to_float(entry.get("startup_target_lead_sec", 0.0), 0.0)
         if stable_target_lead_sec > 0.0:
             latency["stable_target_lead_sec"] = stable_target_lead_sec
         if startup_target_lead_sec > 0.0:
@@ -92,8 +196,8 @@ class ProfileStore:
             "signal": signal,
             "latency": latency,
             "meta": {
-                "sessions": int(entry.get("sessions", 0)),
-                "last_updated_at": entry.get("last_updated_at", ""),
+                "sessions": self._to_int(entry.get("sessions", 0), 0),
+                "last_updated_at": str(entry.get("last_updated_at", "")),
                 "key": key,
             },
         }
@@ -112,17 +216,30 @@ class ProfileStore:
     ) -> None:
         data = self.load()
         devices = data.setdefault("devices", {})
-        key = self._device_key(
+        if not isinstance(devices, dict):
+            devices = {}
+            data["devices"] = devices
+        reliability_tier = str(device_profile.get("reliability_tier", "medium"))
+        candidate_keys = self._candidate_keys(
             input_device_id=input_device_id,
             output_device_id=output_device_id,
             hostapi_name=hostapi_name,
             capture_backend=capture_backend,
             duplex_sample_rate=duplex_sample_rate,
-            reliability_tier=str(device_profile.get("reliability_tier", "medium")),
+            reliability_tier=reliability_tier,
             bluetooth_mode=bluetooth_mode,
         )
-        prev = devices.get(key, {})
-        sessions = int(prev.get("sessions", 0))
+        key = candidate_keys[0]
+        prev: dict[str, Any] = {}
+        matched_legacy_key: str | None = None
+        for candidate_key in candidate_keys:
+            maybe = devices.get(candidate_key)
+            if isinstance(maybe, dict):
+                prev = maybe
+                if candidate_key != key:
+                    matched_legacy_key = candidate_key
+                break
+        sessions = self._to_int(prev.get("sessions", 0), 0)
         new_sessions = sessions + 1
         def ema(prev_value: float, new_value: float, n: int) -> float:
             if n <= 1:
@@ -130,72 +247,82 @@ class ProfileStore:
             alpha = min(0.30, 2.0 / (n + 2.0))
             return (1.0 - alpha) * float(prev_value) + alpha * float(new_value)
         avg_first_reliable = ema(
-            float(prev.get("avg_first_reliable_progress_time_sec", 3.6)),
-            float(metrics.get("first_reliable_progress_time_sec") or 6.0),
+            self._to_float(prev.get("avg_first_reliable_progress_time_sec", 3.6), 3.6),
+            self._to_float(metrics.get("first_reliable_progress_time_sec"), 6.0),
             new_sessions,
         )
         avg_startup_false_hold = ema(
-            float(prev.get("avg_startup_false_hold_count", 0.0)),
-            float(metrics.get("startup_false_hold_count", 0)),
+            self._to_float(prev.get("avg_startup_false_hold_count", 0.0), 0.0),
+            self._to_float(metrics.get("startup_false_hold_count", 0), 0.0),
             new_sessions,
         )
         avg_hold_count = ema(
-            float(prev.get("avg_hold_count", 0.0)),
-            float(metrics.get("hold_count", 0)),
+            self._to_float(prev.get("avg_hold_count", 0.0), 0.0),
+            self._to_float(metrics.get("hold_count", 0), 0.0),
             new_sessions,
         )
         avg_lost_count = ema(
-            float(prev.get("avg_lost_count", 0.0)),
-            float(metrics.get("lost_count", 0)),
+            self._to_float(prev.get("avg_lost_count", 0.0), 0.0),
+            self._to_float(metrics.get("lost_count", 0), 0.0),
             new_sessions,
         )
         avg_tracking_quality = ema(
-            float(prev.get("avg_mean_tracking_quality", 0.55)),
-            float(metrics.get("mean_tracking_quality", 0.0)),
+            self._to_float(prev.get("avg_mean_tracking_quality", 0.55), 0.55),
+            self._to_float(metrics.get("mean_tracking_quality", 0.0), 0.0),
             new_sessions,
         )
         avg_reacquire_count = ema(
-            float(prev.get("avg_reacquire_count", 0.0)),
-            float(metrics.get("reacquire_count", 0)),
+            self._to_float(prev.get("avg_reacquire_count", 0.0), 0.0),
+            self._to_float(metrics.get("reacquire_count", 0), 0.0),
             new_sessions,
         )
         avg_seek_count = ema(
-            float(prev.get("avg_seek_count", 0.0)),
-            float(metrics.get("seek_count", 0)),
+            self._to_float(prev.get("avg_seek_count", 0.0), 0.0),
+            self._to_float(metrics.get("seek_count", 0), 0.0),
             new_sessions,
         )
         lc = latency_calibration or {}
-        estimated_output_latency_ms = float(
+        estimated_output_latency_ms = self._to_float(
             lc.get(
                 "estimated_output_latency_ms",
                 prev.get(
                     "estimated_output_latency_ms",
-                    float(device_profile.get("estimated_output_latency_ms", 180.0)),
+                    device_profile.get("estimated_output_latency_ms", 180.0),
                 ),
-            )
+            ),
+            180.0,
         )
-        estimated_input_latency_ms = float(
+        estimated_input_latency_ms = self._to_float(
             lc.get(
                 "estimated_input_latency_ms",
                 prev.get(
                     "estimated_input_latency_ms",
-                    float(device_profile.get("estimated_input_latency_ms", 50.0)),
+                    device_profile.get("estimated_input_latency_ms", 50.0),
                 ),
-            )
+            ),
+            50.0,
         )
-        runtime_output_drift_ms = float(lc.get("runtime_output_drift_ms", prev.get("runtime_output_drift_ms", 0.0)))
-        runtime_input_drift_ms = float(lc.get("runtime_input_drift_ms", prev.get("runtime_input_drift_ms", 0.0)))
-        stable_target_lead_sec = float(
+        runtime_output_drift_ms = self._to_float(
+            lc.get("runtime_output_drift_ms", prev.get("runtime_output_drift_ms", 0.0)),
+            0.0,
+        )
+        runtime_input_drift_ms = self._to_float(
+            lc.get("runtime_input_drift_ms", prev.get("runtime_input_drift_ms", 0.0)),
+            0.0,
+        )
+        stable_target_lead_sec = self._to_float(
             lc.get(
                 "stable_target_lead_sec",
                 prev.get("stable_target_lead_sec", 0.35 if bluetooth_mode else 0.15),
-            )
+            ),
+            0.35 if bluetooth_mode else 0.15,
         )
-        startup_target_lead_sec = float(
+        startup_target_lead_sec = self._to_float(
             lc.get(
                 "startup_target_lead_sec",
                 prev.get("startup_target_lead_sec", 0.28 if bluetooth_mode else 0.15),
-            )
+            ),
+            0.28 if bluetooth_mode else 0.15,
         )
         recommended_control = self._derive_recommended_control(
             avg_first_reliable_progress_time_sec=avg_first_reliable,
@@ -205,7 +332,7 @@ class ProfileStore:
             avg_mean_tracking_quality=avg_tracking_quality,
             avg_reacquire_count=avg_reacquire_count,
             avg_seek_count=avg_seek_count,
-            reliability_tier=str(device_profile.get("reliability_tier", "medium")),
+            reliability_tier=reliability_tier,
             input_gain_hint=str(device_profile.get("input_gain_hint", "normal")),
             bluetooth_mode=bool(bluetooth_mode),
         )
@@ -216,9 +343,9 @@ class ProfileStore:
             )
         }
         recommended_signal = self._derive_recommended_signal(
-            reliability_tier=str(device_profile.get("reliability_tier", "medium")),
+            reliability_tier=reliability_tier,
             input_gain_hint=str(device_profile.get("input_gain_hint", "normal")),
-            noise_floor_rms=float(device_profile.get("noise_floor_rms", 0.0025)),
+            noise_floor_rms=self._to_float(device_profile.get("noise_floor_rms", 0.0025), 0.0025),
             bluetooth_mode=bool(bluetooth_mode),
         )
         recommended_latency = {
@@ -229,15 +356,18 @@ class ProfileStore:
             "stable_target_lead_sec": round(stable_target_lead_sec, 3),
             "startup_target_lead_sec": round(startup_target_lead_sec, 3),
         }
+        normalized_input_device_id = self._normalized_device_id(input_device_id)
+        normalized_output_device_id = self._normalized_device_id(output_device_id)
         devices[key] = {
+            "schema_version": 2,
             "sessions": new_sessions,
-            "input_device_id": input_device_id,
-            "output_device_id": output_device_id,
-            "hostapi_name": hostapi_name,
-            "capture_backend": capture_backend,
-            "duplex_sample_rate": int(duplex_sample_rate or 0),
+            "input_device_id": normalized_input_device_id,
+            "output_device_id": normalized_output_device_id,
+            "hostapi_name": self._normalized_scalar_text(hostapi_name),
+            "capture_backend": self._normalized_scalar_text(capture_backend),
+            "duplex_sample_rate": max(0, int(duplex_sample_rate or 0)),
             "bluetooth_mode": bool(bluetooth_mode),
-            "device_profile": device_profile,
+            "device_profile": dict(device_profile),
             "avg_first_reliable_progress_time_sec": avg_first_reliable,
             "avg_startup_false_hold_count": avg_startup_false_hold,
             "avg_hold_count": avg_hold_count,
@@ -255,8 +385,13 @@ class ProfileStore:
             "recommended_playback": recommended_playback,
             "recommended_signal": recommended_signal,
             "recommended_latency": recommended_latency,
-            "last_updated_at": datetime.now().isoformat(timespec="seconds"),
+            "last_updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
+        if matched_legacy_key is not None and matched_legacy_key in devices and matched_legacy_key != key:
+            try:
+                del devices[matched_legacy_key]
+            except Exception:
+                pass
         self.save(data)
     def _derive_recommended_control(
         self,
@@ -926,53 +1061,9 @@ import time
 from dataclasses import dataclass, field
 import numpy as np
 import sounddevice as sd
-@dataclass(slots=True)
-class ResolvedDevice:
-    index: int
-    name: str
-    max_input_channels: int
-    max_output_channels: int
-    default_samplerate: float
-    hostapi_name: str
-@dataclass(slots=True)
-class BluetoothPreflightConfig:
-    input_device: int | str | None
-    output_device: int | str | None
-    preferred_input_samplerate: int = 48000
-    preferred_output_samplerate: int = 44100
-    duration_sec: float = 4.0
-    warmup_ignore_sec: float = 0.9
-    blocksize: int = 0
-    probe_tone_hz: float = 880.0
-    probe_tone_amp: float = 0.05
-    min_mean_rms: float = 0.0015
-    min_peak: float = 0.0150
-    min_nonzero_ratio: float = 0.010
-    min_voiced_frame_ratio: float = 0.12
-    strong_rms: float = 0.0060
-    strong_peak: float = 0.0200
-    strong_voiced_frame_ratio: float = 0.22
-    max_status_events: int = 10
-@dataclass(slots=True)
-class BluetoothPreflightResult:
-    should_run: bool
-    passed: bool
-    input_device_index: int | None = None
-    input_device_name: str = ""
-    output_device_index: int | None = None
-    output_device_name: str = ""
-    samplerate: int = 0
-    mean_rms: float = 0.0
-    max_peak: float = 0.0
-    nonzero_ratio: float = 0.0
-    voiced_frame_ratio: float = 0.0
-    tail_mean_rms: float = 0.0
-    tail_max_peak: float = 0.0
-    tail_nonzero_ratio: float = 0.0
-    tail_voiced_frame_ratio: float = 0.0
-    status_events: int = 0
-    failure_reason: str = ""
-    notes: list[str] = field(default_factory=list)
+from shadowing.audio.device_profile import (
+    normalize_device_name,
+)
 _BLUETOOTH_KEYWORDS = (
     "bluetooth",
     "headset",
@@ -1017,13 +1108,69 @@ def _device_family_key(name: str | None) -> str:
         if token in normalized:
             return token
     return " ".join(normalized.split())
+@dataclass(slots=True)
+class ResolvedDevice:
+    index: int
+    name: str
+    normalized_name: str
+    family_key: str
+    max_input_channels: int
+    max_output_channels: int
+    default_samplerate: float
+    hostapi_name: str
+@dataclass(slots=True)
+class BluetoothPreflightConfig:
+    input_device: int | str | None
+    output_device: int | str | None
+    preferred_input_samplerate: int = 48000
+    preferred_output_samplerate: int = 44100
+    duration_sec: float = 4.0
+    warmup_ignore_sec: float = 0.9
+    blocksize: int = 0
+    probe_tone_hz: float = 880.0
+    probe_tone_amp: float = 0.05
+    min_mean_rms: float = 0.0015
+    min_peak: float = 0.0150
+    min_nonzero_ratio: float = 0.010
+    min_voiced_frame_ratio: float = 0.12
+    strong_rms: float = 0.0060
+    strong_peak: float = 0.0200
+    strong_voiced_frame_ratio: float = 0.22
+    max_status_events: int = 10
+@dataclass(slots=True)
+class BluetoothPreflightResult:
+    should_run: bool
+    passed: bool
+    input_device_index: int | None = None
+    input_device_name: str = ""
+    input_device_family_key: str = ""
+    input_hostapi_name: str = ""
+    output_device_index: int | None = None
+    output_device_name: str = ""
+    output_device_family_key: str = ""
+    output_hostapi_name: str = ""
+    samplerate: int = 0
+    mean_rms: float = 0.0
+    max_peak: float = 0.0
+    nonzero_ratio: float = 0.0
+    voiced_frame_ratio: float = 0.0
+    tail_mean_rms: float = 0.0
+    tail_max_peak: float = 0.0
+    tail_nonzero_ratio: float = 0.0
+    tail_voiced_frame_ratio: float = 0.0
+    status_events: int = 0
+    failure_reason: str = ""
+    notes: list[str] = field(default_factory=list)
 def _resolve_hostapi_name(dev: dict) -> str:
     hostapis = sd.query_hostapis()
     return str(hostapis[int(dev["hostapi"])]["name"])
 def _build_resolved_device(idx: int, dev: dict) -> ResolvedDevice:
+    name = str(dev["name"])
     return ResolvedDevice(
         index=int(idx),
-        name=str(dev["name"]),
+        name=name,
+        normalized_name=normalize_device_name(name),
+        family_key=_device_family_key(name),
         max_input_channels=int(dev["max_input_channels"]),
         max_output_channels=int(dev["max_output_channels"]),
         default_samplerate=float(dev["default_samplerate"]),
@@ -1034,7 +1181,9 @@ def _resolve_input_device(device: int | str | None) -> ResolvedDevice:
     if isinstance(device, int):
         dev = sd.query_devices(device)
         if int(dev["max_input_channels"]) <= 0:
-            raise RuntimeError(f"Resolved input device is not an input device: idx={device}, name={dev['name']}")
+            raise RuntimeError(
+                f"Resolved input device is not an input device: idx={device}, name={dev['name']}"
+            )
         return _build_resolved_device(int(device), dev)
     if device is None:
         default_in, _ = sd.default.device
@@ -1042,7 +1191,9 @@ def _resolve_input_device(device: int | str | None) -> ResolvedDevice:
             raise RuntimeError("No default input device available for bluetooth preflight.")
         dev = sd.query_devices(int(default_in))
         if int(dev["max_input_channels"]) <= 0:
-            raise RuntimeError(f"Default input device is invalid: idx={default_in}, name={dev['name']}")
+            raise RuntimeError(
+                f"Default input device is invalid: idx={default_in}, name={dev['name']}"
+            )
         return _build_resolved_device(int(default_in), dev)
     target = str(device).strip().lower()
     for idx, dev in enumerate(devices):
@@ -1056,7 +1207,9 @@ def _resolve_output_device(device: int | str | None) -> ResolvedDevice:
     if isinstance(device, int):
         dev = sd.query_devices(device)
         if int(dev["max_output_channels"]) <= 0:
-            raise RuntimeError(f"Resolved output device is not an output device: idx={device}, name={dev['name']}")
+            raise RuntimeError(
+                f"Resolved output device is not an output device: idx={device}, name={dev['name']}"
+            )
         return _build_resolved_device(int(device), dev)
     if device is None:
         _, default_out = sd.default.device
@@ -1064,7 +1217,9 @@ def _resolve_output_device(device: int | str | None) -> ResolvedDevice:
             raise RuntimeError("No default output device available for bluetooth preflight.")
         dev = sd.query_devices(int(default_out))
         if int(dev["max_output_channels"]) <= 0:
-            raise RuntimeError(f"Default output device is invalid: idx={default_out}, name={dev['name']}")
+            raise RuntimeError(
+                f"Default output device is invalid: idx={default_out}, name={dev['name']}"
+            )
         return _build_resolved_device(int(default_out), dev)
     target = str(device).strip().lower()
     for idx, dev in enumerate(devices):
@@ -1073,7 +1228,10 @@ def _resolve_output_device(device: int | str | None) -> ResolvedDevice:
         if target in str(dev["name"]).lower():
             return _build_resolved_device(int(idx), dev)
     raise RuntimeError(f"No matching output device found for bluetooth preflight: {device!r}")
-def should_run_bluetooth_preflight(input_device: int | str | None, output_device: int | str | None) -> bool:
+def should_run_bluetooth_preflight(
+    input_device: int | str | None,
+    output_device: int | str | None,
+) -> bool:
     try:
         input_resolved = _resolve_input_device(input_device)
         output_resolved = _resolve_output_device(output_device)
@@ -1083,9 +1241,11 @@ def should_run_bluetooth_preflight(input_device: int | str | None, output_device
     output_is_bt = _looks_like_bluetooth(output_resolved.name)
     if not (input_is_bt and output_is_bt):
         return False
-    input_family = _device_family_key(input_resolved.name)
-    output_family = _device_family_key(output_resolved.name)
-    if input_family and output_family and input_family != output_family:
+    if (
+        input_resolved.family_key
+        and output_resolved.family_key
+        and input_resolved.family_key != output_resolved.family_key
+    ):
         return False
     return True
 def _pick_duplex_samplerate(
@@ -1097,14 +1257,14 @@ def _pick_duplex_samplerate(
     candidates: list[int] = []
     for sr in (
         preferred_input_sr,
+        preferred_output_sr,
         48000,
+        44100,
         32000,
         24000,
         16000,
-        preferred_output_sr,
         int(input_dev.default_samplerate),
         int(output_dev.default_samplerate),
-        44100,
     ):
         if sr > 0 and sr not in candidates:
             candidates.append(int(sr))
@@ -1135,7 +1295,9 @@ def _safe_mean(values: list[float]) -> float:
     return float(np.mean(values)) if values else 0.0
 def _safe_max(values: list[float]) -> float:
     return float(np.max(values)) if values else 0.0
-def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> BluetoothPreflightResult:
+def run_bluetooth_duplex_preflight(
+    config: BluetoothPreflightConfig,
+) -> BluetoothPreflightResult:
     if not should_run_bluetooth_preflight(config.input_device, config.output_device):
         return BluetoothPreflightResult(
             should_run=False,
@@ -1154,9 +1316,13 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
         should_run=True,
         passed=False,
         input_device_index=input_dev.index,
-        input_device_name=input_dev.name,
+        input_device_name=input_dev.normalized_name,
+        input_device_family_key=input_dev.family_key,
+        input_hostapi_name=input_dev.hostapi_name,
         output_device_index=output_dev.index,
-        output_device_name=output_dev.name,
+        output_device_name=output_dev.normalized_name,
+        output_device_family_key=output_dev.family_key,
+        output_hostapi_name=output_dev.hostapi_name,
         samplerate=samplerate,
     )
     rms_values: list[float] = []
@@ -1174,6 +1340,7 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
     lock = threading.Lock()
     def callback(indata, outdata, frames, time_info, status) -> None:
         nonlocal status_events, tone_phase
+        _ = time_info
         now = time.monotonic()
         elapsed = now - started_at
         if status:
@@ -1195,7 +1362,10 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
                 tail_nonzero_ratios.append(nonzero_ratio)
                 tail_voiced_flags.append(voiced)
         t = (np.arange(frames, dtype=np.float32) + tone_phase) / float(samplerate)
-        tone = config.probe_tone_amp * np.sin(2.0 * np.pi * config.probe_tone_hz * t).astype(np.float32, copy=False)
+        tone = config.probe_tone_amp * np.sin(2.0 * np.pi * config.probe_tone_hz * t).astype(
+            np.float32,
+            copy=False,
+        )
         tone_phase += frames
         outdata.fill(0.0)
         outdata[:, 0] = tone
@@ -1288,6 +1458,7 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
 ```python
 from __future__ import annotations
 from dataclasses import dataclass
+import re
 _BLUETOOTH_KEYWORDS = (
     "bluetooth",
     "headset",
@@ -1340,7 +1511,26 @@ _WIRED_HEADSET_KEYWORDS = (
 def _normalize_text(value: int | str | None) -> str:
     if value is None:
         return ""
-    return str(value).strip().lower()
+    text = str(value).strip().lower()
+    text = text.replace("\u3000", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text
+def _normalize_compact_text(value: int | str | None) -> str:
+    text = _normalize_text(value)
+    if not text:
+        return ""
+    text = (
+        text.replace("hands-free", "handsfree")
+        .replace("hands free", "handsfree")
+        .replace("built-in", "builtin")
+        .replace("line-out", "lineout")
+        .replace("type-c", "typec")
+        .replace("type c", "typec")
+    )
+    text = re.sub(r"[\[\]{}()<>]", " ", text)
+    text = re.sub(r"[_\-]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
     if not text:
         return False
@@ -1350,13 +1540,49 @@ def _looks_like_bluetooth(name: str | None) -> bool:
     if not text:
         return False
     return _contains_any(text, _BLUETOOTH_KEYWORDS)
-def _normalize_device_id(device_name: int | str | None) -> str:
+def _device_family_key(name: str | None) -> str:
+    text = _normalize_compact_text(name)
+    if not text:
+        return ""
+    for token in (
+        "zero air",
+        "airpods",
+        "earbuds",
+        "buds",
+        "handsfree",
+        "headset",
+        "耳机",
+        "蓝牙",
+    ):
+        if token in text:
+            return token
+    return " ".join(text.split())
+def normalize_device_name(device_name: int | str | None) -> str:
     text = _normalize_text(device_name)
     return text if text else "unknown"
+def normalize_device_id(
+    *,
+    device_name: int | str | None,
+    hostapi_name: str | None = None,
+    device_index: int | None = None,
+) -> str:
+    norm_name = normalize_device_name(device_name)
+    norm_hostapi = _normalize_text(hostapi_name) or "unknown"
+    parts = [f"hostapi={norm_hostapi}", f"name={norm_name}"]
+    if device_index is not None:
+        try:
+            parts.append(f"idx={int(device_index)}")
+        except Exception:
+            pass
+    return " | ".join(parts)
 @dataclass(slots=True)
 class DeviceProfile:
     input_device_id: str
     output_device_id: str
+    input_device_name: str
+    output_device_name: str
+    input_family_key: str
+    output_family_key: str
     input_kind: str
     output_kind: str
     input_sample_rate: int
@@ -1366,6 +1592,9 @@ class DeviceProfile:
     noise_floor_rms: float
     input_gain_hint: str
     reliability_tier: str
+    bluetooth_mode: bool = False
+    hostapi_name: str = ""
+    capture_backend: str = ""
 def classify_input_device(device_name: int | str | None) -> str:
     name = _normalize_text(device_name)
     if not name:
@@ -1439,13 +1668,43 @@ def build_device_profile(
     input_sample_rate: int,
     output_sample_rate: int,
     noise_floor_rms: float,
+    *,
+    hostapi_name: str = "",
+    capture_backend: str = "",
+    input_device_id: str | None = None,
+    output_device_id: str | None = None,
 ) -> DeviceProfile:
-    input_kind = classify_input_device(input_device_name)
-    output_kind = classify_output_device(output_device_name)
+    normalized_input_name = normalize_device_name(input_device_name)
+    normalized_output_name = normalize_device_name(output_device_name)
+    input_kind = classify_input_device(normalized_input_name)
+    output_kind = classify_output_device(normalized_output_name)
     normalized_noise_floor = max(0.0, float(noise_floor_rms))
+    bluetooth_mode = bool(
+        input_kind == "bluetooth_headset" or output_kind == "bluetooth_headset"
+    )
+    resolved_input_device_id = (
+        str(input_device_id).strip()
+        if str(input_device_id or "").strip()
+        else normalize_device_id(
+            device_name=normalized_input_name,
+            hostapi_name=hostapi_name,
+        )
+    )
+    resolved_output_device_id = (
+        str(output_device_id).strip()
+        if str(output_device_id or "").strip()
+        else normalize_device_id(
+            device_name=normalized_output_name,
+            hostapi_name=hostapi_name,
+        )
+    )
     return DeviceProfile(
-        input_device_id=_normalize_device_id(input_device_name),
-        output_device_id=_normalize_device_id(output_device_name),
+        input_device_id=resolved_input_device_id,
+        output_device_id=resolved_output_device_id,
+        input_device_name=normalized_input_name,
+        output_device_name=normalized_output_name,
+        input_family_key=_device_family_key(normalized_input_name),
+        output_family_key=_device_family_key(normalized_output_name),
         input_kind=input_kind,
         output_kind=output_kind,
         input_sample_rate=max(0, int(input_sample_rate)),
@@ -1455,6 +1714,9 @@ def build_device_profile(
         noise_floor_rms=normalized_noise_floor,
         input_gain_hint=infer_input_gain_hint(normalized_noise_floor),
         reliability_tier=infer_reliability_tier(input_kind, output_kind),
+        bluetooth_mode=bluetooth_mode,
+        hostapi_name=str(hostapi_name or ""),
+        capture_backend=str(capture_backend or ""),
     )
 ```
 
@@ -1835,7 +2097,6 @@ class LatencyCalibrator:
         assert self._state is not None
         bounded = float(max(-260.0, min(260.0, error_ms)))
         magnitude = abs(bounded)
-        sign = 1.0 if bounded > 0.0 else -1.0
         fast_startup = self._bluetooth_mode and now_sec <= self._startup_fast_calibration_until_sec
         if self._bluetooth_mode:
             if fast_startup:
@@ -1847,8 +2108,12 @@ class LatencyCalibrator:
         else:
             output_step = max(1.0, min(5.0, magnitude * 0.040))
             input_step = max(0.5, min(2.2, magnitude * 0.016))
-        self._state.runtime_output_drift_ms += sign * output_step
-        self._state.runtime_input_drift_ms += sign * input_step
+        if bounded > 0.0:
+            self._state.runtime_output_drift_ms -= output_step
+            self._state.runtime_input_drift_ms += input_step
+        else:
+            self._state.runtime_output_drift_ms += output_step
+            self._state.runtime_input_drift_ms -= input_step
         self._state.runtime_output_drift_ms = max(
             -self._max_runtime_output_drift_ms,
             min(self._max_runtime_output_drift_ms, self._state.runtime_output_drift_ms),
@@ -2428,12 +2693,20 @@ from shadowing.audio.reference_audio_features import (
     ReferenceBoundaryHint,
     ReferenceTokenAcousticTemplate,
 )
+from shadowing.preprocess.reference_builder import SegmentTimelineRecord
 class ReferenceAudioAnalyzer:
     def __init__(self, frame_size_sec: float = 0.025, hop_sec: float = 0.010, n_bands: int = 6) -> None:
         self.frame_size_sec = float(frame_size_sec)
         self.hop_sec = float(hop_sec)
         self.n_bands = int(n_bands)
-    def analyze(self, *, lesson_id: str, chunks: list, reference_map) -> ReferenceAudioFeatures:
+    def analyze(
+        self,
+        *,
+        lesson_id: str,
+        chunks: list,
+        reference_map,
+        segment_records: list[SegmentTimelineRecord] | None = None,
+    ) -> ReferenceAudioFeatures:
         if not chunks:
             return ReferenceAudioFeatures(
                 lesson_id=lesson_id,
@@ -2465,7 +2738,51 @@ class ReferenceAudioAnalyzer:
                         embedding=list(item.embedding),
                     )
                 )
+            extractor.reset()
+        boundaries = self._build_boundaries(
+            frames=frames,
+            reference_map=reference_map,
+            segment_records=segment_records,
+        )
+        token_time_hints_sec = self._build_token_time_hints(reference_map=reference_map)
+        token_templates = self._build_token_templates(
+            frames=frames,
+            reference_map=reference_map,
+            segment_records=segment_records,
+        )
+        total_duration_sec = float(getattr(reference_map, "total_duration_sec", 0.0))
+        return ReferenceAudioFeatures(
+            lesson_id=str(lesson_id),
+            frame_hop_sec=self.hop_sec,
+            frame_size_sec=self.frame_size_sec,
+            sample_rate=sample_rate,
+            frames=frames,
+            boundaries=boundaries,
+            token_time_hints_sec=token_time_hints_sec,
+            token_acoustic_templates=token_templates,
+            total_duration_sec=total_duration_sec,
+        )
+    def _build_boundaries(self, *, frames, reference_map, segment_records: list[SegmentTimelineRecord] | None) -> list[ReferenceBoundaryHint]:
         boundaries: list[ReferenceBoundaryHint] = []
+        if segment_records:
+            for seg in segment_records:
+                start_sec = self._segment_effective_start(seg)
+                end_sec = self._segment_effective_end(seg)
+                boundaries.append(
+                    ReferenceBoundaryHint(
+                        time_sec=float(start_sec),
+                        kind="segment_start",
+                        weight=1.25,
+                    )
+                )
+                if end_sec > start_sec:
+                    boundaries.append(
+                        ReferenceBoundaryHint(
+                            time_sec=float(end_sec),
+                            kind="segment_end",
+                            weight=0.95,
+                        )
+                    )
         seen_clause_ids: set[int] = set()
         seen_sentence_ids: set[int] = set()
         for token in getattr(reference_map, "tokens", []):
@@ -2485,36 +2802,56 @@ class ReferenceAudioAnalyzer:
                 for idx in range(1, len(frames) - 1):
                     cur = frames[idx].onset_strength
                     if cur >= threshold and cur >= frames[idx - 1].onset_strength and cur >= frames[idx + 1].onset_strength:
-                        boundaries.append(ReferenceBoundaryHint(time_sec=float(frames[idx].time_sec), kind="peak", weight=0.7))
-        boundaries.sort(key=lambda x: (x.time_sec, x.kind))
-        token_time_hints_sec = [float(getattr(t, "t_start", 0.0)) for t in getattr(reference_map, "tokens", [])]
-        token_templates = self._build_token_templates(frames, reference_map)
-        total_duration_sec = float(getattr(reference_map, "total_duration_sec", 0.0))
-        return ReferenceAudioFeatures(
-            lesson_id=str(lesson_id),
-            frame_hop_sec=self.hop_sec,
-            frame_size_sec=self.frame_size_sec,
-            sample_rate=sample_rate,
-            frames=frames,
-            boundaries=boundaries,
-            token_time_hints_sec=token_time_hints_sec,
-            token_acoustic_templates=token_templates,
-            total_duration_sec=total_duration_sec,
-        )
-    def _build_token_templates(self, frames: list[ReferenceAudioFrameFeatures], reference_map) -> list[ReferenceTokenAcousticTemplate]:
+                        boundaries.append(
+                            ReferenceBoundaryHint(
+                                time_sec=float(frames[idx].time_sec),
+                                kind="peak",
+                                weight=0.7,
+                            )
+                        )
+        boundaries.sort(key=lambda x: (float(x.time_sec), str(x.kind), -float(x.weight)))
+        deduped: list[ReferenceBoundaryHint] = []
+        for item in boundaries:
+            if deduped and abs(float(item.time_sec) - float(deduped[-1].time_sec)) <= 0.008 and item.kind == deduped[-1].kind:
+                if item.weight > deduped[-1].weight:
+                    deduped[-1] = item
+            else:
+                deduped.append(item)
+        return deduped
+    def _build_token_time_hints(self, *, reference_map) -> list[float]:
+        return [float(getattr(t, "t_start", 0.0)) for t in getattr(reference_map, "tokens", [])]
+    def _build_token_templates(
+        self,
+        *,
+        frames: list[ReferenceAudioFrameFeatures],
+        reference_map,
+        segment_records: list[SegmentTimelineRecord] | None,
+    ) -> list[ReferenceTokenAcousticTemplate]:
         if not frames:
             return []
         frame_times = np.asarray([f.time_sec for f in frames], dtype=np.float32)
-        embeddings = np.asarray([f.embedding for f in frames], dtype=np.float32) if frames[0].embedding else np.zeros((len(frames), 0), dtype=np.float32)
+        embeddings = (
+            np.asarray([f.embedding for f in frames], dtype=np.float32)
+            if frames[0].embedding
+            else np.zeros((len(frames), 0), dtype=np.float32)
+        )
         if embeddings.size == 0:
             return []
+        token_windows = None
+        if segment_records:
+            token_windows = self._build_token_windows_from_segments(segment_records)
         templates: list[ReferenceTokenAcousticTemplate] = []
         for token in getattr(reference_map, "tokens", []):
-            t0 = float(getattr(token, "t_start", 0.0)) - 0.03
-            t1 = float(getattr(token, "t_end", t0 + 0.06)) + 0.03
+            token_idx = int(getattr(token, "idx", len(templates)))
+            t0, t1 = self._resolve_token_window(
+                token=token,
+                token_idx=token_idx,
+                token_windows=token_windows,
+            )
             mask = np.where((frame_times >= t0) & (frame_times <= t1))[0]
             if mask.size == 0:
-                idx = int(np.argmin(np.abs(frame_times - float(getattr(token, "t_start", 0.0)))))
+                ref_t = float(getattr(token, "t_start", 0.0))
+                idx = int(np.argmin(np.abs(frame_times - ref_t)))
                 mask = np.asarray([idx], dtype=np.int32)
             emb = np.mean(embeddings[mask], axis=0)
             norm = float(np.linalg.norm(emb))
@@ -2522,12 +2859,58 @@ class ReferenceAudioAnalyzer:
                 emb = emb / norm
             templates.append(
                 ReferenceTokenAcousticTemplate(
-                    token_idx=int(getattr(token, "idx", len(templates))),
+                    token_idx=token_idx,
                     time_sec=float(getattr(token, "t_start", 0.0)),
                     embedding=emb.astype(np.float32, copy=False).tolist(),
                 )
             )
         return templates
+    def _build_token_windows_from_segments(
+        self,
+        segment_records: list[SegmentTimelineRecord],
+    ) -> list[tuple[float, float]]:
+        out: list[tuple[float, float]] = []
+        for seg in segment_records:
+            base_start = self._segment_effective_start(seg)
+            local_starts = [float(x) for x in seg.local_starts]
+            local_ends = [float(x) for x in seg.local_ends]
+            trim_head = float(seg.trim_head_sec or 0.0)
+            trim_tail = float(seg.trim_tail_sec or 0.0)
+            effective_seg_end = self._segment_effective_end(seg)
+            for ls, le in zip(local_starts, local_ends, strict=True):
+                t0 = max(base_start, base_start + max(0.0, ls - trim_head))
+                t1 = max(t0, base_start + max(0.0, le - trim_head))
+                if effective_seg_end > 0.0:
+                    t0 = min(t0, effective_seg_end)
+                    t1 = min(t1, effective_seg_end)
+                if trim_tail > 0.0 and effective_seg_end <= 0.0:
+                    t1 = max(t0, t1 - trim_tail)
+                out.append((float(t0), float(t1)))
+        return out
+    def _resolve_token_window(
+        self,
+        *,
+        token,
+        token_idx: int,
+        token_windows: list[tuple[float, float]] | None,
+    ) -> tuple[float, float]:
+        if token_windows and 0 <= token_idx < len(token_windows):
+            t0, t1 = token_windows[token_idx]
+            if t1 >= t0:
+                return float(t0 - 0.015), float(t1 + 0.020)
+        t0 = float(getattr(token, "t_start", 0.0)) - 0.03
+        t1 = float(getattr(token, "t_end", t0 + 0.06)) + 0.03
+        return t0, t1
+    def _segment_effective_start(self, seg: SegmentTimelineRecord) -> float:
+        if seg.assembled_start_sec is not None:
+            return float(seg.assembled_start_sec)
+        return float(seg.global_start_sec)
+    def _segment_effective_end(self, seg: SegmentTimelineRecord) -> float:
+        if seg.assembled_end_sec is not None:
+            return float(seg.assembled_end_sec)
+        if seg.local_ends:
+            return float(seg.global_start_sec + max(float(x) for x in seg.local_ends))
+        return float(seg.global_start_sec)
 ```
 
 ---
@@ -2613,146 +2996,6 @@ class ReferenceAudioStore:
 ```
 
 ---
-### 文件: `shadowing_app/src/shadowing/audio/sounddevice_player.py`
-
-```python
-from __future__ import annotations
-import queue
-import threading
-from collections.abc import Iterable
-import numpy as np
-import sounddevice as sd
-from shadowing.audio.playback_config import PlaybackConfig
-class SoundDevicePlayer:
-    def __init__(self, config: PlaybackConfig) -> None:
-        self.config = config
-        self._queue: queue.Queue[np.ndarray] = queue.Queue()
-        self._stream: sd.OutputStream | None = None
-        self._started = False
-        self._lock = threading.Lock()
-        self._closed = False
-        self._resolved_device: int | None = None
-    def start(self) -> None:
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Player already closed")
-            if self._started:
-                return
-            self._resolved_device = self._resolve_output_device(self.config.device)
-            self._stream = sd.OutputStream(
-                samplerate=int(self.config.sample_rate),
-                channels=int(self.config.channels),
-                dtype="float32",
-                callback=self._callback,
-                blocksize=int(self.config.blocksize),
-                latency=self.config.latency,
-                device=self._resolved_device,
-            )
-            self._stream.start()
-            self._started = True
-    def stop(self) -> None:
-        with self._lock:
-            if self._stream is not None:
-                try:
-                    self._stream.stop()
-                finally:
-                    self._stream.close()
-                    self._stream = None
-            self._started = False
-    def close(self) -> None:
-        if self._closed:
-            return
-        self.stop()
-        self._closed = True
-    def enqueue(self, audio: np.ndarray) -> None:
-        if audio is None:
-            return
-        arr = np.asarray(audio, dtype=np.float32).reshape(-1)
-        if arr.size == 0:
-            return
-        self._queue.put(arr)
-    def enqueue_many(self, audios: Iterable[np.ndarray]) -> None:
-        for audio in audios:
-            self.enqueue(audio)
-    def clear(self) -> None:
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                break
-    def _callback(self, outdata, frames, time_info, status) -> None:
-        _ = time_info
-        if status:
-            pass
-        out = np.zeros((frames, int(self.config.channels)), dtype=np.float32)
-        filled = 0
-        while filled < frames:
-            try:
-                chunk = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            if chunk.ndim != 1:
-                chunk = chunk.reshape(-1)
-            remain = frames - filled
-            take = min(remain, chunk.shape[0])
-            mono = chunk[:take].astype(np.float32, copy=False)
-            if int(self.config.channels) == 1:
-                out[filled : filled + take, 0] = mono
-            else:
-                out[filled : filled + take, :] = mono[:, None]
-            filled += take
-            leftover = chunk[take:]
-            if leftover.size > 0:
-                self._queue.queue.appendleft(leftover)
-                break
-        outdata[:] = out
-    def _resolve_output_device(self, device: int | str | None) -> int | None:
-        if device is None:
-            default_in, default_out = sd.default.device
-            _ = default_in
-            if default_out is None or int(default_out) < 0:
-                return None
-            return int(default_out)
-        if isinstance(device, int):
-            info = sd.query_devices(device)
-            max_out = int(info["max_output_channels"])
-            if max_out <= 0:
-                raise ValueError(f"Device index {device} is not an output device")
-            return int(device)
-        target = str(device).strip().lower()
-        if not target:
-            default_in, default_out = sd.default.device
-            _ = default_in
-            if default_out is None or int(default_out) < 0:
-                return None
-            return int(default_out)
-        matched_index: int | None = None
-        matched_name: str | None = None
-        devices = sd.query_devices()
-        for idx, dev in enumerate(devices):
-            if int(dev["max_output_channels"]) <= 0:
-                continue
-            name = str(dev["name"])
-            if target in name.lower():
-                matched_index = int(idx)
-                matched_name = name
-                break
-        if matched_index is None:
-            candidates: list[str] = []
-            for idx, dev in enumerate(devices):
-                if int(dev["max_output_channels"]) <= 0:
-                    continue
-                candidates.append(f"[{idx}] {dev['name']}")
-            joined = "\n".join(candidates[:50])
-            raise ValueError(
-                "Output device name not found: "
-                f"{device!r}\nAvailable output devices:\n{joined}"
-            )
-        _ = matched_name
-        return matched_index
-```
-
----
 ### 文件: `shadowing_app/src/shadowing/bootstrap.py`
 
 ```python
@@ -2777,6 +3020,33 @@ from shadowing.realtime.orchestrator import ShadowingOrchestrator
 from shadowing.realtime.playback.sounddevice_player import PlaybackConfig, SoundDevicePlayer
 from shadowing.realtime.runtime import RealtimeRuntimeConfig, ShadowingRuntime
 from shadowing.telemetry.event_logger import EventLogger
+def _normalize_device_context(raw: dict[str, Any] | None, *, capture_backend: str) -> dict[str, Any]:
+    ctx = dict(raw or {})
+    ctx["capture_backend"] = str(capture_backend or "").strip().lower()
+    def _int_or(default: int, value: Any) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+    def _float_or(default: float, value: Any) -> float:
+        try:
+            out = float(value)
+        except Exception:
+            return float(default)
+        if out != out:
+            return float(default)
+        return float(out)
+    ctx["input_sample_rate"] = _int_or(16000, ctx.get("input_sample_rate", 16000))
+    ctx["output_sample_rate"] = _int_or(0, ctx.get("output_sample_rate", 0))
+    ctx["noise_floor_rms"] = _float_or(0.0025, ctx.get("noise_floor_rms", 0.0025))
+    ctx["hostapi_name"] = str(ctx.get("hostapi_name", "") or "").strip()
+    ctx["input_device_name"] = str(ctx.get("input_device_name", "unknown") or "unknown")
+    ctx["output_device_name"] = str(ctx.get("output_device_name", "unknown") or "unknown")
+    ctx["input_device_id"] = str(ctx.get("input_device_id", "") or "").strip()
+    ctx["output_device_id"] = str(ctx.get("output_device_id", "") or "").strip()
+    ctx["bluetooth_mode"] = bool(ctx.get("bluetooth_mode", False))
+    ctx["bluetooth_long_session_mode"] = bool(ctx.get("bluetooth_long_session_mode", False))
+    return ctx
 def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
     lesson_base_dir = str(config.get("lesson_base_dir", "assets/lessons"))
     playback_cfg = dict(config.get("playback", {}))
@@ -2880,8 +3150,10 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
         text_priority_threshold=float(audio_match_cfg.get("text_priority_threshold", 0.72)),
         audio_takeover_threshold=float(audio_match_cfg.get("audio_takeover_threshold", 0.62)),
     )
-    enriched_device_context = dict(device_context)
-    enriched_device_context["capture_backend"] = capture_backend
+    enriched_device_context = _normalize_device_context(
+        device_context,
+        capture_backend=capture_backend,
+    )
     enriched_device_context["session_dir"] = str(Path(session_dir).expanduser().resolve())
     orchestrator = ShadowingOrchestrator(
         repo=repo,
@@ -2986,8 +3258,8 @@ class EvidenceFuser:
     def __init__(
         self,
         *,
-        text_priority_threshold: float = 0.72,
-        audio_takeover_threshold: float = 0.62,
+        text_priority_threshold: float = 0.74,
+        audio_takeover_threshold: float = 0.66,
         disagreement_soft_sec: float = 0.42,
         disagreement_hard_sec: float = 1.20,
     ) -> None:
@@ -3029,9 +3301,9 @@ class EvidenceFuser:
                 0.0,
                 min(
                     1.0,
-                    0.42 * tracking_quality
+                    0.40 * tracking_quality
                     + 0.22 * progress_conf
-                    + 0.16 * joint_conf
+                    + 0.18 * joint_conf
                     + 0.10 * stable
                     + 0.10 * (1.0 if recently_progressed else 0.0),
                 ),
@@ -3039,9 +3311,9 @@ class EvidenceFuser:
             text_ref_time_sec = float(getattr(progress, "estimated_ref_time_sec", 0.0))
             text_ref_idx = int(getattr(progress, "estimated_ref_idx", 0))
             if position_source == "audio":
-                text_conf *= 0.84
+                text_conf *= 0.82
             elif position_source == "joint":
-                text_conf *= 0.92
+                text_conf *= 0.90
         audio_conf = 0.0
         audio_ref_time_sec = None
         audio_ref_idx = 0
@@ -3055,12 +3327,18 @@ class EvidenceFuser:
             audio_ref_idx = int(audio_match.estimated_ref_idx_hint)
             audio_conf = float(audio_match.confidence)
             repeated = float(audio_match.repeated_pattern_score)
-            still_following = max(still_following, audio_conf * 0.80)
+            still_following = max(still_following, audio_conf * 0.82)
             audio_mode = str(getattr(audio_match, "mode", "tracking"))
         if audio_behavior is not None:
-            audio_conf = max(audio_conf, float(getattr(audio_behavior, "confidence", 0.0)) * 0.96)
-            still_following = max(still_following, float(getattr(audio_behavior, "still_following_likelihood", 0.0)))
-            repeated = max(repeated, float(getattr(audio_behavior, "repeated_likelihood", 0.0)))
+            audio_conf = max(audio_conf, float(getattr(audio_behavior, "confidence", 0.0)) * 0.98)
+            still_following = max(
+                still_following,
+                float(getattr(audio_behavior, "still_following_likelihood", 0.0)),
+            )
+            repeated = max(
+                repeated,
+                float(getattr(audio_behavior, "repeated_likelihood", 0.0)),
+            )
             reentry = float(getattr(audio_behavior, "reentry_likelihood", 0.0))
             paused = float(getattr(audio_behavior, "paused_likelihood", 0.0))
         if signal_quality is not None:
@@ -3070,17 +3348,17 @@ class EvidenceFuser:
                     0.45 if signal_quality.vad_active else 0.0,
                 )
             )
-            if speaking_like >= 0.56:
-                still_following = max(still_following, min(1.0, 0.55 + 0.30 * speaking_like))
+            if speaking_like >= 0.54:
+                still_following = max(still_following, min(1.0, 0.54 + 0.32 * speaking_like))
             if signal_quality.dropout_detected:
-                audio_conf *= 0.90
-                still_following *= 0.92
+                audio_conf *= 0.92
+                still_following *= 0.94
             if float(signal_quality.quality_score) < 0.40:
-                audio_conf *= 0.94
+                audio_conf *= 0.95
         if text_ref_time_sec is None and audio_ref_time_sec is not None:
             est_ref_time_sec = float(audio_ref_time_sec)
             est_ref_idx = int(audio_ref_idx)
-            fused_conf = max(audio_conf, still_following * 0.92)
+            fused_conf = max(audio_conf, still_following * 0.92, reentry * 0.90)
             return FusionEvidence(
                 estimated_ref_time_sec=float(est_ref_time_sec),
                 estimated_ref_idx_hint=int(max(0, est_ref_idx)),
@@ -3090,10 +3368,18 @@ class EvidenceFuser:
                 still_following_likelihood=float(still_following),
                 repeated_likelihood=float(repeated),
                 reentry_likelihood=float(reentry),
-                should_prevent_hold=bool(still_following >= 0.66 and repeated < 0.78),
-                should_prevent_seek=bool(repeated >= 0.60 or reentry >= 0.58),
-                should_widen_reacquire_window=bool(audio_conf >= 0.56 or reentry >= 0.56),
-                should_recenter_aligner_window=bool(audio_conf >= 0.66),
+                should_prevent_hold=bool(
+                    (still_following >= 0.64 or reentry >= 0.56) and paused < 0.80
+                ),
+                should_prevent_seek=bool(
+                    repeated >= 0.54 or reentry >= 0.54 or still_following >= 0.78
+                ),
+                should_widen_reacquire_window=bool(
+                    audio_conf >= 0.54 or reentry >= 0.54
+                ),
+                should_recenter_aligner_window=bool(
+                    audio_conf >= 0.70 and reentry >= 0.52
+                ),
                 emitted_at_sec=float(now_sec),
             )
         if text_ref_time_sec is None:
@@ -3107,34 +3393,34 @@ class EvidenceFuser:
             fused_conf = text_conf
             if audio_ref_time_sec is not None:
                 if disagreement <= self.disagreement_soft_sec:
-                    fused_conf = min(1.0, fused_conf + 0.06)
+                    fused_conf = min(1.0, fused_conf + 0.05)
                 elif disagreement >= self.disagreement_hard_sec:
-                    fused_conf = max(0.0, fused_conf - 0.06)
+                    fused_conf = max(0.0, fused_conf - 0.05)
         else:
             audio_can_takeover = bool(
                 audio_conf >= self.audio_takeover_threshold
-                and still_following >= 0.66
-                and repeated < 0.72
                 and (
-                    reentry >= 0.56
+                    reentry >= 0.58
                     or audio_mode in {"reentry", "recovery"}
-                    or text_conf < 0.52
+                    or (text_conf < 0.50 and still_following >= 0.72)
                 )
+                and repeated < 0.66
+                and paused < 0.78
+                and disagreement <= 1.30
             )
-            if audio_can_takeover and disagreement <= 1.40:
+            if audio_can_takeover:
                 est_ref_time_sec = float(audio_ref_time_sec)
                 est_ref_idx = int(audio_ref_idx)
-                fused_conf = max(audio_conf * 0.94, still_following * 0.90, text_conf * 0.84)
+                fused_conf = max(audio_conf * 0.96, still_following * 0.92, text_conf * 0.82)
             else:
-                w_text = max(0.16, text_conf)
-                w_audio = max(0.18, audio_conf)
-                if repeated >= 0.68:
-                    w_audio *= 0.22
+                w_text = max(0.22, text_conf)
+                w_audio = max(0.16, audio_conf)
+                if repeated >= 0.62:
+                    w_audio *= 0.18
                 elif paused >= 0.72:
-                    w_audio *= 0.38
-                elif disagreement >= self.disagreement_hard_sec:
-                    if reentry < 0.62:
-                        w_audio *= 0.46
+                    w_audio *= 0.32
+                elif disagreement >= self.disagreement_hard_sec and reentry < 0.60:
+                    w_audio *= 0.42
                 denom = max(1e-6, w_text + w_audio)
                 est_ref_time_sec = (
                     w_text * float(text_ref_time_sec)
@@ -3147,42 +3433,43 @@ class EvidenceFuser:
                 )
                 fused_conf = max(
                     text_conf,
-                    audio_conf * 0.90,
-                    0.55 * text_conf + 0.45 * audio_conf,
+                    audio_conf * 0.88,
+                    0.60 * text_conf + 0.40 * audio_conf,
                 )
                 if disagreement <= self.disagreement_soft_sec:
-                    fused_conf = min(1.0, fused_conf + 0.06)
+                    fused_conf = min(1.0, fused_conf + 0.05)
                 elif disagreement >= self.disagreement_hard_sec:
                     fused_conf = max(0.0, fused_conf - 0.08)
         should_prevent_hold = bool(
             (
-                (text_conf < 0.60 and still_following >= 0.66)
-                or (text_conf < 0.54 and audio_conf >= 0.64)
-                or (reentry >= 0.62)
-                or (active_speaking and still_following >= 0.62)
+                still_following >= 0.64
+                or reentry >= 0.58
+                or (active_speaking and still_following >= 0.58)
+                or (recently_progressed and audio_conf >= 0.54)
+                or (text_conf < 0.58 and audio_conf >= 0.60)
             )
             and repeated < 0.78
-            and paused < 0.78
+            and paused < 0.80
         )
         should_prevent_seek = bool(
-            repeated >= 0.60
-            or reentry >= 0.58
-            or (audio_conf >= 0.64 and text_conf < 0.52 and disagreement <= 1.20)
+            repeated >= 0.54
+            or reentry >= 0.56
+            or still_following >= 0.78
+            or (audio_conf >= 0.62 and disagreement <= 1.10 and text_conf < 0.54)
         )
         should_recenter_aligner_window = bool(
             audio_ref_time_sec is not None
             and (
-                (audio_conf >= 0.66 and text_conf < 0.56)
-                or (disagreement >= 0.95 and audio_conf >= 0.62 and text_conf < 0.64)
-                or (reentry >= 0.62)
+                (audio_conf >= 0.68 and text_conf < 0.56 and reentry >= 0.52)
+                or (disagreement >= 0.95 and audio_conf >= 0.64 and reentry >= 0.56)
             )
         )
         should_widen_reacquire_window = bool(
             audio_ref_time_sec is not None
             and (
-                (audio_conf >= 0.56 and text_conf < 0.48)
-                or (reentry >= 0.56)
-                or (repeated >= 0.56)
+                audio_conf >= 0.54
+                or reentry >= 0.54
+                or repeated >= 0.52
                 or (paused >= 0.72 and still_following < 0.58)
             )
         )
@@ -3773,6 +4060,92 @@ class SignalQualityMonitor:
 ```
 
 ---
+### 文件: `shadowing_app/src/shadowing/preprocess/assembled_reference_loader.py`
+
+```python
+from __future__ import annotations
+import json
+from dataclasses import dataclass
+from pathlib import Path
+import numpy as np
+import soundfile as sf
+from shadowing.preprocess.reference_builder import SegmentTimelineRecord
+from shadowing.types import AudioChunk
+@dataclass(slots=True)
+class AssembledReferenceBundle:
+    audio_chunk: AudioChunk
+    segment_records: list[SegmentTimelineRecord]
+    assembled_audio_path: str
+    segments_manifest_path: str
+class AssembledReferenceLoader:
+    def __init__(self, base_dir: str) -> None:
+        self.base_dir = Path(base_dir)
+    def exists(self, lesson_id: str) -> bool:
+        lesson_dir = self.base_dir / lesson_id
+        assembled_audio = lesson_dir / "assembled_reference.wav"
+        segments_manifest = lesson_dir / "segments_manifest.json"
+        return assembled_audio.exists() and segments_manifest.exists()
+    def load(self, lesson_id: str) -> AssembledReferenceBundle:
+        lesson_dir = self.base_dir / lesson_id
+        assembled_audio = lesson_dir / "assembled_reference.wav"
+        segments_manifest = lesson_dir / "segments_manifest.json"
+        if not assembled_audio.exists():
+            raise FileNotFoundError(f"assembled_reference.wav not found: {assembled_audio}")
+        if not segments_manifest.exists():
+            raise FileNotFoundError(f"segments_manifest.json not found: {segments_manifest}")
+        data = json.loads(segments_manifest.read_text(encoding="utf-8"))
+        raw_segments = data.get("segments", [])
+        segment_records = [self._coerce_segment_record(x, i) for i, x in enumerate(raw_segments)]
+        samples, sr = sf.read(str(assembled_audio), dtype="float32", always_2d=False)
+        arr = np.asarray(samples, dtype=np.float32)
+        if arr.ndim == 1:
+            channels = 1
+            duration_sec = float(arr.shape[0]) / float(sr)
+        else:
+            channels = int(arr.shape[1])
+            duration_sec = float(arr.shape[0]) / float(sr)
+        audio_chunk = AudioChunk(
+            chunk_id=0,
+            sample_rate=int(sr),
+            channels=channels,
+            samples=arr,
+            duration_sec=float(duration_sec),
+            start_time_sec=0.0,
+            path=str(assembled_audio),
+        )
+        return AssembledReferenceBundle(
+            audio_chunk=audio_chunk,
+            segment_records=segment_records,
+            assembled_audio_path=str(assembled_audio),
+            segments_manifest_path=str(segments_manifest),
+        )
+    def _coerce_segment_record(self, raw: dict, fallback_idx: int) -> SegmentTimelineRecord:
+        chars = raw.get("chars", [])
+        pinyins = raw.get("pinyins", [])
+        local_starts = raw.get("local_starts", [])
+        local_ends = raw.get("local_ends", [])
+        return SegmentTimelineRecord(
+            segment_id=int(raw.get("segment_id", fallback_idx)),
+            text=str(raw.get("text", "")),
+            chars=[str(x) for x in chars],
+            pinyins=[str(x or "") for x in pinyins],
+            local_starts=[float(x) for x in local_starts],
+            local_ends=[float(x) for x in local_ends],
+            global_start_sec=float(raw.get("global_start_sec", 0.0)),
+            sentence_id=int(raw.get("sentence_id", 0)),
+            clause_id=int(raw.get("clause_id", fallback_idx)),
+            trim_head_sec=float(raw.get("trim_head_sec", 0.0) or 0.0),
+            trim_tail_sec=float(raw.get("trim_tail_sec", 0.0) or 0.0),
+            assembled_start_sec=(
+                None if raw.get("assembled_start_sec") is None else float(raw.get("assembled_start_sec"))
+            ),
+            assembled_end_sec=(
+                None if raw.get("assembled_end_sec") is None else float(raw.get("assembled_end_sec"))
+            ),
+        )
+```
+
+---
 ### 文件: `shadowing_app/src/shadowing/preprocess/chunker.py`
 
 ```python
@@ -3814,6 +4187,7 @@ class ClauseChunker:
 
 ```python
 from __future__ import annotations
+from pathlib import Path
 from shadowing.interfaces.repository import LessonRepository
 from shadowing.interfaces.tts import TTSProvider
 class LessonPreprocessPipeline:
@@ -3821,13 +4195,306 @@ class LessonPreprocessPipeline:
         self.tts_provider = tts_provider
         self.repo = repo
     def run(self, lesson_id: str, text: str, output_dir: str) -> None:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
         manifest, ref_map = self.tts_provider.synthesize_lesson(
             lesson_id=lesson_id,
             text=text,
-            output_dir=output_dir,
+            output_dir=str(output_path),
         )
         self.repo.save_manifest(manifest)
         self.repo.save_reference_map(lesson_id, ref_map)
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/preprocess/providers/audio_assembler.py`
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass
+from pathlib import Path
+import numpy as np
+import soundfile as sf
+from shadowing.preprocess.reference_builder import SegmentTimelineRecord
+@dataclass(slots=True)
+class AudioAssemblerConfig:
+    silence_rms_threshold: float = 0.0035
+    min_silence_keep_sec: float = 0.035
+    max_trim_head_sec: float = 0.180
+    max_trim_tail_sec: float = 0.220
+    crossfade_sec: float = 0.025
+    write_trimmed_segment_files: bool = False
+    trimmed_segments_dirname: str = "assembled_segments"
+@dataclass(slots=True)
+class AssembledAudioResult:
+    sample_rate: int
+    assembled_audio_path: str
+    total_duration_sec: float
+    segment_records: list[SegmentTimelineRecord]
+class AudioAssembler:
+    def __init__(self, config: AudioAssemblerConfig | None = None) -> None:
+        self.config = config or AudioAssemblerConfig()
+    def assemble(
+        self,
+        *,
+        output_dir: str,
+        segment_records: list[SegmentTimelineRecord],
+        segment_audio_paths: list[str],
+        output_filename: str = "assembled_reference.wav",
+    ) -> AssembledAudioResult:
+        if not segment_records:
+            raise ValueError("segment_records is empty")
+        if not segment_audio_paths:
+            raise ValueError("segment_audio_paths is empty")
+        if len(segment_records) != len(segment_audio_paths):
+            raise ValueError(
+                f"segment_records and segment_audio_paths length mismatch: "
+                f"{len(segment_records)} vs {len(segment_audio_paths)}"
+            )
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        trimmed_segments_dir = output_path / self.config.trimmed_segments_dirname
+        if self.config.write_trimmed_segment_files:
+            trimmed_segments_dir.mkdir(parents=True, exist_ok=True)
+        loaded_segments: list[tuple[np.ndarray, int]] = []
+        sample_rate: int | None = None
+        for audio_path in segment_audio_paths:
+            audio, sr = self._load_mono_float_audio(audio_path)
+            if sample_rate is None:
+                sample_rate = int(sr)
+            elif int(sr) != int(sample_rate):
+                raise ValueError(
+                    f"Inconsistent segment sample_rate: {sample_rate} vs {sr}, path={audio_path}"
+                )
+            loaded_segments.append((audio, int(sr)))
+        assert sample_rate is not None
+        updated_records: list[SegmentTimelineRecord] = []
+        assembled_parts: list[np.ndarray] = []
+        assembled_cursor_sec = 0.0
+        previous_audio: np.ndarray | None = None
+        for idx, ((audio, sr), raw_record, audio_path) in enumerate(
+            zip(loaded_segments, segment_records, segment_audio_paths, strict=True)
+        ):
+            trimmed_audio, trim_head_sec, trim_tail_sec = self._trim_segment_audio(
+                audio=audio,
+                sample_rate=sr,
+            )
+            if trimmed_audio.size == 0:
+                trimmed_audio = np.zeros((1,), dtype=np.float32)
+                trim_head_sec = 0.0
+                trim_tail_sec = 0.0
+            crossfade_sec = 0.0
+            if previous_audio is not None and previous_audio.size > 0 and trimmed_audio.size > 0:
+                crossfade_sec = self._effective_crossfade_sec(
+                    left_audio=previous_audio,
+                    right_audio=trimmed_audio,
+                    sample_rate=sr,
+                )
+            assembled_start_sec = assembled_cursor_sec - crossfade_sec
+            assembled_start_sec = max(0.0, assembled_start_sec)
+            updated_record = SegmentTimelineRecord(
+                segment_id=int(raw_record.segment_id),
+                text=str(raw_record.text),
+                chars=list(raw_record.chars),
+                pinyins=list(raw_record.pinyins),
+                local_starts=[float(x) for x in raw_record.local_starts],
+                local_ends=[float(x) for x in raw_record.local_ends],
+                global_start_sec=float(raw_record.global_start_sec),
+                sentence_id=int(raw_record.sentence_id),
+                clause_id=int(raw_record.clause_id),
+                trim_head_sec=float(trim_head_sec),
+                trim_tail_sec=float(trim_tail_sec),
+                assembled_start_sec=float(assembled_start_sec),
+                assembled_end_sec=None,
+            )
+            if previous_audio is None or crossfade_sec <= 1e-9:
+                assembled_parts.append(trimmed_audio)
+                assembled_cursor_sec += float(trimmed_audio.shape[0]) / float(sr)
+            else:
+                mixed = self._crossfade_two_segments(
+                    left_audio=assembled_parts[-1],
+                    right_audio=trimmed_audio,
+                    sample_rate=sr,
+                    crossfade_sec=crossfade_sec,
+                )
+                assembled_parts[-1] = mixed
+                assembled_cursor_sec = self._sum_duration_sec(assembled_parts, sr)
+            updated_record.assembled_end_sec = float(assembled_cursor_sec)
+            updated_records.append(updated_record)
+            if self.config.write_trimmed_segment_files:
+                trimmed_path = trimmed_segments_dir / f"{idx:04d}.wav"
+                sf.write(
+                    str(trimmed_path),
+                    trimmed_audio.astype(np.float32, copy=False),
+                    sr,
+                    subtype="PCM_16",
+                )
+            previous_audio = trimmed_audio
+        final_audio = self._concat_parts(assembled_parts)
+        assembled_audio_path = output_path / output_filename
+        sf.write(
+            str(assembled_audio_path),
+            final_audio.astype(np.float32, copy=False),
+            sample_rate,
+            subtype="PCM_16",
+        )
+        total_duration_sec = float(final_audio.shape[0]) / float(sample_rate)
+        if updated_records:
+            updated_records[-1].assembled_end_sec = float(total_duration_sec)
+        return AssembledAudioResult(
+            sample_rate=int(sample_rate),
+            assembled_audio_path=str(assembled_audio_path),
+            total_duration_sec=float(total_duration_sec),
+            segment_records=updated_records,
+        )
+    def _load_mono_float_audio(self, audio_path: str) -> tuple[np.ndarray, int]:
+        data, sr = sf.read(str(audio_path), dtype="float32", always_2d=False)
+        arr = np.asarray(data, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = np.mean(arr, axis=1).astype(np.float32, copy=False)
+        arr = arr.reshape(-1).astype(np.float32, copy=False)
+        return arr, int(sr)
+    def _trim_segment_audio(
+        self,
+        *,
+        audio: np.ndarray,
+        sample_rate: int,
+    ) -> tuple[np.ndarray, float, float]:
+        arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            return arr, 0.0, 0.0
+        head_idx = self._detect_head_trim_index(arr, sample_rate)
+        tail_idx = self._detect_tail_trim_index(arr, sample_rate)
+        if tail_idx <= head_idx:
+            return arr, 0.0, 0.0
+        trimmed = arr[head_idx:tail_idx].astype(np.float32, copy=False)
+        trim_head_sec = float(head_idx) / float(sample_rate)
+        trim_tail_sec = float(arr.shape[0] - tail_idx) / float(sample_rate)
+        return trimmed, trim_head_sec, trim_tail_sec
+    def _detect_head_trim_index(self, audio: np.ndarray, sample_rate: int) -> int:
+        max_trim_samples = int(round(self.config.max_trim_head_sec * sample_rate))
+        keep_samples = int(round(self.config.min_silence_keep_sec * sample_rate))
+        threshold = float(self.config.silence_rms_threshold)
+        if max_trim_samples <= 0:
+            return 0
+        search_end = min(audio.shape[0], max_trim_samples)
+        if search_end <= 0:
+            return 0
+        first_active = self._find_first_active_sample(audio[:search_end], threshold)
+        if first_active is None:
+            return 0
+        trim_to = max(0, first_active - keep_samples)
+        return int(min(trim_to, search_end))
+    def _detect_tail_trim_index(self, audio: np.ndarray, sample_rate: int) -> int:
+        max_trim_samples = int(round(self.config.max_trim_tail_sec * sample_rate))
+        keep_samples = int(round(self.config.min_silence_keep_sec * sample_rate))
+        threshold = float(self.config.silence_rms_threshold)
+        if max_trim_samples <= 0:
+            return int(audio.shape[0])
+        search_start = max(0, audio.shape[0] - max_trim_samples)
+        tail_region = audio[search_start:]
+        if tail_region.size == 0:
+            return int(audio.shape[0])
+        last_active = self._find_last_active_sample(tail_region, threshold)
+        if last_active is None:
+            return int(audio.shape[0])
+        absolute_last_active = search_start + last_active
+        trim_to = min(audio.shape[0], absolute_last_active + keep_samples + 1)
+        return int(max(trim_to, 1))
+    def _find_first_active_sample(
+        self,
+        audio: np.ndarray,
+        threshold: float,
+    ) -> int | None:
+        frame = max(32, min(512, audio.shape[0] // 8 if audio.shape[0] >= 8 else 32))
+        hop = max(16, frame // 4)
+        for start in range(0, max(1, audio.shape[0] - frame + 1), hop):
+            win = audio[start : start + frame]
+            rms = self._rms(win)
+            peak = float(np.max(np.abs(win))) if win.size else 0.0
+            if rms >= threshold or peak >= max(threshold * 2.2, 0.008):
+                return int(start)
+        if audio.shape[0] > 0:
+            rms = self._rms(audio)
+            peak = float(np.max(np.abs(audio)))
+            if rms >= threshold or peak >= max(threshold * 2.2, 0.008):
+                return 0
+        return None
+    def _find_last_active_sample(
+        self,
+        audio: np.ndarray,
+        threshold: float,
+    ) -> int | None:
+        frame = max(32, min(512, audio.shape[0] // 8 if audio.shape[0] >= 8 else 32))
+        hop = max(16, frame // 4)
+        last_hit: int | None = None
+        for start in range(0, max(1, audio.shape[0] - frame + 1), hop):
+            win = audio[start : start + frame]
+            rms = self._rms(win)
+            peak = float(np.max(np.abs(win))) if win.size else 0.0
+            if rms >= threshold or peak >= max(threshold * 2.2, 0.008):
+                last_hit = int(start + win.shape[0] - 1)
+        if last_hit is None and audio.shape[0] > 0:
+            rms = self._rms(audio)
+            peak = float(np.max(np.abs(audio)))
+            if rms >= threshold or peak >= max(threshold * 2.2, 0.008):
+                last_hit = int(audio.shape[0] - 1)
+        return last_hit
+    def _effective_crossfade_sec(
+        self,
+        *,
+        left_audio: np.ndarray,
+        right_audio: np.ndarray,
+        sample_rate: int,
+    ) -> float:
+        desired = max(0.0, float(self.config.crossfade_sec))
+        if desired <= 1e-9:
+            return 0.0
+        max_left = float(left_audio.shape[0]) / float(sample_rate)
+        max_right = float(right_audio.shape[0]) / float(sample_rate)
+        effective = min(desired, max_left * 0.35, max_right * 0.35)
+        return max(0.0, effective)
+    def _crossfade_two_segments(
+        self,
+        *,
+        left_audio: np.ndarray,
+        right_audio: np.ndarray,
+        sample_rate: int,
+        crossfade_sec: float,
+    ) -> np.ndarray:
+        left_arr = np.asarray(left_audio, dtype=np.float32).reshape(-1)
+        right_arr = np.asarray(right_audio, dtype=np.float32).reshape(-1)
+        fade_samples = int(round(crossfade_sec * sample_rate))
+        if fade_samples <= 0:
+            return np.concatenate([left_arr, right_arr], axis=0).astype(np.float32, copy=False)
+        fade_samples = min(fade_samples, left_arr.shape[0], right_arr.shape[0])
+        if fade_samples <= 0:
+            return np.concatenate([left_arr, right_arr], axis=0).astype(np.float32, copy=False)
+        left_keep = left_arr[:-fade_samples]
+        left_fade = left_arr[-fade_samples:]
+        right_fade = right_arr[:fade_samples]
+        right_keep = right_arr[fade_samples:]
+        fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+        fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+        mixed = left_fade * fade_out + right_fade * fade_in
+        return np.concatenate([left_keep, mixed, right_keep], axis=0).astype(np.float32, copy=False)
+    def _concat_parts(self, parts: list[np.ndarray]) -> np.ndarray:
+        if not parts:
+            return np.zeros((0,), dtype=np.float32)
+        if len(parts) == 1:
+            return np.asarray(parts[0], dtype=np.float32).reshape(-1)
+        return np.concatenate(
+            [np.asarray(x, dtype=np.float32).reshape(-1) for x in parts],
+            axis=0,
+        ).astype(np.float32, copy=False)
+    def _sum_duration_sec(self, parts: list[np.ndarray], sample_rate: int) -> float:
+        total_samples = sum(int(np.asarray(x).shape[0]) for x in parts)
+        return float(total_samples) / float(sample_rate)
+    def _rms(self, audio: np.ndarray) -> float:
+        arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(arr))))
 ```
 
 ---
@@ -3837,6 +4504,7 @@ class LessonPreprocessPipeline:
 from __future__ import annotations
 import base64
 import io
+import json
 import re
 from pathlib import Path
 import httpx
@@ -3844,8 +4512,15 @@ import numpy as np
 import soundfile as sf
 from pypinyin import lazy_pinyin
 from shadowing.interfaces.tts import TTSProvider
-from shadowing.preprocess.chunker import ClauseChunker
-from shadowing.preprocess.reference_builder import ReferenceBuilder
+from shadowing.preprocess.providers.audio_assembler import (
+    AudioAssembler,
+    AudioAssemblerConfig,
+)
+from shadowing.preprocess.reference_builder import (
+    ReferenceBuilder,
+    SegmentTimelineRecord,
+)
+from shadowing.preprocess.segmenter import ShadowingSegment, ShadowingSegmenter
 from shadowing.types import LessonManifest, ReferenceMap
 class ElevenLabsTTSProvider(TTSProvider):
     def __init__(
@@ -3855,14 +4530,58 @@ class ElevenLabsTTSProvider(TTSProvider):
         model_id: str,
         output_format: str = "pcm_44100",
         timeout_sec: float = 120.0,
+        *,
+        seed: int | None = 2025,
+        continuity_context_chars_prev: int = 100,
+        continuity_context_chars_next: int = 100,
+        target_chars_per_segment: int = 28,
+        hard_max_chars_per_segment: int = 54,
+        min_chars_per_segment: int = 6,
+        context_window_segments: int = 2,
+        max_retries_per_segment: int = 2,
+        assemble_reference_audio: bool = True,
+        assembled_reference_filename: str = "assembled_reference.wav",
+        silence_rms_threshold: float = 0.0035,
+        min_silence_keep_sec: float = 0.035,
+        max_trim_head_sec: float = 0.180,
+        max_trim_tail_sec: float = 0.220,
+        crossfade_sec: float = 0.025,
+        write_trimmed_segment_files: bool = False,
+        trimmed_segments_dirname: str = "assembled_segments",
     ) -> None:
         self.api_key = api_key
         self.voice_id = voice_id
         self.model_id = model_id
         self.output_format = output_format
         self.timeout_sec = float(timeout_sec)
-        self.chunker = ClauseChunker(max_clause_chars=120)
+        self.seed = seed
+        self.max_retries_per_segment = max(1, int(max_retries_per_segment))
+        self.continuity_context_chars_prev = max(20, int(continuity_context_chars_prev))
+        self.continuity_context_chars_next = max(20, int(continuity_context_chars_next))
+        self.assemble_reference_audio = bool(assemble_reference_audio)
+        self.assembled_reference_filename = str(assembled_reference_filename)
+        self.segmenter = ShadowingSegmenter(
+            target_chars_per_segment=target_chars_per_segment,
+            hard_max_chars_per_segment=hard_max_chars_per_segment,
+            min_chars_per_segment=min_chars_per_segment,
+            context_window_segments=context_window_segments,
+            context_max_chars=max(
+                self.continuity_context_chars_prev,
+                self.continuity_context_chars_next,
+            ),
+        )
         self.reference_builder = ReferenceBuilder()
+        self.audio_assembler = AudioAssembler(
+            AudioAssemblerConfig(
+                silence_rms_threshold=float(silence_rms_threshold),
+                min_silence_keep_sec=float(min_silence_keep_sec),
+                max_trim_head_sec=float(max_trim_head_sec),
+                max_trim_tail_sec=float(max_trim_tail_sec),
+                crossfade_sec=float(crossfade_sec),
+                write_trimmed_segment_files=bool(write_trimmed_segment_files),
+                trimmed_segments_dirname=str(trimmed_segments_dirname),
+            )
+        )
     def synthesize_lesson(
         self,
         lesson_id: str,
@@ -3873,82 +4592,174 @@ class ElevenLabsTTSProvider(TTSProvider):
         output_path.mkdir(parents=True, exist_ok=True)
         chunks_dir = output_path / "chunks"
         chunks_dir.mkdir(parents=True, exist_ok=True)
-        clauses = self.chunker.split_text(text)
-        if not clauses:
-            raise ValueError("No valid clauses found after splitting input text.")
-        all_chars: list[str] = []
-        all_pinyins: list[str] = []
-        all_starts: list[float] = []
-        all_ends: list[float] = []
-        all_sentence_ids: list[int] = []
-        all_clause_ids: list[int] = []
+        alignments_dir = output_path / "alignments"
+        alignments_dir.mkdir(parents=True, exist_ok=True)
+        lesson_text = str(text or "").strip()
+        if not lesson_text:
+            raise ValueError("No valid lesson text provided.")
+        segments = self.segmenter.segment_text(lesson_text)
+        if not segments:
+            raise ValueError("No valid segments found after segmentation.")
         chunk_paths: list[str] = []
+        raw_segment_records: list[SegmentTimelineRecord] = []
+        segments_manifest_records: list[dict] = []
         global_time_offset = 0.0
         total_audio_duration = 0.0
         sample_rate_out: int | None = None
-        sentence_id = 0
-        previous_text = ""
         with httpx.Client(timeout=self.timeout_sec) as client:
-            for clause_id, clause_text in enumerate(clauses):
-                next_text = clauses[clause_id + 1] if clause_id + 1 < len(clauses) else ""
-                resp = self._request_tts_with_timestamps(
+            for seg in segments:
+                response = self._request_tts_with_retries(
                     client=client,
-                    text=clause_text,
-                    previous_text=previous_text,
-                    next_text=next_text,
+                    segment=seg,
                 )
-                audio_bytes = base64.b64decode(resp["audio_base64"])
+                audio_bytes = base64.b64decode(response["audio_base64"])
                 chunk_file, chunk_samplerate, chunk_duration = self._write_chunk_audio(
                     chunks_dir=chunks_dir,
-                    clause_id=clause_id,
+                    segment_id=seg.segment_id,
                     audio_bytes=audio_bytes,
                 )
-                chunk_paths.append(str(chunk_file))
                 if sample_rate_out is None:
                     sample_rate_out = int(chunk_samplerate)
-                elif sample_rate_out != int(chunk_samplerate):
+                elif int(sample_rate_out) != int(chunk_samplerate):
                     raise ValueError(
                         f"Inconsistent chunk sample rate: {sample_rate_out} vs {chunk_samplerate}"
                     )
-                alignment = resp.get("alignment") or resp.get("normalized_alignment")
+                chunk_paths.append(str(chunk_file))
+                alignment = response.get("alignment") or response.get("normalized_alignment")
                 if not alignment:
-                    raise ValueError(f"No alignment returned for clause {clause_id}: {clause_text!r}")
-                chars = alignment["characters"]
-                starts = alignment["character_start_times_seconds"]
-                ends = alignment["character_end_times_seconds"]
-                if not (len(chars) == len(starts) == len(ends)):
                     raise ValueError(
-                        f"Alignment length mismatch in clause {clause_id}: "
-                        f"{len(chars)=}, {len(starts)=}, {len(ends)=}"
+                        f"No alignment returned for segment {seg.segment_id}: {seg.text!r}"
                     )
-                pinyins = [lazy_pinyin(ch)[0] if ch.strip() else "" for ch in chars]
-                for ch, py, ts, te in zip(chars, pinyins, starts, ends, strict=True):
-                    all_chars.append(ch)
-                    all_pinyins.append(py)
-                    all_starts.append(global_time_offset + float(ts))
-                    all_ends.append(global_time_offset + float(te))
-                    all_sentence_ids.append(sentence_id)
-                    all_clause_ids.append(clause_id)
-                alignment_end_sec = max((float(x) for x in ends), default=0.0)
-                offset_advance_sec = alignment_end_sec if alignment_end_sec > 0.0 else chunk_duration
+                chars = alignment.get("characters") or []
+                local_starts = alignment.get("character_start_times_seconds") or []
+                local_ends = alignment.get("character_end_times_seconds") or []
+                if not (len(chars) == len(local_starts) == len(local_ends)):
+                    raise ValueError(
+                        f"Alignment length mismatch in segment {seg.segment_id}: "
+                        f"{len(chars)=}, {len(local_starts)=}, {len(local_ends)=}"
+                    )
+                pinyins = [lazy_pinyin(ch)[0] if str(ch).strip() else "" for ch in chars]
+                alignment_path = alignments_dir / f"{seg.segment_id:04d}.alignment.json"
+                alignment_payload = {
+                    "segment_id": int(seg.segment_id),
+                    "text": str(seg.text),
+                    "sentence_id": int(seg.sentence_id),
+                    "clause_id": int(seg.clause_id),
+                    "kind": str(seg.kind),
+                    "prev_context_text": str(seg.prev_context_text),
+                    "next_context_text": str(seg.next_context_text),
+                    "global_start_sec": float(global_time_offset),
+                    "duration_sec": float(chunk_duration),
+                    "sample_rate": int(chunk_samplerate),
+                    "alignment": alignment,
+                }
+                alignment_path.write_text(
+                    json.dumps(alignment_payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                alignment_end_sec = max((float(x) for x in local_ends), default=0.0)
+                offset_advance_sec = alignment_end_sec if alignment_end_sec > 0.0 else float(chunk_duration)
+                raw_record = SegmentTimelineRecord(
+                    segment_id=int(seg.segment_id),
+                    text=str(seg.text),
+                    chars=[str(x) for x in chars],
+                    pinyins=[str(x or "") for x in pinyins],
+                    local_starts=[float(x) for x in local_starts],
+                    local_ends=[float(x) for x in local_ends],
+                    global_start_sec=float(global_time_offset),
+                    sentence_id=int(seg.sentence_id),
+                    clause_id=int(seg.clause_id),
+                    trim_head_sec=0.0,
+                    trim_tail_sec=0.0,
+                    assembled_start_sec=None,
+                    assembled_end_sec=None,
+                )
+                raw_segment_records.append(raw_record)
+                segments_manifest_records.append(
+                    {
+                        "segment_id": int(seg.segment_id),
+                        "sentence_id": int(seg.sentence_id),
+                        "clause_id": int(seg.clause_id),
+                        "kind": str(seg.kind),
+                        "text": str(seg.text),
+                        "prev_context_text": str(seg.prev_context_text),
+                        "next_context_text": str(seg.next_context_text),
+                        "audio_path": str(chunk_file),
+                        "alignment_path": str(alignment_path),
+                        "duration_sec": float(chunk_duration),
+                        "sample_rate": int(chunk_samplerate),
+                        "char_count": len(self._normalize_text(seg.text)),
+                        "alignment_char_count": len(chars),
+                        "global_start_sec": float(global_time_offset),
+                        "global_end_sec": float(global_time_offset + offset_advance_sec),
+                        "request_seed": self.seed,
+                        "output_format": self.output_format,
+                        "model_id": self.model_id,
+                        "chars": [str(x) for x in chars],
+                        "pinyins": [str(x or "") for x in pinyins],
+                        "local_starts": [float(x) for x in local_starts],
+                        "local_ends": [float(x) for x in local_ends],
+                        "trim_head_sec": 0.0,
+                        "trim_tail_sec": 0.0,
+                        "assembled_start_sec": None,
+                        "assembled_end_sec": None,
+                    }
+                )
                 global_time_offset += offset_advance_sec
                 total_audio_duration = global_time_offset
-                if clause_text and clause_text[-1] in "。！？!?":
-                    sentence_id += 1
-                previous_text = clause_text
-        ref_map = self.reference_builder.build(
+        final_segment_records = raw_segment_records
+        final_total_duration_sec = float(total_audio_duration)
+        assembled_audio_path: str | None = None
+        if self.assemble_reference_audio and raw_segment_records and chunk_paths:
+            assembled = self.audio_assembler.assemble(
+                output_dir=str(output_path),
+                segment_records=raw_segment_records,
+                segment_audio_paths=chunk_paths,
+                output_filename=self.assembled_reference_filename,
+            )
+            final_segment_records = assembled.segment_records
+            final_total_duration_sec = float(assembled.total_duration_sec)
+            assembled_audio_path = assembled.assembled_audio_path
+            manifest_by_id = {int(x["segment_id"]): x for x in segments_manifest_records}
+            for record in final_segment_records:
+                item = manifest_by_id.get(int(record.segment_id))
+                if item is None:
+                    continue
+                item["trim_head_sec"] = float(record.trim_head_sec)
+                item["trim_tail_sec"] = float(record.trim_tail_sec)
+                item["assembled_start_sec"] = (
+                    None if record.assembled_start_sec is None else float(record.assembled_start_sec)
+                )
+                item["assembled_end_sec"] = (
+                    None if record.assembled_end_sec is None else float(record.assembled_end_sec)
+                )
+        segments_manifest_path = output_path / "segments_manifest.json"
+        segments_manifest_path.write_text(
+            json.dumps(
+                {
+                    "lesson_id": lesson_id,
+                    "lesson_text": lesson_text,
+                    "voice_id": self.voice_id,
+                    "model_id": self.model_id,
+                    "output_format": self.output_format,
+                    "seed": self.seed,
+                    "total_duration_sec": float(final_total_duration_sec),
+                    "assembled_audio_path": assembled_audio_path,
+                    "segments": segments_manifest_records,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        ref_map = self.reference_builder.build_from_segment_records(
             lesson_id=lesson_id,
-            chars=all_chars,
-            pinyins=all_pinyins,
-            starts=all_starts,
-            ends=all_ends,
-            sentence_ids=all_sentence_ids,
-            clause_ids=all_clause_ids,
-            total_duration_sec=total_audio_duration,
+            segment_records=final_segment_records,
+            total_duration_sec=float(final_total_duration_sec),
         )
         manifest = LessonManifest(
             lesson_id=lesson_id,
-            lesson_text=text,
+            lesson_text=lesson_text,
             sample_rate_out=sample_rate_out or 44100,
             chunk_paths=chunk_paths,
             reference_map_path=str(output_path / "reference_map.json"),
@@ -3956,17 +4767,67 @@ class ElevenLabsTTSProvider(TTSProvider):
             output_format=self.output_format,
         )
         return manifest, ref_map
+    def _request_tts_with_retries(
+        self,
+        *,
+        client: httpx.Client,
+        segment: ShadowingSegment,
+    ) -> dict:
+        last_error: Exception | None = None
+        request_plans = [
+            {
+                "previous_text": self._trim_context(
+                    segment.prev_context_text,
+                    self.continuity_context_chars_prev,
+                    from_left=True,
+                ),
+                "next_text": self._trim_context(
+                    segment.next_context_text,
+                    self.continuity_context_chars_next,
+                    from_left=False,
+                ),
+                "seed": self.seed,
+            },
+            {
+                "previous_text": self._trim_context(segment.prev_context_text, 48, from_left=True),
+                "next_text": self._trim_context(segment.next_context_text, 48, from_left=False),
+                "seed": self.seed,
+            },
+            {
+                "previous_text": "",
+                "next_text": "",
+                "seed": self.seed,
+            },
+        ]
+        max_attempts = min(len(request_plans), self.max_retries_per_segment + 1)
+        for i in range(max_attempts):
+            plan = request_plans[i]
+            try:
+                return self._request_tts_with_timestamps(
+                    client=client,
+                    text=segment.text,
+                    previous_text=plan["previous_text"],
+                    next_text=plan["next_text"],
+                    seed=plan["seed"],
+                )
+            except Exception as e:
+                last_error = e
+                continue
+        raise RuntimeError(
+            f"ElevenLabs TTS failed after retries for segment={segment.segment_id}, "
+            f"text={segment.text!r}, error={last_error}"
+        )
     def _write_chunk_audio(
         self,
         chunks_dir: Path,
-        clause_id: int,
+        segment_id: int,
         audio_bytes: bytes,
     ) -> tuple[Path, int, float]:
         fmt = self.output_format.strip().lower()
         if fmt.startswith("pcm_"):
-            return self._write_pcm_like_audio(chunks_dir, clause_id, audio_bytes, fmt)
+            return self._write_pcm_like_audio(chunks_dir, segment_id, audio_bytes, fmt)
         ext = self._infer_container_extension(fmt)
-        chunk_file = chunks_dir / f"{clause_id:04d}.{ext}"
+        chunk_file = chunks_dir / f"{segment_id:04d}.{ext}"
         chunk_file.write_bytes(audio_bytes)
         info = sf.info(str(chunk_file))
         duration_sec = float(info.duration)
@@ -3975,12 +4836,12 @@ class ElevenLabsTTSProvider(TTSProvider):
     def _write_pcm_like_audio(
         self,
         chunks_dir: Path,
-        clause_id: int,
+        segment_id: int,
         audio_bytes: bytes,
         output_format: str,
     ) -> tuple[Path, int, float]:
         sample_rate = self._parse_pcm_sample_rate(output_format)
-        chunk_file = chunks_dir / f"{clause_id:04d}.wav"
+        chunk_file = chunks_dir / f"{segment_id:04d}.wav"
         wav_data, wav_sr = self._try_decode_as_container(audio_bytes)
         if wav_data is not None:
             wav_sr = int(wav_sr or sample_rate)
@@ -3992,12 +4853,12 @@ class ElevenLabsTTSProvider(TTSProvider):
             head = audio_bytes[:16].hex()
             raise ValueError(
                 "ElevenLabs returned pcm_* audio payload with odd byte length, "
-                f"cannot parse as int16 PCM. clause_id={clause_id}, "
+                f"cannot parse as int16 PCM. segment_id={segment_id}, "
                 f"bytes={len(audio_bytes)}, head={head}"
             )
         pcm_i16 = np.frombuffer(audio_bytes, dtype="<i2")
         if pcm_i16.size == 0:
-            raise ValueError(f"Empty PCM audio returned for clause {clause_id}.")
+            raise ValueError(f"Empty PCM audio returned for segment {segment_id}.")
         audio_f32 = (pcm_i16.astype(np.float32) / 32768.0).astype(np.float32, copy=False)
         sf.write(str(chunk_file), audio_f32, sample_rate, subtype="PCM_16")
         duration_sec = float(audio_f32.shape[0]) / float(sample_rate)
@@ -4037,13 +4898,14 @@ class ElevenLabsTTSProvider(TTSProvider):
         text: str,
         previous_text: str = "",
         next_text: str = "",
+        seed: int | None = None,
     ) -> dict:
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}/with-timestamps"
         headers = {
             "xi-api-key": self.api_key,
             "Content-Type": "application/json",
         }
-        payload = {
+        payload: dict[str, object] = {
             "text": text,
             "model_id": self.model_id,
             "output_format": self.output_format,
@@ -4052,6 +4914,8 @@ class ElevenLabsTTSProvider(TTSProvider):
             payload["previous_text"] = previous_text
         if next_text:
             payload["next_text"] = next_text
+        if seed is not None:
+            payload["seed"] = int(seed)
         response = client.post(url, headers=headers, json=payload)
         try:
             response.raise_for_status()
@@ -4063,6 +4927,21 @@ class ElevenLabsTTSProvider(TTSProvider):
         if "audio_base64" not in data:
             raise RuntimeError(f"ElevenLabs response missing audio_base64: {data}")
         return data
+    def _trim_context(self, text: str, max_chars: int, *, from_left: bool) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        if len(raw) <= max_chars:
+            return raw
+        if from_left:
+            return raw[-max_chars:]
+        return raw[:max_chars]
+    def _normalize_text(self, text: str) -> str:
+        raw = str(text or "").strip()
+        raw = raw.replace("\u3000", " ")
+        raw = re.sub(r"\s+", "", raw)
+        raw = re.sub(r"[，。！？；：、“”‘’\"'（）()\[\]【】<>\-—…,.!?;:/\\|`~@#$%^&*_+=]+", "", raw)
+        return raw
 ```
 
 ---
@@ -4070,18 +4949,33 @@ class ElevenLabsTTSProvider(TTSProvider):
 
 ```python
 from __future__ import annotations
+from shadowing.preprocess.assembled_reference_loader import AssembledReferenceLoader
 class ReferenceAudioFeaturePipeline:
     def __init__(self, repo, feature_store, analyzer) -> None:
         self.repo = repo
         self.feature_store = feature_store
         self.analyzer = analyzer
+        base_dir = getattr(repo, "base_dir", None)
+        self.assembled_loader = (
+            AssembledReferenceLoader(str(base_dir)) if base_dir is not None else None
+        )
     def run(self, lesson_id: str) -> str:
         ref_map = self.repo.load_reference_map(lesson_id)
+        if self.assembled_loader is not None and self.assembled_loader.exists(lesson_id):
+            bundle = self.assembled_loader.load(lesson_id)
+            features = self.analyzer.analyze(
+                lesson_id=lesson_id,
+                chunks=[bundle.audio_chunk],
+                reference_map=ref_map,
+                segment_records=bundle.segment_records,
+            )
+            return self.feature_store.save(lesson_id, features)
         chunks = self.repo.load_audio_chunks(lesson_id)
         features = self.analyzer.analyze(
             lesson_id=lesson_id,
             chunks=chunks,
             reference_map=ref_map,
+            segment_records=None,
         )
         return self.feature_store.save(lesson_id, features)
 ```
@@ -4091,14 +4985,76 @@ class ReferenceAudioFeaturePipeline:
 
 ```python
 from __future__ import annotations
+from dataclasses import dataclass
+from typing import Iterable, Sequence
 from shadowing.types import RefToken, ReferenceMap
+@dataclass(slots=True)
+class SegmentAlignedChar:
+    char: str
+    pinyin: str
+    t_start: float
+    t_end: float
+    sentence_id: int
+    clause_id: int
+@dataclass(slots=True)
+class SegmentTimelineRecord:
+    segment_id: int
+    text: str
+    chars: list[str]
+    pinyins: list[str]
+    local_starts: list[float]
+    local_ends: list[float]
+    global_start_sec: float
+    sentence_id: int
+    clause_id: int
+    trim_head_sec: float = 0.0
+    trim_tail_sec: float = 0.0
+    assembled_start_sec: float | None = None
+    assembled_end_sec: float | None = None
 class ReferenceBuilder:
     _DROP_CHARS = {
-        " ", "\t", "\n", "\r", "\u3000",
-        "，", "。", "！", "？", "；", "：", "、",
-        ",", ".", "!", "?", ";", ":", '"', "'", "“", "”", "‘", "’",
-        "（", "）", "(", ")", "[", "]", "【", "】", "<", ">", "《", "》",
-        "-", "—", "…", "|", "/", "\\",
+        " ",
+        "\t",
+        "\n",
+        "\r",
+        "\u3000",
+        "，",
+        "。",
+        "！",
+        "？",
+        "；",
+        "：",
+        "、",
+        ",",
+        ".",
+        "!",
+        "?",
+        ";",
+        ":",
+        '"',
+        "'",
+        "“",
+        "”",
+        "‘",
+        "’",
+        "（",
+        "）",
+        "(",
+        ")",
+        "[",
+        "]",
+        "【",
+        "】",
+        "<",
+        ">",
+        "《",
+        "》",
+        "-",
+        "—",
+        "…",
+        "|",
+        "/",
+        "\\",
     }
     def build(
         self,
@@ -4111,30 +5067,439 @@ class ReferenceBuilder:
         clause_ids: list[int],
         total_duration_sec: float,
     ) -> ReferenceMap:
+        self._validate_parallel_lists(
+            chars=chars,
+            pinyins=pinyins,
+            starts=starts,
+            ends=ends,
+            sentence_ids=sentence_ids,
+            clause_ids=clause_ids,
+        )
+        aligned_chars = [
+            SegmentAlignedChar(
+                char=str(ch),
+                pinyin=str(py or ""),
+                t_start=float(ts),
+                t_end=float(te),
+                sentence_id=int(sid),
+                clause_id=int(cid),
+            )
+            for ch, py, ts, te, sid, cid in zip(
+                chars,
+                pinyins,
+                starts,
+                ends,
+                sentence_ids,
+                clause_ids,
+                strict=True,
+            )
+        ]
+        return self._build_from_aligned_chars(
+            lesson_id=lesson_id,
+            aligned_chars=aligned_chars,
+            total_duration_sec=total_duration_sec,
+        )
+    def build_from_segment_records(
+        self,
+        lesson_id: str,
+        segment_records: Sequence[SegmentTimelineRecord | dict],
+        total_duration_sec: float | None = None,
+    ) -> ReferenceMap:
+        aligned_chars: list[SegmentAlignedChar] = []
+        max_end_sec = 0.0
+        for i, raw in enumerate(segment_records):
+            record = self._coerce_segment_record(raw, fallback_segment_id=i)
+            self._validate_segment_record(record)
+            base_start_sec = (
+                float(record.assembled_start_sec)
+                if record.assembled_start_sec is not None
+                else float(record.global_start_sec)
+            )
+            trim_head_sec = max(0.0, float(record.trim_head_sec))
+            trim_tail_sec = max(0.0, float(record.trim_tail_sec))
+            segment_effective_end_sec = (
+                float(record.assembled_end_sec)
+                if record.assembled_end_sec is not None
+                else None
+            )
+            for ch, py, local_start, local_end in zip(
+                record.chars,
+                record.pinyins,
+                record.local_starts,
+                record.local_ends,
+                strict=True,
+            ):
+                raw_global_start = base_start_sec + max(0.0, float(local_start) - trim_head_sec)
+                raw_global_end = base_start_sec + max(0.0, float(local_end) - trim_head_sec)
+                if segment_effective_end_sec is not None:
+                    raw_global_start = min(raw_global_start, segment_effective_end_sec)
+                    raw_global_end = min(raw_global_end, segment_effective_end_sec)
+                if trim_tail_sec > 0.0 and segment_effective_end_sec is None:
+                    raw_global_end = max(raw_global_start, raw_global_end - trim_tail_sec)
+                t_start = max(0.0, raw_global_start)
+                t_end = max(t_start, raw_global_end)
+                aligned_chars.append(
+                    SegmentAlignedChar(
+                        char=str(ch),
+                        pinyin=str(py or ""),
+                        t_start=float(t_start),
+                        t_end=float(t_end),
+                        sentence_id=int(record.sentence_id),
+                        clause_id=int(record.clause_id),
+                    )
+                )
+                max_end_sec = max(max_end_sec, t_end)
+        resolved_total_duration = (
+            float(total_duration_sec)
+            if total_duration_sec is not None
+            else float(max_end_sec)
+        )
+        return self._build_from_aligned_chars(
+            lesson_id=lesson_id,
+            aligned_chars=aligned_chars,
+            total_duration_sec=resolved_total_duration,
+        )
+    def _build_from_aligned_chars(
+        self,
+        *,
+        lesson_id: str,
+        aligned_chars: Iterable[SegmentAlignedChar],
+        total_duration_sec: float,
+    ) -> ReferenceMap:
         tokens: list[RefToken] = []
         next_idx = 0
-        for ch, py, ts, te, sid, cid in zip(
-            chars, pinyins, starts, ends, sentence_ids, clause_ids, strict=True
-        ):
+        for item in aligned_chars:
+            ch = str(item.char or "")
             if not ch or ch in self._DROP_CHARS or not ch.strip():
                 continue
+            t_start = max(0.0, float(item.t_start))
+            t_end = max(t_start, float(item.t_end))
             tokens.append(
                 RefToken(
                     idx=next_idx,
                     char=ch,
-                    pinyin=py,
-                    t_start=float(ts),
-                    t_end=float(te),
-                    sentence_id=int(sid),
-                    clause_id=int(cid),
+                    pinyin=str(item.pinyin or ""),
+                    t_start=t_start,
+                    t_end=t_end,
+                    sentence_id=int(item.sentence_id),
+                    clause_id=int(item.clause_id),
                 )
             )
             next_idx += 1
+        inferred_total = max(
+            [float(total_duration_sec)] + [float(t.t_end) for t in tokens] if tokens else [float(total_duration_sec)]
+        )
         return ReferenceMap(
             lesson_id=lesson_id,
             tokens=tokens,
-            total_duration_sec=float(total_duration_sec),
+            total_duration_sec=float(inferred_total),
         )
+    def _validate_parallel_lists(
+        self,
+        *,
+        chars: Sequence[str],
+        pinyins: Sequence[str],
+        starts: Sequence[float],
+        ends: Sequence[float],
+        sentence_ids: Sequence[int],
+        clause_ids: Sequence[int],
+    ) -> None:
+        n = len(chars)
+        sizes = {
+            "chars": len(chars),
+            "pinyins": len(pinyins),
+            "starts": len(starts),
+            "ends": len(ends),
+            "sentence_ids": len(sentence_ids),
+            "clause_ids": len(clause_ids),
+        }
+        if any(size != n for size in sizes.values()):
+            raise ValueError(f"ReferenceBuilder input length mismatch: {sizes}")
+    def _coerce_segment_record(
+        self,
+        raw: SegmentTimelineRecord | dict,
+        *,
+        fallback_segment_id: int,
+    ) -> SegmentTimelineRecord:
+        if isinstance(raw, SegmentTimelineRecord):
+            return raw
+        if not isinstance(raw, dict):
+            raise TypeError(f"Unsupported segment record type: {type(raw)!r}")
+        chars = raw.get("chars")
+        if chars is None:
+            alignment = raw.get("alignment", {})
+            chars = alignment.get("characters", [])
+        pinyins = raw.get("pinyins")
+        if pinyins is None:
+            pinyins = [""] * len(chars)
+        local_starts = raw.get("local_starts")
+        if local_starts is None:
+            alignment = raw.get("alignment", {})
+            local_starts = alignment.get("character_start_times_seconds", [])
+        local_ends = raw.get("local_ends")
+        if local_ends is None:
+            alignment = raw.get("alignment", {})
+            local_ends = alignment.get("character_end_times_seconds", [])
+        return SegmentTimelineRecord(
+            segment_id=int(raw.get("segment_id", fallback_segment_id)),
+            text=str(raw.get("text", "")),
+            chars=[str(x) for x in chars],
+            pinyins=[str(x or "") for x in pinyins],
+            local_starts=[float(x) for x in local_starts],
+            local_ends=[float(x) for x in local_ends],
+            global_start_sec=float(raw.get("global_start_sec", 0.0)),
+            sentence_id=int(raw.get("sentence_id", 0)),
+            clause_id=int(raw.get("clause_id", fallback_segment_id)),
+            trim_head_sec=float(raw.get("trim_head_sec", 0.0) or 0.0),
+            trim_tail_sec=float(raw.get("trim_tail_sec", 0.0) or 0.0),
+            assembled_start_sec=(
+                None
+                if raw.get("assembled_start_sec") is None
+                else float(raw.get("assembled_start_sec"))
+            ),
+            assembled_end_sec=(
+                None
+                if raw.get("assembled_end_sec") is None
+                else float(raw.get("assembled_end_sec"))
+            ),
+        )
+    def _validate_segment_record(self, record: SegmentTimelineRecord) -> None:
+        sizes = {
+            "chars": len(record.chars),
+            "pinyins": len(record.pinyins),
+            "local_starts": len(record.local_starts),
+            "local_ends": len(record.local_ends),
+        }
+        n = sizes["chars"]
+        if any(size != n for size in sizes.values()):
+            raise ValueError(
+                f"SegmentTimelineRecord length mismatch: segment_id={record.segment_id}, sizes={sizes}"
+            )
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/preprocess/segmenter.py`
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass
+import re
+_SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[。！？!?；;])")
+_CLAUSE_SPLIT_PATTERN = re.compile(r"(?<=[，、：,:])")
+@dataclass(slots=True)
+class ShadowingSegment:
+    segment_id: int
+    text: str
+    sentence_id: int
+    clause_id: int
+    kind: str
+    prev_context_text: str = ""
+    next_context_text: str = ""
+class ShadowingSegmenter:
+    def __init__(
+        self,
+        *,
+        target_chars_per_segment: int = 28,
+        hard_max_chars_per_segment: int = 54,
+        min_chars_per_segment: int = 6,
+        context_window_segments: int = 2,
+        context_max_chars: int = 100,
+    ) -> None:
+        self.target_chars_per_segment = max(8, int(target_chars_per_segment))
+        self.hard_max_chars_per_segment = max(
+            self.target_chars_per_segment + 4,
+            int(hard_max_chars_per_segment),
+        )
+        self.min_chars_per_segment = max(2, int(min_chars_per_segment))
+        self.context_window_segments = max(1, int(context_window_segments))
+        self.context_max_chars = max(20, int(context_max_chars))
+    def segment_text(self, text: str) -> list[ShadowingSegment]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        sentences = self._split_sentences(raw)
+        base_units: list[tuple[str, int, int, str]] = []
+        global_clause_id = 0
+        for sentence_id, sent in enumerate(sentences):
+            clauses = self._split_sentence_to_clauses(sent)
+            followable = self._build_followable_segments_from_clauses(clauses)
+            for local_idx, seg_text in enumerate(followable):
+                kind = "sentence" if len(followable) == 1 else ("clause" if local_idx < len(followable) - 1 else "tail")
+                base_units.append(
+                    (
+                        seg_text,
+                        sentence_id,
+                        global_clause_id,
+                        kind,
+                    )
+                )
+                global_clause_id += 1
+        merged_units = self._merge_too_short_units(base_units)
+        segments: list[ShadowingSegment] = []
+        for idx, (seg_text, sentence_id, clause_id, kind) in enumerate(merged_units):
+            segments.append(
+                ShadowingSegment(
+                    segment_id=idx,
+                    text=seg_text,
+                    sentence_id=sentence_id,
+                    clause_id=clause_id,
+                    kind=kind,
+                )
+            )
+        self._attach_contexts(segments)
+        return segments
+    def _split_sentences(self, text: str) -> list[str]:
+        parts = _SENTENCE_SPLIT_PATTERN.split(text)
+        out: list[str] = []
+        for part in parts:
+            item = str(part).strip()
+            if item:
+                out.append(item)
+        return out
+    def _split_sentence_to_clauses(self, sentence: str) -> list[str]:
+        if len(sentence) <= self.hard_max_chars_per_segment:
+            return [sentence]
+        parts = _CLAUSE_SPLIT_PATTERN.split(sentence)
+        clauses = [p.strip() for p in parts if p and p.strip()]
+        if not clauses:
+            return [sentence]
+        out: list[str] = []
+        buf = ""
+        for clause in clauses:
+            if not buf:
+                buf = clause
+                continue
+            if len(self._normalize_visible_text(buf + clause)) <= self.target_chars_per_segment:
+                buf += clause
+            else:
+                out.append(buf)
+                buf = clause
+        if buf:
+            out.append(buf)
+        return out
+    def _build_followable_segments_from_clauses(self, clauses: list[str]) -> list[str]:
+        if not clauses:
+            return []
+        provisional: list[str] = []
+        buf = ""
+        for clause in clauses:
+            clean_clause = clause.strip()
+            if not clean_clause:
+                continue
+            if not buf:
+                if len(self._normalize_visible_text(clean_clause)) > self.hard_max_chars_per_segment:
+                    provisional.extend(self._force_split_long_text(clean_clause))
+                else:
+                    buf = clean_clause
+                continue
+            merged = buf + clean_clause
+            merged_len = len(self._normalize_visible_text(merged))
+            if merged_len <= self.target_chars_per_segment:
+                buf = merged
+                continue
+            provisional.append(buf)
+            if len(self._normalize_visible_text(clean_clause)) > self.hard_max_chars_per_segment:
+                provisional.extend(self._force_split_long_text(clean_clause))
+                buf = ""
+            else:
+                buf = clean_clause
+        if buf:
+            provisional.append(buf)
+        final_segments: list[str] = []
+        for item in provisional:
+            if len(self._normalize_visible_text(item)) > self.hard_max_chars_per_segment:
+                final_segments.extend(self._force_split_long_text(item))
+            else:
+                final_segments.append(item)
+        return final_segments
+    def _force_split_long_text(self, text: str) -> list[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        normalized_len = len(self._normalize_visible_text(raw))
+        if normalized_len <= self.hard_max_chars_per_segment:
+            return [raw]
+        pieces: list[str] = []
+        buf = ""
+        for ch in raw:
+            trial = buf + ch
+            if len(self._normalize_visible_text(trial)) <= self.target_chars_per_segment:
+                buf = trial
+                continue
+            if buf:
+                pieces.append(buf)
+            buf = ch
+        if buf:
+            pieces.append(buf)
+        merged: list[str] = []
+        for piece in pieces:
+            piece = piece.strip()
+            if not piece:
+                continue
+            if merged and len(self._normalize_visible_text(piece)) < self.min_chars_per_segment:
+                merged[-1] += piece
+            else:
+                merged.append(piece)
+        if len(merged) >= 2 and len(self._normalize_visible_text(merged[-1])) < self.min_chars_per_segment:
+            merged[-2] += merged[-1]
+            merged.pop()
+        return merged or [raw]
+    def _merge_too_short_units(
+        self,
+        units: list[tuple[str, int, int, str]],
+    ) -> list[tuple[str, int, int, str]]:
+        if not units:
+            return []
+        out: list[tuple[str, int, int, str]] = []
+        i = 0
+        while i < len(units):
+            text, sentence_id, clause_id, kind = units[i]
+            cur_len = len(self._normalize_visible_text(text))
+            if cur_len >= self.min_chars_per_segment or not out:
+                out.append((text, sentence_id, clause_id, kind))
+                i += 1
+                continue
+            prev_text, prev_sid, prev_cid, prev_kind = out[-1]
+            merged_prev = prev_text + text
+            if len(self._normalize_visible_text(merged_prev)) <= self.hard_max_chars_per_segment:
+                out[-1] = (merged_prev, prev_sid, prev_cid, "merged")
+                i += 1
+                continue
+            if i + 1 < len(units):
+                next_text, next_sid, next_cid, next_kind = units[i + 1]
+                merged_next = text + next_text
+                out.append((merged_next, sentence_id, clause_id, "merged"))
+                i += 2
+                continue
+            out[-1] = (prev_text + text, prev_sid, prev_cid, "merged")
+            i += 1
+        return out
+    def _attach_contexts(self, segments: list[ShadowingSegment]) -> None:
+        if not segments:
+            return
+        for i, seg in enumerate(segments):
+            prev_parts: list[str] = []
+            next_parts: list[str] = []
+            for j in range(max(0, i - self.context_window_segments), i):
+                prev_parts.append(segments[j].text)
+            for j in range(i + 1, min(len(segments), i + 1 + self.context_window_segments)):
+                next_parts.append(segments[j].text)
+            seg.prev_context_text = self._trim_context("".join(prev_parts), from_left=True)
+            seg.next_context_text = self._trim_context("".join(next_parts), from_left=False)
+    def _trim_context(self, text: str, *, from_left: bool) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        if len(raw) <= self.context_max_chars:
+            return raw
+        if from_left:
+            return raw[-self.context_max_chars :]
+        return raw[: self.context_max_chars]
+    def _normalize_visible_text(self, text: str) -> str:
+        raw = str(text or "")
+        raw = raw.replace("\u3000", " ")
+        raw = re.sub(r"\s+", "", raw)
+        return raw
 ```
 
 ---
@@ -4657,11 +6022,11 @@ class BehaviorInterpreter:
         ):
             return UserReadState.PAUSED
         if tracking_mode == TrackingMode.LOST:
-            if signal_speaking or audio_support_strength >= 0.60:
+            if signal_speaking or audio_support_strength >= 0.60 or audio_confidence >= 0.62:
                 return UserReadState.REJOINING
             return UserReadState.LOST
         if tracking_mode == TrackingMode.REACQUIRING:
-            if signal_speaking or audio_support_strength >= 0.58:
+            if signal_speaking or audio_support_strength >= 0.58 or audio_confidence >= 0.60:
                 return UserReadState.REJOINING
             return UserReadState.HESITATING
         if (
@@ -4674,12 +6039,12 @@ class BehaviorInterpreter:
         if progress_age <= self.recent_progress_sec:
             if tracking_quality >= 0.60 or audio_support_strength >= 0.64:
                 return UserReadState.FOLLOWING
-            if signal_speaking:
+            if signal_speaking or audio_confidence >= 0.58:
                 return UserReadState.HESITATING
             return UserReadState.WARMING_UP
         if (
             silence_run <= self.rejoin_signal_sec
-            and (signal_speaking or audio_support_strength >= 0.60)
+            and (signal_speaking or audio_support_strength >= 0.60 or audio_confidence >= 0.60)
             and tracking_quality >= 0.36
         ):
             return UserReadState.REJOINING
@@ -4689,7 +6054,7 @@ class BehaviorInterpreter:
             or (position_source != "text" and audio_confidence >= 0.58)
         ):
             return UserReadState.HESITATING
-        if signal_weak_speaking or audio_support_strength >= 0.46:
+        if signal_weak_speaking or audio_support_strength >= 0.46 or audio_confidence >= 0.48:
             return UserReadState.WARMING_UP
         return UserReadState.NOT_STARTED
     def _is_signal_speaking(self, signal_quality: SignalQuality | None) -> bool:
@@ -5031,10 +6396,277 @@ class MonotonicProgressEstimator:
 
 ```python
 from __future__ import annotations
-raise RuntimeError(
-    "shadowing.realtime.aligner is a legacy module and is no longer used. "
-    "Use shadowing.realtime.alignment.incremental_aligner instead."
-)
+import logging
+import re
+from dataclasses import dataclass
+from typing import Any
+logger = logging.getLogger(__name__)
+def _normalize_text(text: str) -> str:
+    text = str(text or "").strip().lower()
+    text = text.replace("\u3000", " ")
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[，。！？；：、“”‘’\"'（）()\[\]【】<>\-—…,.!?;:/\\|`~@#$%^&*_+=]+", "", text)
+    return text
+def _clamp(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, value))
+@dataclass(slots=True)
+class AlignmentCandidate:
+    ref_idx: int
+    confidence: float
+    local_match_ratio: float
+    matched_chars: int
+    source_text: str
+@dataclass(slots=True)
+class AlignmentTrackingQuality:
+    local_score: float
+    continuity_score: float
+    confidence_score: float
+    overall_score: float
+@dataclass(slots=True)
+class AlignmentSnapshot:
+    candidate_ref_idx: int
+    committed_ref_idx: int
+    confidence: float
+    stable: bool
+    local_match_ratio: float
+    repeat_penalty: float
+    emitted_at_sec: float
+    tracking_mode: str
+    tracking_quality: AlignmentTrackingQuality
+class RealtimeAligner:
+    def __init__(
+        self,
+        *,
+        window_back: int = 8,
+        window_ahead: int = 40,
+        stable_hits: int = 2,
+        min_confidence: float = 0.60,
+        debug: bool = False,
+    ) -> None:
+        self.window_back = max(0, int(window_back))
+        self.window_ahead = max(1, int(window_ahead))
+        self.stable_hits = max(1, int(stable_hits))
+        self.min_confidence = max(0.0, min(1.0, float(min_confidence)))
+        self.debug = bool(debug)
+        self._tokens: list[dict[str, Any]] = []
+        self._norm_tokens: list[str] = []
+        self._committed_ref_idx = 0
+        self._last_candidate_ref_idx = 0
+        self._same_candidate_run = 0
+        self._last_partial_text = ""
+        self._last_emitted_at_sec = 0.0
+    def reset(self, reference_tokens: list[dict[str, Any]]) -> None:
+        self._tokens = list(reference_tokens or [])
+        self._norm_tokens = [_normalize_text(x.get("text", "")) for x in self._tokens]
+        self._committed_ref_idx = 0
+        self._last_candidate_ref_idx = 0
+        self._same_candidate_run = 0
+        self._last_partial_text = ""
+        self._last_emitted_at_sec = 0.0
+    def update(
+        self,
+        *,
+        partial_text: str,
+        emitted_at_sec: float,
+    ) -> AlignmentSnapshot | None:
+        if not self._tokens:
+            return None
+        norm = _normalize_text(partial_text)
+        if not norm:
+            return self._build_snapshot(
+                candidate_ref_idx=self._committed_ref_idx,
+                confidence=0.0,
+                local_match_ratio=0.0,
+                matched_chars=0,
+                source_text="",
+                emitted_at_sec=emitted_at_sec,
+            )
+        search_start = max(0, self._committed_ref_idx - self.window_back)
+        search_end = min(len(self._tokens), self._committed_ref_idx + self.window_ahead + 1)
+        best = self._scan_candidates(
+            norm_text=norm,
+            search_start=search_start,
+            search_end=search_end,
+        )
+        if best is None:
+            return self._build_snapshot(
+                candidate_ref_idx=self._committed_ref_idx,
+                confidence=0.0,
+                local_match_ratio=0.0,
+                matched_chars=0,
+                source_text=norm,
+                emitted_at_sec=emitted_at_sec,
+            )
+        if best.ref_idx == self._last_candidate_ref_idx:
+            self._same_candidate_run += 1
+        else:
+            self._same_candidate_run = 1
+            self._last_candidate_ref_idx = best.ref_idx
+        stable = (
+            best.confidence >= self.min_confidence
+            and self._same_candidate_run >= self.stable_hits
+        )
+        if stable and best.ref_idx >= self._committed_ref_idx:
+            self._committed_ref_idx = best.ref_idx
+        snapshot = self._build_snapshot(
+            candidate_ref_idx=best.ref_idx,
+            confidence=best.confidence,
+            local_match_ratio=best.local_match_ratio,
+            matched_chars=best.matched_chars,
+            source_text=best.source_text,
+            emitted_at_sec=emitted_at_sec,
+        )
+        if self.debug:
+            logger.info(
+                "align: partial=%r candidate=%s committed=%s conf=%.3f stable=%s ratio=%.3f",
+                partial_text,
+                snapshot.candidate_ref_idx,
+                snapshot.committed_ref_idx,
+                snapshot.confidence,
+                snapshot.stable,
+                snapshot.local_match_ratio,
+            )
+        self._last_partial_text = norm
+        self._last_emitted_at_sec = float(emitted_at_sec)
+        return snapshot
+    def _scan_candidates(
+        self,
+        *,
+        norm_text: str,
+        search_start: int,
+        search_end: int,
+    ) -> AlignmentCandidate | None:
+        best: AlignmentCandidate | None = None
+        for idx in range(search_start, search_end):
+            candidate = self._score_candidate(idx=idx, norm_text=norm_text)
+            if candidate is None:
+                continue
+            if best is None:
+                best = candidate
+                continue
+            if candidate.confidence > best.confidence + 1e-6:
+                best = candidate
+            elif abs(candidate.confidence - best.confidence) <= 1e-6:
+                if candidate.ref_idx > best.ref_idx:
+                    best = candidate
+        return best
+    def _score_candidate(self, *, idx: int, norm_text: str) -> AlignmentCandidate | None:
+        if idx < 0 or idx >= len(self._norm_tokens):
+            return None
+        token_text = self._norm_tokens[idx]
+        if not token_text:
+            return None
+        overlap = self._longest_common_subsequence_approx(norm_text, token_text)
+        if overlap <= 0:
+            return None
+        local_match_ratio = overlap / max(1, len(token_text))
+        source_cover_ratio = overlap / max(1, len(norm_text))
+        continuity_bonus = 0.0
+        if idx == self._committed_ref_idx:
+            continuity_bonus += 0.08
+        elif idx == self._committed_ref_idx + 1:
+            continuity_bonus += 0.06
+        elif idx > self._committed_ref_idx + 1:
+            jump = idx - self._committed_ref_idx
+            continuity_bonus -= min(0.14, 0.015 * jump)
+        elif idx < self._committed_ref_idx:
+            back = self._committed_ref_idx - idx
+            continuity_bonus -= min(0.18, 0.03 * back)
+        confidence = (
+            0.58 * local_match_ratio
+            + 0.26 * source_cover_ratio
+            + continuity_bonus
+        )
+        confidence = max(0.0, min(1.0, confidence))
+        return AlignmentCandidate(
+            ref_idx=idx,
+            confidence=confidence,
+            local_match_ratio=max(0.0, min(1.0, local_match_ratio)),
+            matched_chars=overlap,
+            source_text=norm_text,
+        )
+    def _build_snapshot(
+        self,
+        *,
+        candidate_ref_idx: int,
+        confidence: float,
+        local_match_ratio: float,
+        matched_chars: int,
+        source_text: str,
+        emitted_at_sec: float,
+    ) -> AlignmentSnapshot:
+        candidate_ref_idx = _clamp(candidate_ref_idx, 0, max(0, len(self._tokens) - 1))
+        committed_ref_idx = _clamp(self._committed_ref_idx, 0, max(0, len(self._tokens) - 1))
+        stable = confidence >= self.min_confidence and self._same_candidate_run >= self.stable_hits
+        repeat_penalty = 0.0
+        if committed_ref_idx > candidate_ref_idx:
+            repeat_penalty = min(1.0, 0.18 * (committed_ref_idx - candidate_ref_idx))
+        elif candidate_ref_idx == committed_ref_idx and source_text == self._last_partial_text:
+            repeat_penalty = min(1.0, 0.08 * self._same_candidate_run)
+        continuity_score = 1.0
+        if candidate_ref_idx < committed_ref_idx:
+            continuity_score = max(0.0, 1.0 - 0.18 * (committed_ref_idx - candidate_ref_idx))
+        elif candidate_ref_idx > committed_ref_idx:
+            continuity_score = max(0.0, 1.0 - 0.04 * (candidate_ref_idx - committed_ref_idx))
+        confidence_score = float(confidence)
+        overall_score = (
+            0.40 * float(local_match_ratio)
+            + 0.30 * continuity_score
+            + 0.30 * confidence_score
+        )
+        overall_score = max(0.0, min(1.0, overall_score))
+        if confidence < 0.20:
+            tracking_mode = "LOST"
+        elif stable and confidence >= self.min_confidence:
+            tracking_mode = "LOCKED"
+        elif confidence >= max(0.35, self.min_confidence - 0.12):
+            tracking_mode = "WEAK_LOCKED"
+        else:
+            tracking_mode = "REACQUIRING"
+        return AlignmentSnapshot(
+            candidate_ref_idx=int(candidate_ref_idx),
+            committed_ref_idx=int(committed_ref_idx),
+            confidence=float(max(0.0, min(1.0, confidence))),
+            stable=bool(stable),
+            local_match_ratio=float(max(0.0, min(1.0, local_match_ratio))),
+            repeat_penalty=float(max(0.0, min(1.0, repeat_penalty))),
+            emitted_at_sec=float(emitted_at_sec),
+            tracking_mode=str(tracking_mode),
+            tracking_quality=AlignmentTrackingQuality(
+                local_score=float(max(0.0, min(1.0, local_match_ratio))),
+                continuity_score=float(max(0.0, min(1.0, continuity_score))),
+                confidence_score=float(max(0.0, min(1.0, confidence_score))),
+                overall_score=float(max(0.0, min(1.0, overall_score))),
+            ),
+        )
+    def _longest_common_subsequence_approx(self, a: str, b: str) -> int:
+        if not a or not b:
+            return 0
+        longest_substring = self._longest_common_substring_len(a, b)
+        prefix = 0
+        for x, y in zip(a, b):
+            if x != y:
+                break
+            prefix += 1
+        suffix = 0
+        for x, y in zip(a[::-1], b[::-1]):
+            if x != y:
+                break
+            suffix += 1
+        return max(longest_substring, prefix, suffix)
+    def _longest_common_substring_len(self, a: str, b: str) -> int:
+        if not a or not b:
+            return 0
+        shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+        best = 0
+        for win in range(len(shorter), 0, -1):
+            if win <= best:
+                break
+            for i in range(0, len(shorter) - win + 1):
+                sub = shorter[i : i + win]
+                if sub in longer:
+                    return win
+        return best
 ```
 
 ---
@@ -6486,45 +8118,45 @@ from __future__ import annotations
 from dataclasses import dataclass
 @dataclass(slots=True)
 class ControlPolicy:
-    target_lead_sec: float = 0.15
-    hold_if_lead_sec: float = 0.90
-    resume_if_lead_sec: float = 0.28
-    seek_if_lag_sec: float = -1.80
-    min_confidence: float = 0.75
-    seek_cooldown_sec: float = 1.20
-    gain_following: float = 0.55
-    gain_transition: float = 0.80
-    gain_soft_duck: float = 0.42
-    recover_after_seek_sec: float = 0.60
-    startup_grace_sec: float = 0.80
-    low_confidence_hold_sec: float = 0.60
-    bootstrapping_sec: float = 1.80
-    guide_play_sec: float = 2.20
-    no_progress_hold_min_play_sec: float = 4.00
-    speaking_recent_sec: float = 0.90
-    progress_stale_sec: float = 1.10
-    hold_trend_sec: float = 0.75
-    hold_extra_lead_sec: float = 0.18
-    low_confidence_continue_sec: float = 1.40
+    target_lead_sec: float = 0.18
+    hold_if_lead_sec: float = 1.05
+    resume_if_lead_sec: float = 0.36
+    seek_if_lag_sec: float = -2.60
+    min_confidence: float = 0.70
+    seek_cooldown_sec: float = 2.20
+    gain_following: float = 0.52
+    gain_transition: float = 0.72
+    gain_soft_duck: float = 0.36
+    recover_after_seek_sec: float = 0.80
+    startup_grace_sec: float = 3.20
+    low_confidence_hold_sec: float = 2.20
+    bootstrapping_sec: float = 2.20
+    guide_play_sec: float = 3.20
+    no_progress_hold_min_play_sec: float = 5.80
+    speaking_recent_sec: float = 1.10
+    progress_stale_sec: float = 1.45
+    hold_trend_sec: float = 1.00
+    hold_extra_lead_sec: float = 0.22
+    low_confidence_continue_sec: float = 1.80
     tracking_quality_hold_min: float = 0.60
-    tracking_quality_seek_min: float = 0.72
-    resume_from_hold_event_fresh_sec: float = 0.45
-    resume_from_hold_speaking_lead_slack_sec: float = 0.45
-    reacquire_soft_duck_sec: float = 2.00
+    tracking_quality_seek_min: float = 0.84
+    resume_from_hold_event_fresh_sec: float = 0.60
+    resume_from_hold_speaking_lead_slack_sec: float = 0.72
+    reacquire_soft_duck_sec: float = 2.40
     disable_seek: bool = False
-    bluetooth_long_session_target_lead_sec: float = 0.35
-    bluetooth_long_session_hold_if_lead_sec: float = 1.20
-    bluetooth_long_session_resume_if_lead_sec: float = 0.22
-    bluetooth_long_session_seek_if_lag_sec: float = -2.80
-    bluetooth_long_session_seek_cooldown_sec: float = 2.60
-    bluetooth_long_session_progress_stale_sec: float = 1.45
-    bluetooth_long_session_hold_trend_sec: float = 1.00
-    bluetooth_long_session_tracking_quality_hold_min: float = 0.64
-    bluetooth_long_session_tracking_quality_seek_min: float = 0.82
-    bluetooth_long_session_resume_from_hold_speaking_lead_slack_sec: float = 0.62
-    bluetooth_long_session_gain_following: float = 0.52
-    bluetooth_long_session_gain_transition: float = 0.72
-    bluetooth_long_session_gain_soft_duck: float = 0.36
+    bluetooth_long_session_target_lead_sec: float = 0.38
+    bluetooth_long_session_hold_if_lead_sec: float = 1.35
+    bluetooth_long_session_resume_if_lead_sec: float = 0.30
+    bluetooth_long_session_seek_if_lag_sec: float = -3.20
+    bluetooth_long_session_seek_cooldown_sec: float = 3.20
+    bluetooth_long_session_progress_stale_sec: float = 1.75
+    bluetooth_long_session_hold_trend_sec: float = 1.15
+    bluetooth_long_session_tracking_quality_hold_min: float = 0.58
+    bluetooth_long_session_tracking_quality_seek_min: float = 0.88
+    bluetooth_long_session_resume_from_hold_speaking_lead_slack_sec: float = 0.82
+    bluetooth_long_session_gain_following: float = 0.50
+    bluetooth_long_session_gain_transition: float = 0.66
+    bluetooth_long_session_gain_soft_duck: float = 0.32
 ```
 
 ---
@@ -6594,17 +8226,21 @@ class StateMachineController:
         fusion_reentry = 0.0 if fusion_evidence is None else float(fusion_evidence.reentry_likelihood)
         fusion_fused_conf = 0.0 if fusion_evidence is None else float(fusion_evidence.fused_confidence)
         if progress is None:
-            if fusion_evidence is None or max(fusion_fused_conf, fusion_still_following) < 0.60:
+            if fusion_evidence is None or max(fusion_fused_conf, fusion_still_following, fusion_reentry) < 0.58:
                 return ControlDecision(
                     action=ControlAction.NOOP,
                     reason="no_progress",
-                    target_gain=self._gain_for_state(playback.state, following=False, bluetooth_long_session_mode=False),
+                    target_gain=self._gain_for_state(
+                        playback.state,
+                        following=False,
+                        bluetooth_long_session_mode=False,
+                    ),
                     confidence=0.0,
                 )
             effective_idx = int(getattr(fusion_evidence, "estimated_ref_idx_hint", 0))
-            tracking_quality = max(0.0, min(1.0, fusion_fused_conf * 0.86))
+            tracking_quality = max(0.0, min(1.0, fusion_fused_conf * 0.84))
             confidence = fusion_fused_conf
-            active_speaking = bool(fusion_still_following >= 0.62 or fusion_reentry >= 0.58)
+            active_speaking = bool(fusion_still_following >= 0.60 or fusion_reentry >= 0.56)
             recently_progressed = False
             progress_age_sec = 9999.0
             estimated_ref_time_sec = float(fusion_evidence.estimated_ref_time_sec)
@@ -6620,7 +8256,7 @@ class StateMachineController:
             estimated_ref_time_sec = float(getattr(progress, "estimated_ref_time_sec", 0.0))
             stable = bool(getattr(progress, "stable", False))
             position_source = str(getattr(progress, "position_source", "text"))
-        if active_speaking or recently_progressed or fusion_still_following >= 0.66 or fusion_reentry >= 0.58:
+        if active_speaking or recently_progressed or fusion_still_following >= 0.62 or fusion_reentry >= 0.56:
             self._last_voice_like_at = now
         if effective_idx > self._last_effective_idx:
             self._last_effective_idx = effective_idx
@@ -6682,14 +8318,18 @@ class StateMachineController:
             if bluetooth_long_session_mode
             else self.policy.resume_from_hold_speaking_lead_slack_sec
         )
-        in_startup_grace = (now - self._started_at) < (self.policy.startup_grace_sec + (1.0 if bluetooth_long_session_mode else 0.0))
-        in_resume_cooldown = (now - self._last_resume_at) < (0.55 if bluetooth_long_session_mode else 0.35)
+        in_startup_grace = (now - self._started_at) < (
+            self.policy.startup_grace_sec + (1.2 if bluetooth_long_session_mode else 0.6)
+        )
+        in_resume_cooldown = (now - self._last_resume_at) < (0.70 if bluetooth_long_session_mode else 0.45)
         in_seek_cooldown = (now - self._last_seek_at) < seek_cooldown_sec
-        in_soft_duck_cooldown = (now - self._last_soft_duck_at) < (0.35 if bluetooth_long_session_mode else 0.25)
-        speaking_recent = (now - self._last_voice_like_at) <= (self.policy.speaking_recent_sec + (0.25 if bluetooth_long_session_mode else 0.0))
+        in_soft_duck_cooldown = (now - self._last_soft_duck_at) < (0.45 if bluetooth_long_session_mode else 0.30)
+        speaking_recent = (now - self._last_voice_like_at) <= (
+            self.policy.speaking_recent_sec + (0.35 if bluetooth_long_session_mode else 0.15)
+        )
         progress_stale = progress_age_sec >= progress_stale_threshold
         playback_ref = float(playback.t_ref_heard_content_sec)
-        if fusion_evidence is not None and fusion_evidence.fused_confidence >= 0.58 and tracking_quality < 0.55:
+        if fusion_evidence is not None and fusion_evidence.fused_confidence >= 0.60 and tracking_quality < 0.56:
             user_ref = float(fusion_evidence.estimated_ref_time_sec)
         else:
             user_ref = float(estimated_ref_time_sec)
@@ -6704,29 +8344,31 @@ class StateMachineController:
             confidence=confidence,
             speech_confidence=speech_conf,
         )
+        engaged_recent = bool(
+            speaking_recent
+            or fusion_still_following >= 0.62
+            or fusion_reentry >= 0.56
+            or recently_progressed
+            or (active_speaking and tracking_quality >= tracking_quality_hold_min - 0.08)
+        )
         strong_resume_ok = bool(
             (
                 recently_progressed
                 or active_speaking
-                or fusion_reentry >= 0.65
-                or fusion_still_following >= 0.76
+                or fusion_reentry >= 0.62
+                or fusion_still_following >= 0.74
             )
-            and tracking_quality >= tracking_quality_hold_min
-            and confidence >= self.policy.min_confidence - (0.10 if fusion_still_following >= 0.72 else 0.0)
+            and tracking_quality >= tracking_quality_hold_min - 0.04
+            and confidence >= self.policy.min_confidence - 0.14
             and lead_error_sec >= -resume_from_hold_speaking_lead_slack_sec
         )
         weak_resume_ok = bool(
-            (
-                active_speaking
-                or fusion_reentry >= 0.60
-                or fusion_still_following >= 0.72
-            )
-            and tracking_quality >= tracking_quality_hold_min - 0.06
-            and confidence >= max(0.54, self.policy.min_confidence - 0.18)
-            and speaking_recent
+            engaged_recent
+            and tracking_quality >= tracking_quality_hold_min - 0.10
+            and confidence >= max(0.48, self.policy.min_confidence - 0.22)
             and lead_error_sec >= -resume_from_hold_speaking_lead_slack_sec
         )
-        following = (
+        following = bool(
             strong_resume_ok
             or weak_resume_ok
             or tracking_state in (TrackingState.RELIABLE, TrackingState.LOCKED)
@@ -6742,6 +8384,7 @@ class StateMachineController:
             confidence=confidence,
             stable=stable,
             speaking_recent=speaking_recent,
+            engaged_recent=engaged_recent,
             in_startup_grace=in_startup_grace,
             strong_resume_ok=strong_resume_ok,
             weak_resume_ok=weak_resume_ok,
@@ -6762,16 +8405,15 @@ class StateMachineController:
         )
         if fusion_evidence is not None:
             if fusion_evidence.should_prevent_hold:
-                self._pressure.hold_pressure *= 0.18
-                self._pressure.soft_duck_pressure *= 0.72
+                self._pressure.hold_pressure *= 0.12
             if fusion_evidence.should_prevent_seek:
-                self._pressure.seek_pressure *= 0.12
+                self._pressure.seek_pressure *= 0.08
             if playback.state == PlaybackState.HOLDING and (
                 fusion_still_following >= 0.74 or fusion_reentry >= 0.60
             ):
                 self._pressure.resume_pressure = max(
                     self._pressure.resume_pressure,
-                    1.06 if bluetooth_long_session_mode else 1.04,
+                    1.04 if bluetooth_long_session_mode else 1.02,
                 )
         if playback.state == PlaybackState.HOLDING and self._pressure.resume_pressure >= 1.0:
             self._last_resume_at = now
@@ -6779,21 +8421,45 @@ class StateMachineController:
             self._pressure.resume_pressure = 0.0
             return ControlDecision(
                 action=ControlAction.RESUME,
-                reason="resume_to_target_lead",
+                reason="resume_on_engaged_user",
                 lead_sec=lead_sec,
                 target_gain=self._gain_for_state(
                     PlaybackState.PLAYING,
                     following=True,
                     bluetooth_long_session_mode=bluetooth_long_session_mode,
                 ),
-                confidence=max(confidence, fusion_still_following * 0.88, fusion_fused_conf * 0.82),
-                aggressiveness="low" if bluetooth_long_session_mode else "medium",
+                confidence=max(confidence, fusion_still_following * 0.88, fusion_fused_conf * 0.84),
+                aggressiveness="low",
             )
-        if playback.state == PlaybackState.PLAYING and self._pressure.hold_pressure >= 1.0:
+        if (
+            playback.state == PlaybackState.PLAYING
+            and self._pressure.soft_duck_pressure >= (0.58 if bluetooth_long_session_mode else 0.62)
+            and not in_soft_duck_cooldown
+        ):
+            self._last_soft_duck_at = now
+            return ControlDecision(
+                action=ControlAction.SOFT_DUCK,
+                reason="soft_duck_wait_for_user",
+                lead_sec=lead_sec,
+                target_gain=self._gain_for_state(
+                    PlaybackState.HOLDING,
+                    following=False,
+                    bluetooth_long_session_mode=bluetooth_long_session_mode,
+                ),
+                confidence=max(confidence, fusion_still_following * 0.66, fusion_fused_conf * 0.60),
+                aggressiveness="low",
+            )
+        if (
+            playback.state == PlaybackState.PLAYING
+            and self._pressure.hold_pressure >= 1.0
+            and not engaged_recent
+            and fusion_repeated < 0.60
+            and fusion_reentry < 0.54
+        ):
             self._last_hold_at = now
             return ControlDecision(
                 action=ControlAction.HOLD,
-                reason="hold_for_lead_convergence",
+                reason="hold_when_user_disengaged",
                 lead_sec=lead_sec,
                 target_gain=self._gain_for_state(
                     PlaybackState.HOLDING,
@@ -6801,14 +8467,17 @@ class StateMachineController:
                     bluetooth_long_session_mode=bluetooth_long_session_mode,
                 ),
                 confidence=confidence,
-                aggressiveness="low" if bluetooth_long_session_mode else "medium",
+                aggressiveness="low",
             )
         if (
             playback.state in (PlaybackState.PLAYING, PlaybackState.HOLDING)
             and self._pressure.seek_pressure >= 1.0
             and not self.disable_seek
             and allow_seek
-            and fusion_repeated < 0.55
+            and not bluetooth_mode
+            and fusion_repeated < 0.42
+            and fusion_reentry < 0.42
+            and not engaged_recent
             and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
         ):
             self._last_seek_at = now
@@ -6817,7 +8486,7 @@ class StateMachineController:
             target_time_sec = max(0.0, user_ref - target_lead_sec)
             return ControlDecision(
                 action=ControlAction.SEEK,
-                reason="seek_to_target_lead",
+                reason="seek_only_when_clearly_derailed",
                 target_time_sec=target_time_sec,
                 lead_sec=lead_sec,
                 target_gain=self._gain_for_state(
@@ -6825,37 +8494,19 @@ class StateMachineController:
                     following=False,
                     bluetooth_long_session_mode=bluetooth_long_session_mode,
                 ),
-                confidence=max(confidence, 0.35 + 0.45 * fusion_still_following),
-                aggressiveness="low" if (bluetooth_mode or bluetooth_long_session_mode) else "medium",
-            )
-        if (
-            playback.state == PlaybackState.PLAYING
-            and self._pressure.soft_duck_pressure >= (0.58 if bluetooth_long_session_mode else 0.65)
-            and not in_soft_duck_cooldown
-        ):
-            self._last_soft_duck_at = now
-            return ControlDecision(
-                action=ControlAction.SOFT_DUCK,
-                reason="soft_duck_for_lead_convergence",
-                lead_sec=lead_sec,
-                target_gain=self._gain_for_state(
-                    PlaybackState.HOLDING,
-                    following=False,
-                    bluetooth_long_session_mode=bluetooth_long_session_mode,
-                ),
-                confidence=max(confidence, fusion_still_following * 0.62),
+                confidence=max(confidence, 0.30 + 0.40 * fusion_still_following),
                 aggressiveness="low",
             )
         return ControlDecision(
             action=ControlAction.NOOP,
-            reason="track_target_lead",
+            reason="follow_user_smoothly",
             lead_sec=lead_sec,
             target_gain=self._gain_for_state(
                 playback.state,
                 following=following,
                 bluetooth_long_session_mode=bluetooth_long_session_mode,
             ),
-            confidence=max(confidence, fusion_still_following * 0.58, fusion_fused_conf * 0.52),
+            confidence=max(confidence, fusion_still_following * 0.56, fusion_fused_conf * 0.52),
             aggressiveness="low",
         )
     def _update_emas(
@@ -6897,6 +8548,7 @@ class StateMachineController:
         confidence: float,
         stable: bool,
         speaking_recent: bool,
+        engaged_recent: bool,
         in_startup_grace: bool,
         strong_resume_ok: bool,
         weak_resume_ok: bool,
@@ -6915,7 +8567,7 @@ class StateMachineController:
         fusion_evidence: FusionEvidence | None,
         position_source: str,
     ) -> None:
-        decay = (0.86 if bluetooth_long_session_mode else 0.82) ** max(1.0, dt * 15.0)
+        decay = (0.88 if bluetooth_long_session_mode else 0.84) ** max(1.0, dt * 15.0)
         self._pressure.hold_pressure *= decay
         self._pressure.resume_pressure *= decay
         self._pressure.seek_pressure *= decay
@@ -6925,60 +8577,65 @@ class StateMachineController:
         fusion_reentry = 0.0 if fusion_evidence is None else float(fusion_evidence.reentry_likelihood)
         lead_err = float(self._pressure.lead_error_ema)
         lead_err_d = float(self._pressure.lead_error_derivative_ema)
-        large_positive_error = lead_err >= max(0.18, hold_if_lead_sec - (0.35 if bluetooth_long_session_mode else 0.28))
+        large_positive_error = lead_sec >= hold_if_lead_sec
         large_negative_error = lead_sec <= seek_if_lag_sec
         near_target = abs(lead_err) <= resume_if_lead_sec
         if playback_state == PlaybackState.PLAYING:
             if large_positive_error:
-                self._pressure.soft_duck_pressure += 0.18 if bluetooth_long_session_mode else 0.24
-                if lead_err >= (0.34 if bluetooth_long_session_mode else 0.28):
-                    self._pressure.hold_pressure += 0.20 if bluetooth_long_session_mode else 0.28
-            if lead_err > 0.10 and lead_err_d > 0.04:
-                self._pressure.hold_pressure += 0.08
-            hold_scale = 0.40 if (fusion_still_following >= 0.65 or fusion_reentry >= 0.58) else 1.0
-            if not in_startup_grace and progress_stale and not speaking_recent:
-                self._pressure.hold_pressure += (0.24 if bluetooth_long_session_mode else 0.34) * hold_scale
-            if (
-                not in_startup_grace
-                and progress_stale
-                and tracking_quality < tracking_quality_hold_min
-            ):
-                self._pressure.hold_pressure += (0.18 if bluetooth_long_session_mode else 0.28) * hold_scale
+                self._pressure.soft_duck_pressure += 0.26 if bluetooth_long_session_mode else 0.30
+                if (
+                    lead_sec >= (hold_if_lead_sec + (0.28 if bluetooth_long_session_mode else 0.20))
+                    and not engaged_recent
+                    and not in_startup_grace
+                ):
+                    self._pressure.hold_pressure += 0.18 if bluetooth_long_session_mode else 0.24
+            if lead_err > 0.12 and lead_err_d > 0.05 and not engaged_recent:
+                self._pressure.soft_duck_pressure += 0.10
+            if progress_stale and not engaged_recent and not in_startup_grace:
+                self._pressure.soft_duck_pressure += 0.16 if bluetooth_long_session_mode else 0.20
+                if tracking_quality < tracking_quality_hold_min - 0.04:
+                    self._pressure.hold_pressure += 0.14 if bluetooth_long_session_mode else 0.18
             if tracking_state == TrackingState.WEAK or sync_state == SyncState.DEGRADED:
-                self._pressure.soft_duck_pressure += 0.20 if not bluetooth_long_session_mode else 0.26
-            if confidence < max(0.55, self.policy.min_confidence - 0.15):
+                if engaged_recent:
+                    self._pressure.soft_duck_pressure += 0.10
+                else:
+                    self._pressure.soft_duck_pressure += 0.16 if bluetooth_long_session_mode else 0.20
+            if confidence < max(0.50, self.policy.min_confidence - 0.18) and not engaged_recent:
                 self._pressure.soft_duck_pressure += 0.08
-            if stable and tracking_quality >= 0.76 and near_target:
-                self._pressure.hold_pressure *= 0.92
-                self._pressure.soft_duck_pressure *= 0.90
+            if stable and tracking_quality >= 0.78 and near_target:
+                self._pressure.hold_pressure *= 0.90
+                self._pressure.soft_duck_pressure *= 0.88
         if playback_state == PlaybackState.HOLDING and not in_resume_cooldown:
             if strong_resume_ok and near_target:
-                self._pressure.resume_pressure += 0.40 if bluetooth_long_session_mode else 0.48
+                self._pressure.resume_pressure += 0.44 if bluetooth_long_session_mode else 0.50
             elif strong_resume_ok:
-                self._pressure.resume_pressure += 0.28
-            elif weak_resume_ok and lead_err >= -0.12:
-                self._pressure.resume_pressure += 0.22 if bluetooth_long_session_mode else 0.28
-            if fusion_reentry >= 0.62:
-                self._pressure.resume_pressure += 0.26
+                self._pressure.resume_pressure += 0.30
+            elif weak_resume_ok and lead_err >= -0.16:
+                self._pressure.resume_pressure += 0.24 if bluetooth_long_session_mode else 0.30
+            if fusion_reentry >= 0.60:
+                self._pressure.resume_pressure += 0.24
             elif fusion_still_following >= 0.74:
                 self._pressure.resume_pressure += 0.18
             if near_target and speaking_recent:
-                self._pressure.resume_pressure += 0.14
+                self._pressure.resume_pressure += 0.12
         seek_trigger = bool(
             allow_seek
             and not in_seek_cooldown
             and playback_state == PlaybackState.PLAYING
             and large_negative_error
             and tracking_quality >= tracking_quality_seek_min
-            and confidence >= max(0.70, self.policy.min_confidence)
+            and confidence >= max(0.74, self.policy.min_confidence)
             and tracking_state == TrackingState.LOCKED
             and sync_state == SyncState.STABLE
-            and fusion_repeated < 0.60
-            and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
+            and fusion_repeated < 0.40
+            and fusion_reentry < 0.40
             and position_source != "audio"
+            and not engaged_recent
+            and not bluetooth_mode
+            and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
         )
         if seek_trigger:
-            self._pressure.seek_pressure += 0.18 if (bluetooth_mode or bluetooth_long_session_mode) else 0.34
+            self._pressure.seek_pressure += 0.18
         self._pressure.hold_pressure = max(0.0, min(1.4, self._pressure.hold_pressure))
         self._pressure.resume_pressure = max(0.0, min(1.4, self._pressure.resume_pressure))
         self._pressure.seek_pressure = max(0.0, min(1.4, self._pressure.seek_pressure))
@@ -6995,6 +8652,259 @@ class StateMachineController:
         if following:
             return self.policy.gain_following
         return self.policy.gain_transition
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/realtime/controller.py`
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any
+def _f(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+def _b(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+@dataclass(slots=True)
+class ControlDecision:
+    action: str
+    reason: str
+    target_gain: float
+    seek_to_ref_time_sec: float | None = None
+class PlaybackController:
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = dict(config)
+        self.target_lead_sec = _f(config.get("target_lead_sec"), 0.18)
+        self.hold_if_lead_sec = _f(config.get("hold_if_lead_sec"), 1.05)
+        self.resume_if_lead_sec = _f(config.get("resume_if_lead_sec"), 0.36)
+        self.seek_if_lag_sec = _f(config.get("seek_if_lag_sec"), -2.60)
+        self.min_confidence = _f(config.get("min_confidence"), 0.70)
+        self.seek_cooldown_sec = _f(config.get("seek_cooldown_sec"), 2.20)
+        self.gain_following = _f(config.get("gain_following"), 0.52)
+        self.gain_transition = _f(config.get("gain_transition"), 0.72)
+        self.gain_soft_duck = _f(config.get("gain_soft_duck"), 0.36)
+        self.startup_grace_sec = _f(config.get("startup_grace_sec"), 3.2)
+        self.low_confidence_hold_sec = _f(config.get("low_confidence_hold_sec"), 2.2)
+        self.guide_play_sec = _f(config.get("guide_play_sec"), 3.20)
+        self.no_progress_hold_min_play_sec = _f(config.get("no_progress_hold_min_play_sec"), 5.80)
+        self.progress_stale_sec = _f(config.get("progress_stale_sec"), 1.45)
+        self.hold_trend_sec = _f(config.get("hold_trend_sec"), 1.00)
+        self.tracking_quality_hold_min = _f(config.get("tracking_quality_hold_min"), 0.60)
+        self.tracking_quality_seek_min = _f(config.get("tracking_quality_seek_min"), 0.84)
+        self.resume_from_hold_speaking_lead_slack_sec = _f(
+            config.get("resume_from_hold_speaking_lead_slack_sec"),
+            0.72,
+        )
+        self.disable_seek = _b(config.get("disable_seek"), False)
+        self._started_at_sec = 0.0
+        self._last_seek_at_sec = -999999.0
+        self._hold_started_at_sec = 0.0
+        self._is_holding = False
+    def reset(self, *, started_at_sec: float) -> None:
+        self._started_at_sec = float(started_at_sec)
+        self._last_seek_at_sec = -999999.0
+        self._hold_started_at_sec = 0.0
+        self._is_holding = False
+    def decide(
+        self,
+        *,
+        now_sec: float,
+        playback_ref_time_sec: float,
+        progress_estimate,
+        latency_state=None,
+    ) -> ControlDecision:
+        if progress_estimate is None:
+            return ControlDecision(
+                action="guide",
+                reason="no_progress_estimate",
+                target_gain=self.gain_transition,
+            )
+        est_ref_time_sec = _f(getattr(progress_estimate, "estimated_ref_time_sec", 0.0), 0.0)
+        progress_age_sec = _f(getattr(progress_estimate, "progress_age_sec", 9999.0), 9999.0)
+        joint_confidence = _f(getattr(progress_estimate, "joint_confidence", 0.0), 0.0)
+        tracking_quality = _f(getattr(progress_estimate, "tracking_quality", 0.0), 0.0)
+        active_speaking = bool(getattr(progress_estimate, "active_speaking", False))
+        recently_progressed = bool(getattr(progress_estimate, "recently_progressed", False))
+        user_state = str(getattr(progress_estimate, "user_state", "UNKNOWN"))
+        position_source = str(getattr(progress_estimate, "position_source", "text"))
+        target_lead_sec = self.target_lead_sec
+        if latency_state is not None:
+            target_lead_sec = _f(
+                getattr(latency_state, "baseline_target_lead_sec", self.target_lead_sec),
+                self.target_lead_sec,
+            )
+        lead_sec = _f(playback_ref_time_sec, 0.0) - est_ref_time_sec - target_lead_sec
+        session_age_sec = max(0.0, float(now_sec) - self._started_at_sec)
+        if session_age_sec <= self.startup_grace_sec:
+            return ControlDecision(
+                action="guide",
+                reason="startup_grace",
+                target_gain=self.gain_transition,
+            )
+        if joint_confidence < self.min_confidence:
+            if progress_age_sec >= self.low_confidence_hold_sec:
+                self._enter_hold(now_sec)
+                return ControlDecision(
+                    action="hold",
+                    reason="low_confidence",
+                    target_gain=0.0,
+                )
+            return ControlDecision(
+                action="duck",
+                reason="confidence_recovering",
+                target_gain=self.gain_soft_duck,
+            )
+        if progress_age_sec >= self.progress_stale_sec:
+            if active_speaking:
+                self._enter_hold(now_sec)
+                return ControlDecision(
+                    action="hold",
+                    reason="speaking_but_no_progress",
+                    target_gain=0.0,
+                )
+            return ControlDecision(
+                action="duck",
+                reason="no_recent_progress",
+                target_gain=self.gain_soft_duck,
+            )
+        if tracking_quality < self.tracking_quality_hold_min and active_speaking:
+            self._enter_hold(now_sec)
+            return ControlDecision(
+                action="hold",
+                reason="weak_tracking_while_speaking",
+                target_gain=0.0,
+            )
+        if lead_sec >= self.hold_if_lead_sec and active_speaking:
+            self._enter_hold(now_sec)
+            return ControlDecision(
+                action="hold",
+                reason="lead_too_large",
+                target_gain=0.0,
+            )
+        if (
+            not self.disable_seek
+            and lead_sec <= self.seek_if_lag_sec
+            and tracking_quality >= self.tracking_quality_seek_min
+            and joint_confidence >= self.min_confidence
+            and (now_sec - self._last_seek_at_sec) >= self.seek_cooldown_sec
+        ):
+            self._last_seek_at_sec = float(now_sec)
+            self._leave_hold()
+            return ControlDecision(
+                action="seek",
+                reason="lag_too_large",
+                target_gain=self.gain_transition,
+                seek_to_ref_time_sec=max(0.0, est_ref_time_sec + target_lead_sec),
+            )
+        if self._is_holding:
+            if (
+                lead_sec <= self.resume_if_lead_sec + (self.resume_from_hold_speaking_lead_slack_sec if active_speaking else 0.0)
+                and recently_progressed
+                and tracking_quality >= self.tracking_quality_hold_min
+            ):
+                self._leave_hold()
+                return ControlDecision(
+                    action="resume",
+                    reason="hold_released",
+                    target_gain=self.gain_transition,
+                )
+            return ControlDecision(
+                action="hold",
+                reason="holding",
+                target_gain=0.0,
+            )
+        if user_state in {"REJOINING", "HESITATING"}:
+            return ControlDecision(
+                action="duck",
+                reason=f"user_state_{user_state.lower()}",
+                target_gain=self.gain_soft_duck,
+            )
+        if user_state in {"FOLLOWING", "SKIPPING"} or position_source in {"joint", "audio"}:
+            return ControlDecision(
+                action="follow",
+                reason="tracking_ok",
+                target_gain=self.gain_following,
+            )
+        return ControlDecision(
+            action="guide",
+            reason="fallback",
+            target_gain=self.gain_transition,
+        )
+    def _enter_hold(self, now_sec: float) -> None:
+        if not self._is_holding:
+            self._is_holding = True
+            self._hold_started_at_sec = float(now_sec)
+    def _leave_hold(self) -> None:
+        self._is_holding = False
+        self._hold_started_at_sec = 0.0
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/realtime/controller_legacy_adapter.py`
+
+```python
+from __future__ import annotations
+from dataclasses import asdict, is_dataclass
+from typing import Any
+from shadowing.realtime.controller import ControlDecision, PlaybackController
+def _to_plain_dict(obj: Any) -> dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if is_dataclass(obj):
+        return asdict(obj)
+    out: dict[str, Any] = {}
+    for name in dir(obj):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        out[name] = value
+    return out
+class LegacyControllerAdapter:
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.controller = PlaybackController(config=config)
+    def reset(self, *, started_at_sec: float) -> None:
+        self.controller.reset(started_at_sec=started_at_sec)
+    def decide(
+        self,
+        *,
+        now_sec: float,
+        playback_ref_time_sec: float,
+        progress_estimate,
+        latency_state=None,
+    ) -> dict[str, Any]:
+        decision: ControlDecision = self.controller.decide(
+            now_sec=now_sec,
+            playback_ref_time_sec=playback_ref_time_sec,
+            progress_estimate=progress_estimate,
+            latency_state=latency_state,
+        )
+        payload = _to_plain_dict(decision)
+        payload.setdefault("action", decision.action)
+        payload.setdefault("reason", decision.reason)
+        payload.setdefault("target_gain", decision.target_gain)
+        payload.setdefault("seek_to_ref_time_sec", decision.seek_to_ref_time_sec)
+        return payload
 ```
 
 ---
@@ -7102,15 +9012,15 @@ class ShadowingOrchestrator:
         self._asr_gate_last_close_at_sec = 0.0
         self._last_human_voice_like_at_sec = 0.0
         self._last_asr_reset_at_sec = 0.0
-        self._speech_open_rms = 0.010
-        self._speech_keep_rms = 0.0065
-        self._speech_open_peak = 0.030
-        self._speech_keep_peak = 0.018
-        self._speech_open_likelihood = 0.58
-        self._speech_keep_likelihood = 0.42
-        self._speech_tail_hold_sec = 0.38
-        self._asr_reset_after_silence_sec = 1.60
-        self._asr_reset_cooldown_sec = 1.20
+        self._speech_open_rms = 0.0085
+        self._speech_keep_rms = 0.0052
+        self._speech_open_peak = 0.022
+        self._speech_keep_peak = 0.014
+        self._speech_open_likelihood = 0.50
+        self._speech_keep_likelihood = 0.34
+        self._speech_tail_hold_sec = 0.70
+        self._asr_reset_after_silence_sec = 2.80
+        self._asr_reset_cooldown_sec = 1.80
         self._reference_audio_features = None
         self._latest_audio_match = None
         self._latest_audio_behavior = None
@@ -7167,28 +9077,51 @@ class ShadowingOrchestrator:
         self._last_audio_recentering_at_sec = 0.0
         self._stable_lead_samples = []
         self._last_stable_lead_rebaseline_at_sec = self._session_started_at_sec
-        output_sr = chunks[0].sample_rate if chunks else 44100
+        output_sr = chunks[0].sample_rate if chunks else int(self.device_context.get("output_sample_rate", 44100))
         self._device_profile = self._build_initial_device_profile(output_sr)
-        bluetooth_mode = self._is_bluetooth_mode()
+        bluetooth_mode = bool(self._device_profile.bluetooth_mode) if self._device_profile is not None else False
         total_duration_sec = float(getattr(self._ref_map, "total_duration_sec", 0.0))
         manual_long_session_flag = bool(self.device_context.get("bluetooth_long_session_mode", False))
         self._bluetooth_long_session_mode = bool(
             bluetooth_mode and (manual_long_session_flag or total_duration_sec >= 1800.0)
         )
+        if bluetooth_mode:
+            self._speech_open_rms = 0.0072
+            self._speech_keep_rms = 0.0045
+            self._speech_open_peak = 0.018
+            self._speech_keep_peak = 0.011
+            self._speech_open_likelihood = 0.42
+            self._speech_keep_likelihood = 0.28
+            self._speech_tail_hold_sec = 1.20
+            self._asr_reset_after_silence_sec = 4.20
+            self._asr_reset_cooldown_sec = 2.60
+        else:
+            self._speech_open_rms = 0.0085
+            self._speech_keep_rms = 0.0052
+            self._speech_open_peak = 0.022
+            self._speech_keep_peak = 0.014
+            self._speech_open_likelihood = 0.50
+            self._speech_keep_likelihood = 0.34
+            self._speech_tail_hold_sec = 0.70
+            self._asr_reset_after_silence_sec = 2.80
+            self._asr_reset_cooldown_sec = 1.80
         self.latency_calibrator.reset(
             self._device_profile,
             bluetooth_mode=bluetooth_mode,
             bluetooth_long_session_mode=self._bluetooth_long_session_mode,
             now_sec=self._session_started_at_sec,
         )
-        self.auto_tuner.reset(self._device_profile.reliability_tier, bluetooth_mode=bluetooth_mode)
+        self.auto_tuner.reset(
+            self._device_profile.reliability_tier,
+            bluetooth_mode=bluetooth_mode,
+        )
         if self.profile_store is not None and self._device_profile is not None:
             self._warm_start = self.profile_store.load_warm_start(
                 input_device_id=self._device_profile.input_device_id,
                 output_device_id=self._device_profile.output_device_id,
-                hostapi_name=str(self.device_context.get("hostapi_name", "")),
-                capture_backend=str(self.device_context.get("capture_backend", "")),
-                duplex_sample_rate=int(self.device_context.get("input_sample_rate", 0)),
+                hostapi_name=self._device_profile.hostapi_name,
+                capture_backend=self._device_profile.capture_backend,
+                duplex_sample_rate=int(self._device_profile.input_sample_rate),
                 reliability_tier=self._device_profile.reliability_tier,
                 bluetooth_mode=bluetooth_mode,
             )
@@ -7251,7 +9184,7 @@ class ShadowingOrchestrator:
         self._drain_audio_queue()
         now_sec = time.monotonic()
         signal_snapshot = self.signal_monitor.snapshot(now_sec)
-        if signal_snapshot.vad_active or signal_snapshot.speaking_likelihood >= 0.48:
+        if signal_snapshot.vad_active or signal_snapshot.speaking_likelihood >= 0.46:
             self.metrics.observe_signal_active(now_sec)
         playback_status = self.player.get_status()
         if playback_status.generation != self._last_generation:
@@ -7408,7 +9341,11 @@ class ShadowingOrchestrator:
             fusion_evidence=fusion_evidence,
         )
         self._apply_decision(decision, playback_status)
-        self._run_auto_tuning(now_sec=now_sec, progress=progress, signal_snapshot=signal_snapshot)
+        self._run_auto_tuning(
+            now_sec=now_sec,
+            progress=progress,
+            signal_snapshot=signal_snapshot,
+        )
         self._log_event(
             progress=progress,
             signal_snapshot=signal_snapshot,
@@ -7454,7 +9391,7 @@ class ShadowingOrchestrator:
             return
         if not progress.active_speaking:
             return
-        if progress.tracking_quality < (0.72 if self._is_bluetooth_mode() else 0.78):
+        if progress.tracking_quality < (0.70 if self._is_bluetooth_mode() else 0.76):
             return
         lead_sec = float(playback_status.t_ref_heard_content_sec) - float(progress.estimated_ref_time_sec)
         if abs(lead_sec) > 2.2:
@@ -7578,7 +9515,7 @@ class ShadowingOrchestrator:
                     observed_at_sec=observed_at_sec,
                 )
                 self.live_audio_matcher.feed_features(feat_frames)
-            bootstrap_mode = (observed_at_sec - self._session_started_at_sec) <= 3.0
+            bootstrap_mode = (observed_at_sec - self._session_started_at_sec) <= 4.0
             bluetooth_mode = self._is_bluetooth_mode()
             should_feed_asr = self._should_feed_asr(
                 signal_snapshot=signal_snapshot,
@@ -7605,9 +9542,9 @@ class ShadowingOrchestrator:
         bootstrap_mode: bool,
         bluetooth_mode: bool,
     ) -> bool:
-        open_rms = 0.0085 if bootstrap_mode else self._speech_open_rms
-        open_peak = 0.022 if bootstrap_mode else self._speech_open_peak
-        open_likelihood = 0.48 if bootstrap_mode else self._speech_open_likelihood
+        open_rms = 0.0070 if bluetooth_mode else (0.0078 if bootstrap_mode else self._speech_open_rms)
+        open_peak = 0.017 if bluetooth_mode else (0.020 if bootstrap_mode else self._speech_open_peak)
+        open_likelihood = 0.40 if bluetooth_mode else (0.44 if bootstrap_mode else self._speech_open_likelihood)
         strong_voice = bool(
             signal_snapshot.vad_active
             and signal_snapshot.rms >= open_rms
@@ -7628,7 +9565,7 @@ class ShadowingOrchestrator:
         if strong_voice or likely_voice:
             self._last_human_voice_like_at_sec = float(now_sec)
         gate_should_open = strong_voice or likely_voice
-        gate_tail_sec = 0.95 if bluetooth_mode else (0.60 if bootstrap_mode else self._speech_tail_hold_sec)
+        gate_tail_sec = 1.25 if bluetooth_mode else (0.95 if bootstrap_mode else self._speech_tail_hold_sec)
         gate_should_keep = False
         if self._asr_gate_open and self._last_human_voice_like_at_sec > 0.0:
             gate_should_keep = keep_voice or (
@@ -7669,7 +9606,7 @@ class ShadowingOrchestrator:
         very_quiet = bool(
             signal_snapshot.rms <= self._speech_keep_rms
             and signal_snapshot.peak <= self._speech_keep_peak
-            and signal_snapshot.speaking_likelihood <= 0.24
+            and signal_snapshot.speaking_likelihood <= 0.18
         )
         if not very_quiet:
             return
@@ -7741,10 +9678,10 @@ class ShadowingOrchestrator:
         self.profile_store.update_from_session(
             input_device_id=self._device_profile.input_device_id,
             output_device_id=self._device_profile.output_device_id,
-            hostapi_name=str(self.device_context.get("hostapi_name", "")),
-            capture_backend=str(self.device_context.get("capture_backend", "")),
-            duplex_sample_rate=int(self.device_context.get("input_sample_rate", 0)),
-            bluetooth_mode=self._is_bluetooth_mode(),
+            hostapi_name=self._device_profile.hostapi_name,
+            capture_backend=self._device_profile.capture_backend,
+            duplex_sample_rate=int(self._device_profile.input_sample_rate),
+            bluetooth_mode=bool(self._device_profile.bluetooth_mode),
             device_profile=asdict(self._device_profile),
             metrics=self.metrics.summary_dict(),
             latency_calibration=(
@@ -7779,6 +9716,7 @@ class ShadowingOrchestrator:
             "metrics": self.metrics.summary_dict(),
             "stats": asdict(self.stats),
             "device_profile": None if self._device_profile is None else asdict(self._device_profile),
+            "device_context": dict(self.device_context),
             "latency_calibration": (
                 None
                 if latency_snapshot is None
@@ -7915,21 +9853,43 @@ class ShadowingOrchestrator:
             session_tick=self.stats.ticks,
         )
     def _build_initial_device_profile(self, output_sr: int) -> DeviceProfile:
+        input_device_name = str(self.device_context.get("input_device_name", "unknown") or "unknown")
+        output_device_name = str(self.device_context.get("output_device_name", "unknown") or "unknown")
+        hostapi_name = str(self.device_context.get("hostapi_name", "") or "").strip()
+        capture_backend = str(self.device_context.get("capture_backend", "") or "").strip().lower()
+        input_device_id = str(self.device_context.get("input_device_id", "") or "").strip()
+        output_device_id = str(self.device_context.get("output_device_id", "") or "").strip()
+        input_sample_rate = self._safe_int(self.device_context.get("input_sample_rate", 16000), 16000)
+        noise_floor_rms = self._safe_float(self.device_context.get("noise_floor_rms", 0.0025), 0.0025)
         return build_device_profile(
-            input_device_name=self.device_context.get("input_device_name"),
-            output_device_name=self.device_context.get("output_device_name"),
-            input_sample_rate=int(self.device_context.get("input_sample_rate", 16000)),
+            input_device_name=input_device_name,
+            output_device_name=output_device_name,
+            input_sample_rate=input_sample_rate,
             output_sample_rate=int(output_sr),
-            noise_floor_rms=float(self.device_context.get("noise_floor_rms", 0.0025)),
+            noise_floor_rms=noise_floor_rms,
+            hostapi_name=hostapi_name,
+            capture_backend=capture_backend,
+            input_device_id=input_device_id or None,
+            output_device_id=output_device_id or None,
         )
+    def _safe_int(self, value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+    def _safe_float(self, value: Any, default: float) -> float:
+        try:
+            out = float(value)
+        except Exception:
+            return float(default)
+        if out != out:
+            return float(default)
+        return float(out)
     def _is_bluetooth_mode(self) -> bool:
         profile = self._device_profile
         if profile is None:
             return False
-        return bool(
-            profile.input_kind == "bluetooth_headset"
-            or profile.output_kind == "bluetooth_headset"
-        )
+        return bool(profile.bluetooth_mode)
     def _is_bluetooth_long_session_mode(self) -> bool:
         return bool(self._bluetooth_long_session_mode)
     def _safe_close_startup_resources(self) -> None:
@@ -8520,18 +10480,20 @@ class SyncEvidenceBuilder:
     def __init__(
         self,
         *,
-        startup_window_sec: float = 3.0,
-        seek_enable_after_sec: float = 4.0,
-        sustained_speaking_sec: float = 0.55,
+        startup_window_sec: float = 4.0,
+        seek_enable_after_sec: float = 8.0,
+        sustained_speaking_sec: float = 0.65,
     ) -> None:
         self.startup_window_sec = float(startup_window_sec)
         self.seek_enable_after_sec = float(seek_enable_after_sec)
         self.sustained_speaking_sec = float(sustained_speaking_sec)
         self._session_started_at_sec = 0.0
         self._last_speech_like_at_sec = 0.0
+        self._last_engaged_like_at_sec = 0.0
     def reset(self, now_sec: float) -> None:
         self._session_started_at_sec = float(now_sec)
         self._last_speech_like_at_sec = 0.0
+        self._last_engaged_like_at_sec = 0.0
     def build(
         self,
         *,
@@ -8542,10 +10504,10 @@ class SyncEvidenceBuilder:
         bluetooth_mode: bool,
         bluetooth_long_session_mode: bool = False,
     ) -> SyncEvidence:
-        startup_window = self.startup_window_sec + (1.5 if bluetooth_mode else 0.0)
+        startup_window = self.startup_window_sec + (2.0 if bluetooth_mode else 0.0)
         startup_mode = (now_sec - self._session_started_at_sec) <= startup_window
         speech_conf = self._speech_confidence(signal_quality)
-        if speech_conf >= 0.40:
+        if speech_conf >= 0.36:
             self._last_speech_like_at_sec = float(now_sec)
         speech_state = self._speech_state(
             now_sec=now_sec,
@@ -8558,9 +10520,42 @@ class SyncEvidenceBuilder:
         still_following = 0.0 if fusion_evidence is None else float(fusion_evidence.still_following_likelihood)
         reentry = 0.0 if fusion_evidence is None else float(fusion_evidence.reentry_likelihood)
         repeated = 0.0 if fusion_evidence is None else float(fusion_evidence.repeated_likelihood)
+        progress_recent = False
+        progress_active = False
+        progress_conf = 0.0
+        progress_quality = 0.0
+        progress_stable = False
+        progress_age = 9999.0
+        if progress is not None:
+            progress_recent = bool(getattr(progress, "recently_progressed", False))
+            progress_active = bool(getattr(progress, "active_speaking", False))
+            progress_conf = float(getattr(progress, "confidence", 0.0))
+            progress_quality = float(getattr(progress, "tracking_quality", 0.0))
+            progress_stable = bool(getattr(progress, "stable", False))
+            progress_age = float(getattr(progress, "progress_age_sec", 9999.0))
+        engaged_like = bool(
+            progress_recent
+            or progress_active
+            or still_following >= 0.60
+            or reentry >= 0.54
+            or (speech_conf >= 0.46 and progress_quality >= 0.46)
+        )
+        if engaged_like:
+            self._last_engaged_like_at_sec = float(now_sec)
+        engaged_tail_sec = 1.70 if bluetooth_mode else 1.10
+        engaged_recent = (
+            self._last_engaged_like_at_sec > 0.0
+            and (now_sec - self._last_engaged_like_at_sec) <= engaged_tail_sec
+        )
         sync_conf = max(
             0.0,
-            min(1.0, 0.36 * speech_conf + 0.40 * tracking_conf + 0.24 * max(audio_conf, still_following)),
+            min(
+                1.0,
+                0.34 * speech_conf
+                + 0.36 * tracking_conf
+                + 0.20 * max(audio_conf, still_following)
+                + 0.10 * (1.0 if engaged_recent else 0.0),
+            ),
         )
         sync_state = self._sync_state(
             startup_mode=startup_mode,
@@ -8568,20 +10563,30 @@ class SyncEvidenceBuilder:
             tracking_state=tracking_state,
             sync_confidence=sync_conf,
             fusion_evidence=fusion_evidence,
+            engaged_recent=engaged_recent,
         )
-        should_open_asr_gate = speech_state in (
-            SpeechState.POSSIBLE,
-            SpeechState.ACTIVE,
-            SpeechState.SUSTAINED,
+        should_open_asr_gate = bool(
+            speech_state in (SpeechState.POSSIBLE, SpeechState.ACTIVE, SpeechState.SUSTAINED)
+            or (engaged_recent and still_following >= 0.52)
         )
-        should_keep_asr_gate = should_open_asr_gate or (
-            self._last_speech_like_at_sec > 0.0
-            and (now_sec - self._last_speech_like_at_sec) <= (0.90 if bluetooth_mode else 0.45)
+        gate_tail_sec = 1.15 if bluetooth_mode else 0.65
+        should_keep_asr_gate = bool(
+            should_open_asr_gate
+            or (
+                self._last_speech_like_at_sec > 0.0
+                and (now_sec - self._last_speech_like_at_sec) <= gate_tail_sec
+            )
+            or engaged_recent
         )
         allow_latency_observation = bool(
-            speech_state in (SpeechState.ACTIVE, SpeechState.SUSTAINED)
+            not startup_mode
+            and speech_state in (SpeechState.ACTIVE, SpeechState.SUSTAINED)
             and tracking_state in (TrackingState.RELIABLE, TrackingState.LOCKED)
             and sync_state in (SyncState.CONVERGING, SyncState.STABLE)
+            and repeated < 0.50
+            and reentry < 0.70
+            and progress_age <= (1.10 if bluetooth_mode else 0.95)
+            and progress_conf >= 0.52
             and (
                 fusion_evidence is None
                 or fusion_evidence.fused_confidence >= (0.54 if bluetooth_mode else 0.58)
@@ -8592,11 +10597,20 @@ class SyncEvidenceBuilder:
         else:
             allow_seek = bool(
                 (now_sec - self._session_started_at_sec) >= self.seek_enable_after_sec
+                and not startup_mode
                 and tracking_state == TrackingState.LOCKED
                 and sync_state == SyncState.STABLE
-                and not startup_mode
-                and repeated < 0.55
-                and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
+                and progress_stable
+                and progress_quality >= 0.78
+                and progress_conf >= 0.74
+                and progress_age <= 0.85
+                and repeated < 0.42
+                and reentry < 0.42
+                and still_following < 0.72
+                and (
+                    fusion_evidence is None
+                    or not fusion_evidence.should_prevent_seek
+                )
             )
         return SyncEvidence(
             speech_state=speech_state,
@@ -8621,13 +10635,13 @@ class SyncEvidenceBuilder:
         if signal_quality is None:
             return 0.0
         score = 0.0
-        score += min(0.35, max(0.0, signal_quality.speaking_likelihood) * 0.45)
+        score += min(0.34, max(0.0, signal_quality.speaking_likelihood) * 0.46)
         score += min(0.30, max(0.0, signal_quality.rms) * 18.0)
-        score += min(0.18, max(0.0, signal_quality.peak) * 2.2)
+        score += min(0.18, max(0.0, signal_quality.peak) * 2.0)
         if signal_quality.vad_active:
             score += 0.18
         if signal_quality.dropout_detected:
-            score -= 0.18
+            score -= 0.16
         if signal_quality.clipping_ratio >= 0.05:
             score -= 0.08
         return max(0.0, min(1.0, score))
@@ -8640,9 +10654,9 @@ class SyncEvidenceBuilder:
     ) -> SpeechState:
         if signal_quality is None:
             return SpeechState.NONE
-        if speech_confidence < 0.18:
+        if speech_confidence < 0.16:
             return SpeechState.NONE
-        if speech_confidence < 0.42:
+        if speech_confidence < 0.40:
             return SpeechState.POSSIBLE
         if self._last_speech_like_at_sec > 0.0 and (
             now_sec - self._last_speech_like_at_sec
@@ -8656,15 +10670,15 @@ class SyncEvidenceBuilder:
     ) -> float:
         score = 0.0
         if progress is not None:
-            score += min(0.45, float(progress.tracking_quality) * 0.50)
-            score += min(0.30, float(progress.confidence) * 0.35)
+            score += min(0.42, float(progress.tracking_quality) * 0.50)
+            score += min(0.28, float(progress.confidence) * 0.34)
             if progress.stable:
-                score += 0.15
+                score += 0.14
             if progress.recently_progressed:
                 score += 0.10
-            if progress.progress_age_sec > 1.4:
-                score -= 0.12
-        if fusion_evidence is not None and (progress is None or getattr(progress, "tracking_quality", 0.0) < 0.55):
+            if progress.progress_age_sec > 1.5:
+                score -= 0.10
+        if fusion_evidence is not None and (progress is None or getattr(progress, "tracking_quality", 0.0) < 0.56):
             score += min(0.16, float(fusion_evidence.audio_confidence) * 0.20)
             score += min(0.14, float(fusion_evidence.still_following_likelihood) * 0.18)
         return max(0.0, min(1.0, score))
@@ -8678,7 +10692,7 @@ class SyncEvidenceBuilder:
         mode = progress.tracking_mode
         if mode == TrackingMode.LOCKED and tracking_confidence >= 0.72:
             return TrackingState.LOCKED
-        if mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED) and tracking_confidence >= 0.54:
+        if mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED) and tracking_confidence >= 0.52:
             return TrackingState.RELIABLE
         if tracking_confidence >= 0.30:
             return TrackingState.WEAK
@@ -8691,6 +10705,7 @@ class SyncEvidenceBuilder:
         tracking_state: TrackingState,
         sync_confidence: float,
         fusion_evidence: FusionEvidence | None,
+        engaged_recent: bool,
     ) -> SyncState:
         if startup_mode:
             return SyncState.BOOTSTRAP
@@ -8700,11 +10715,211 @@ class SyncEvidenceBuilder:
             and sync_confidence >= 0.72
         ):
             return SyncState.STABLE
-        if fusion_evidence is not None and fusion_evidence.still_following_likelihood >= 0.68 and sync_confidence >= 0.56:
+        if fusion_evidence is not None:
+            if (
+                fusion_evidence.still_following_likelihood >= 0.66
+                or fusion_evidence.reentry_likelihood >= 0.54
+            ) and sync_confidence >= 0.54:
+                return SyncState.CONVERGING
+        if engaged_recent and tracking_state in (TrackingState.RELIABLE, TrackingState.LOCKED):
             return SyncState.CONVERGING
         if speech_state != SpeechState.NONE and tracking_state in (TrackingState.RELIABLE, TrackingState.LOCKED):
             return SyncState.CONVERGING
         return SyncState.DEGRADED
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/session/session_metrics.py`
+
+```python
+from __future__ import annotations
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any
+_STARTUP_FALSE_HOLD_REASONS = {
+    "no_progress_timeout",
+    "reference_too_far_ahead",
+}
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return float(default)
+    if out != out:
+        return float(default)
+    return float(out)
+@dataclass(slots=True)
+class SessionMetrics:
+    lesson_id: str = ""
+    session_started_at_sec: float = 0.0
+    session_ended_at_sec: float = 0.0
+    first_signal_active_time_sec: float | None = None
+    first_asr_partial_time_sec: float | None = None
+    first_reliable_progress_time_sec: float | None = None
+    startup_false_hold_count: int = 0
+    hold_count: int = 0
+    resume_count: int = 0
+    soft_duck_count: int = 0
+    seek_count: int = 0
+    lost_count: int = 0
+    reacquire_count: int = 0
+    max_tracking_quality: float = 0.0
+    _tracking_quality_sum: float = 0.0
+    total_progress_updates: int = 0
+    tracking_total: int = 0
+    tracking_stable_count: int = 0
+    tracking_mode_counter: Counter[str] = field(default_factory=Counter)
+    progress_recent_count: int = 0
+    position_source_counter: Counter[str] = field(default_factory=Counter)
+    joint_confidence_sum: float = 0.0
+    signal_active_events: int = 0
+    asr_partial_count: int = 0
+    action_reason_counter: Counter[str] = field(default_factory=Counter)
+    def mark_session_started(self, now_sec: float) -> None:
+        now_sec = _safe_float(now_sec)
+        if self.session_started_at_sec <= 0.0:
+            self.session_started_at_sec = now_sec
+        if self.session_ended_at_sec < self.session_started_at_sec:
+            self.session_ended_at_sec = self.session_started_at_sec
+    def mark_session_ended(self, now_sec: float) -> None:
+        now_sec = _safe_float(now_sec)
+        if self.session_started_at_sec <= 0.0:
+            self.session_started_at_sec = now_sec
+        self.session_ended_at_sec = max(now_sec, self.session_started_at_sec)
+    def observe_signal_active(self, now_sec: float) -> None:
+        now_sec = _safe_float(now_sec)
+        self.signal_active_events += 1
+        if self.first_signal_active_time_sec is None and self.session_started_at_sec > 0.0:
+            self.first_signal_active_time_sec = max(0.0, now_sec - self.session_started_at_sec)
+    def observe_asr_partial(self, now_sec: float) -> None:
+        now_sec = _safe_float(now_sec)
+        self.asr_partial_count += 1
+        if self.first_asr_partial_time_sec is None and self.session_started_at_sec > 0.0:
+            self.first_asr_partial_time_sec = max(0.0, now_sec - self.session_started_at_sec)
+    def observe_progress(
+        self,
+        *,
+        now_since_session_start_sec: float,
+        recently_progressed: bool,
+        joint_confidence: float,
+        position_source: str,
+        tracking_quality: float | None = None,
+        is_reliable: bool | None = None,
+    ) -> None:
+        self.total_progress_updates += 1
+        tq = _safe_float(tracking_quality, 0.0) if tracking_quality is not None else 0.0
+        jc = max(0.0, min(1.0, _safe_float(joint_confidence, 0.0)))
+        if tq > self.max_tracking_quality:
+            self.max_tracking_quality = tq
+        self._tracking_quality_sum += tq
+        self.joint_confidence_sum += jc
+        if recently_progressed:
+            self.progress_recent_count += 1
+        source = str(position_source or "unknown")
+        self.position_source_counter[source] += 1
+        if is_reliable and self.first_reliable_progress_time_sec is None:
+            self.first_reliable_progress_time_sec = max(0.0, _safe_float(now_since_session_start_sec))
+    def observe_tracking(
+        self,
+        *,
+        tracking_mode: str,
+        tracking_quality: float,
+        stable: bool,
+    ) -> None:
+        self.tracking_total += 1
+        mode = str(tracking_mode or "unknown")
+        self.tracking_mode_counter[mode] += 1
+        if stable:
+            self.tracking_stable_count += 1
+        tq = _safe_float(tracking_quality, 0.0)
+        if tq > self.max_tracking_quality:
+            self.max_tracking_quality = tq
+        if mode == "lost":
+            self.lost_count += 1
+        elif mode == "reacquiring":
+            self.reacquire_count += 1
+    def observe_tracking_mode(self, mode: str) -> None:
+        mode = str(mode or "unknown")
+        self.tracking_mode_counter[mode] += 1
+        if mode == "lost":
+            self.lost_count += 1
+        elif mode == "reacquiring":
+            self.reacquire_count += 1
+    def observe_control(
+        self,
+        *,
+        action: str,
+        now_since_session_start_sec: float,
+        startup_grace_sec: float,
+        reason: str | None = None,
+    ) -> None:
+        action = str(action or "unknown")
+        reason = str(reason or "").strip()
+        if action == "hold":
+            self.hold_count += 1
+            if now_since_session_start_sec <= max(0.0, _safe_float(startup_grace_sec)):
+                if reason in _STARTUP_FALSE_HOLD_REASONS:
+                    self.startup_false_hold_count += 1
+        elif action == "resume":
+            self.resume_count += 1
+        elif action == "soft_duck":
+            self.soft_duck_count += 1
+        elif action == "seek":
+            self.seek_count += 1
+        if reason:
+            self.action_reason_counter[f"{action}:{reason}"] += 1
+    def observe_action(self, action: str, reason: str, now_sec: float) -> None:
+        if self.session_started_at_sec > 0.0:
+            since_start = max(0.0, _safe_float(now_sec) - self.session_started_at_sec)
+        else:
+            since_start = 0.0
+        self.observe_control(
+            action=action,
+            now_since_session_start_sec=since_start,
+            startup_grace_sec=5.0,
+            reason=reason,
+        )
+    def mean_tracking_quality(self) -> float:
+        if self.total_progress_updates <= 0:
+            return 0.0
+        return float(self._tracking_quality_sum / self.total_progress_updates)
+    def summary_dict(self) -> dict[str, Any]:
+        duration_sec = 0.0
+        if self.session_started_at_sec > 0.0 and self.session_ended_at_sec >= self.session_started_at_sec:
+            duration_sec = float(self.session_ended_at_sec - self.session_started_at_sec)
+        mean_tracking_quality = self.mean_tracking_quality()
+        return {
+            "first_signal_active_time_sec": self.first_signal_active_time_sec,
+            "first_asr_partial_time_sec": self.first_asr_partial_time_sec,
+            "first_reliable_progress_time_sec": self.first_reliable_progress_time_sec,
+            "startup_false_hold_count": self.startup_false_hold_count,
+            "hold_count": self.hold_count,
+            "resume_count": self.resume_count,
+            "soft_duck_count": self.soft_duck_count,
+            "seek_count": self.seek_count,
+            "lost_count": self.lost_count,
+            "reacquire_count": self.reacquire_count,
+            "max_tracking_quality": self.max_tracking_quality,
+            "mean_tracking_quality": mean_tracking_quality,
+            "total_progress_updates": self.total_progress_updates,
+            "lesson_id": self.lesson_id,
+            "session_started_at_sec": self.session_started_at_sec,
+            "session_ended_at_sec": self.session_ended_at_sec,
+            "session_duration_sec": duration_sec,
+            "signal_active_events": self.signal_active_events,
+            "asr_partial_count": self.asr_partial_count,
+            "tracking_total": self.tracking_total,
+            "tracking_stable_count": self.tracking_stable_count,
+            "progress_recent_count": self.progress_recent_count,
+            "avg_joint_confidence": (
+                float(self.joint_confidence_sum / self.total_progress_updates)
+                if self.total_progress_updates > 0
+                else 0.0
+            ),
+            "tracking_mode_counter": dict(self.tracking_mode_counter),
+            "position_source_counter": dict(self.position_source_counter),
+            "action_reason_counter": dict(self.action_reason_counter),
+        }
 ```
 
 ---
@@ -8753,10 +10968,7 @@ class EventLogger:
 ```python
 from __future__ import annotations
 from dataclasses import dataclass
-_STARTUP_FALSE_HOLD_REASONS = {
-    "no_progress_timeout",
-    "reference_too_far_ahead",
-}
+from shadowing.session.session_metrics import SessionMetrics
 @dataclass(slots=True)
 class SessionMetricsSummary:
     first_signal_active_time_sec: float | None
@@ -8773,91 +10985,55 @@ class SessionMetricsSummary:
     mean_tracking_quality: float
     total_progress_updates: int
 class MetricsAggregator:
-    def __init__(self) -> None:
-        self.session_started_at_sec = 0.0
-        self.first_signal_active_time_sec: float | None = None
-        self.first_asr_partial_time_sec: float | None = None
-        self.first_reliable_progress_time_sec: float | None = None
-        self.startup_false_hold_count = 0
-        self.hold_count = 0
-        self.resume_count = 0
-        self.soft_duck_count = 0
-        self.seek_count = 0
-        self.lost_count = 0
-        self.reacquire_count = 0
-        self.max_tracking_quality = 0.0
-        self._tracking_quality_sum = 0.0
-        self.total_progress_updates = 0
+    def __init__(self, lesson_id: str = "") -> None:
+        self._delegate = SessionMetrics(lesson_id=lesson_id)
     def mark_session_started(self, now_sec: float) -> None:
-        if self.session_started_at_sec <= 0.0:
-            self.session_started_at_sec = float(now_sec)
+        self._delegate.mark_session_started(now_sec)
+    def mark_session_ended(self, now_sec: float) -> None:
+        self._delegate.mark_session_ended(now_sec)
     def observe_signal_active(self, now_sec: float) -> None:
-        if self.first_signal_active_time_sec is None and self.session_started_at_sec > 0.0:
-            self.first_signal_active_time_sec = max(0.0, now_sec - self.session_started_at_sec)
+        self._delegate.observe_signal_active(now_sec)
     def observe_asr_partial(self, now_sec: float) -> None:
-        if self.first_asr_partial_time_sec is None and self.session_started_at_sec > 0.0:
-            self.first_asr_partial_time_sec = max(0.0, now_sec - self.session_started_at_sec)
+        self._delegate.observe_asr_partial(now_sec)
     def observe_progress(self, now_sec: float, tracking_quality: float, is_reliable: bool) -> None:
-        self.total_progress_updates += 1
-        self.max_tracking_quality = max(self.max_tracking_quality, float(tracking_quality))
-        self._tracking_quality_sum += float(tracking_quality)
-        if is_reliable and self.first_reliable_progress_time_sec is None and self.session_started_at_sec > 0.0:
-            self.first_reliable_progress_time_sec = max(0.0, now_sec - self.session_started_at_sec)
-    def observe_action(self, action: str, reason: str, now_sec: float) -> None:
-        if action == "hold":
-            self.hold_count += 1
-            if self.session_started_at_sec > 0.0 and (now_sec - self.session_started_at_sec) <= 5.0:
-                if reason in _STARTUP_FALSE_HOLD_REASONS:
-                    self.startup_false_hold_count += 1
-        elif action == "resume":
-            self.resume_count += 1
-        elif action == "soft_duck":
-            self.soft_duck_count += 1
-        elif action == "seek":
-            self.seek_count += 1
-    def observe_tracking_mode(self, mode: str) -> None:
-        if mode == "lost":
-            self.lost_count += 1
-        elif mode == "reacquiring":
-            self.reacquire_count += 1
-    def summary(self) -> SessionMetricsSummary:
-        mean_tracking_quality = (
-            self._tracking_quality_sum / self.total_progress_updates
-            if self.total_progress_updates > 0
-            else 0.0
+        if self._delegate.session_started_at_sec > 0.0:
+            since_start = max(0.0, float(now_sec) - self._delegate.session_started_at_sec)
+        else:
+            since_start = 0.0
+        self._delegate.observe_progress(
+            now_since_session_start_sec=since_start,
+            recently_progressed=False,
+            joint_confidence=float(tracking_quality),
+            position_source="unknown",
+            tracking_quality=float(tracking_quality),
+            is_reliable=bool(is_reliable),
         )
+    def observe_action(self, action: str, reason: str, now_sec: float) -> None:
+        self._delegate.observe_action(action, reason, now_sec)
+    def observe_tracking_mode(self, mode: str) -> None:
+        self._delegate.observe_tracking_mode(mode)
+    def summary(self) -> SessionMetricsSummary:
+        d = self._delegate.summary_dict()
         return SessionMetricsSummary(
-            first_signal_active_time_sec=self.first_signal_active_time_sec,
-            first_asr_partial_time_sec=self.first_asr_partial_time_sec,
-            first_reliable_progress_time_sec=self.first_reliable_progress_time_sec,
-            startup_false_hold_count=self.startup_false_hold_count,
-            hold_count=self.hold_count,
-            resume_count=self.resume_count,
-            soft_duck_count=self.soft_duck_count,
-            seek_count=self.seek_count,
-            lost_count=self.lost_count,
-            reacquire_count=self.reacquire_count,
-            max_tracking_quality=self.max_tracking_quality,
-            mean_tracking_quality=float(mean_tracking_quality),
-            total_progress_updates=self.total_progress_updates,
+            first_signal_active_time_sec=d.get("first_signal_active_time_sec"),
+            first_asr_partial_time_sec=d.get("first_asr_partial_time_sec"),
+            first_reliable_progress_time_sec=d.get("first_reliable_progress_time_sec"),
+            startup_false_hold_count=int(d.get("startup_false_hold_count", 0)),
+            hold_count=int(d.get("hold_count", 0)),
+            resume_count=int(d.get("resume_count", 0)),
+            soft_duck_count=int(d.get("soft_duck_count", 0)),
+            seek_count=int(d.get("seek_count", 0)),
+            lost_count=int(d.get("lost_count", 0)),
+            reacquire_count=int(d.get("reacquire_count", 0)),
+            max_tracking_quality=float(d.get("max_tracking_quality", 0.0)),
+            mean_tracking_quality=float(d.get("mean_tracking_quality", 0.0)),
+            total_progress_updates=int(d.get("total_progress_updates", 0)),
         )
     def summary_dict(self) -> dict:
-        s = self.summary()
-        return {
-            "first_signal_active_time_sec": s.first_signal_active_time_sec,
-            "first_asr_partial_time_sec": s.first_asr_partial_time_sec,
-            "first_reliable_progress_time_sec": s.first_reliable_progress_time_sec,
-            "startup_false_hold_count": s.startup_false_hold_count,
-            "hold_count": s.hold_count,
-            "resume_count": s.resume_count,
-            "soft_duck_count": s.soft_duck_count,
-            "seek_count": s.seek_count,
-            "lost_count": s.lost_count,
-            "reacquire_count": s.reacquire_count,
-            "max_tracking_quality": s.max_tracking_quality,
-            "mean_tracking_quality": s.mean_tracking_quality,
-            "total_progress_updates": s.total_progress_updates,
-        }
+        return self._delegate.summary_dict()
+    @property
+    def session_metrics(self) -> SessionMetrics:
+        return self._delegate
 ```
 
 ---
@@ -9880,133 +12056,6 @@ if str(SRC_DIR) not in sys.path:
 ```
 
 ---
-### 文件: `shadowing_app/tools/build_reference_audio_features.py`
-
-```python
-from __future__ import annotations
-import _bootstrap
-import argparse
-from pathlib import Path
-from shadowing.audio.reference_audio_analyzer import ReferenceAudioAnalyzer
-from shadowing.audio.reference_audio_store import ReferenceAudioStore
-from shadowing.infrastructure.lesson_repo import FileLessonRepository
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Build reference audio features for a lesson"
-    )
-    parser.add_argument("--lesson-id", type=str, required=True)
-    parser.add_argument("--lesson-base-dir", type=str, default="assets/lessons")
-    parser.add_argument("--frame-size-sec", type=float, default=0.025)
-    parser.add_argument("--hop-sec", type=float, default=0.010)
-    parser.add_argument("--n-bands", type=int, default=6)
-    args = parser.parse_args()
-    lesson_base_dir = str(Path(args.lesson_base_dir).expanduser().resolve())
-    repo = FileLessonRepository(lesson_base_dir)
-    store = ReferenceAudioStore(lesson_base_dir)
-    analyzer = ReferenceAudioAnalyzer(
-        frame_size_sec=float(args.frame_size_sec),
-        hop_sec=float(args.hop_sec),
-        n_bands=int(args.n_bands),
-    )
-    ref_map = repo.load_reference_map(args.lesson_id)
-    chunks = repo.load_audio_chunks(args.lesson_id)
-    features = analyzer.analyze(
-        lesson_id=args.lesson_id,
-        chunks=chunks,
-        reference_map=ref_map,
-    )
-    path = store.save(args.lesson_id, features)
-if __name__ == "__main__":
-    main()
-```
-
----
-### 文件: `shadowing_app/tools/evaluate_session.py`
-
-```python
-from __future__ import annotations
-import _bootstrap
-import argparse
-import json
-from pathlib import Path
-from shadowing.telemetry.session_evaluator import SessionEvaluator
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a recorded shadowing session")
-    parser.add_argument("--events-file", type=str, required=True)
-    parser.add_argument("--summary-file", type=str, default=None)
-    parser.add_argument("--output-json", type=str, default=None)
-    args = parser.parse_args()
-    evaluator = SessionEvaluator(
-        events_file=args.events_file,
-        summary_file=args.summary_file,
-    )
-    result = evaluator.evaluate()
-    payload = result.to_dict()
-    if args.output_json:
-        out_path = Path(args.output_json).expanduser().resolve()
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    else:
-if __name__ == "__main__":
-    main()
-```
-
----
-### 文件: `shadowing_app/tools/replay_session.py`
-
-```python
-from __future__ import annotations
-import _bootstrap
-import argparse
-from collections import Counter
-from shadowing.telemetry.replay_loader import ReplayLoader
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Replay and summarize a recorded runtime session events.jsonl"
-    )
-    parser.add_argument("--events-file", type=str, required=True)
-    args = parser.parse_args()
-    loader = ReplayLoader(args.events_file)
-    counts = Counter()
-    last_tracking_mode = None
-    last_user_state = None
-    max_tracking_quality = 0.0
-    max_signal = 0.0
-    first_tick = None
-    last_tick = None
-    first_ts = None
-    last_ts = None
-    for ev in loader:
-        counts[ev.event_type] += 1
-        if ev.session_tick is not None:
-            if first_tick is None:
-                first_tick = ev.session_tick
-            last_tick = ev.session_tick
-        if ev.ts_monotonic_sec is not None:
-            if first_ts is None:
-                first_ts = ev.ts_monotonic_sec
-            last_ts = ev.ts_monotonic_sec
-        if ev.event_type == "tracking_snapshot":
-            mode = ev.payload.get("tracking_mode")
-            tq = float(ev.payload.get("overall_score", 0.0))
-            max_tracking_quality = max(max_tracking_quality, tq)
-            last_tracking_mode = mode
-        elif ev.event_type == "progress_snapshot":
-            last_user_state = ev.payload.get("user_state")
-        elif ev.event_type == "signal_snapshot":
-            max_signal = max(
-                max_signal,
-                float(ev.payload.get("speaking_likelihood", 0.0)),
-            )
-    for k in sorted(counts):
-if __name__ == "__main__":
-    main()
-```
-
----
 ### 文件: `shadowing_app/tools/run_shadowing.py`
 
 ```python
@@ -10023,6 +12072,7 @@ from shadowing.audio.bluetooth_preflight import (
     run_bluetooth_duplex_preflight,
     should_run_bluetooth_preflight,
 )
+from shadowing.audio.device_profile import normalize_device_id
 from shadowing.bootstrap import build_runtime
 from shadowing.llm.qwen_hotwords import extract_hotwords_with_qwen
 from shadowing.realtime.capture.device_utils import pick_working_input_config
@@ -10094,37 +12144,106 @@ def _parse_output_device_arg(raw_value: str | None) -> int | str | None:
     if raw.isdigit():
         return int(raw)
     return raw
-def _resolve_output_device_name(device_value: int | str | None) -> str:
+def _query_input_device_info(device_value: int | str | None) -> dict[str, object]:
     devices = sd.query_devices()
-    if device_value is None:
-        _, default_out = sd.default.device
-        if default_out is None or int(default_out) < 0:
-            return "unknown"
-        return str(sd.query_devices(int(default_out))["name"])
-    if isinstance(device_value, int):
-        return str(sd.query_devices(int(device_value))["name"])
-    target = str(device_value).strip().lower()
-    for dev in devices:
-        if int(dev["max_output_channels"]) <= 0:
-            continue
-        if target in str(dev["name"]).lower():
-            return str(dev["name"])
-    return str(device_value)
-def _resolve_input_device_name(device_value: int | str | None) -> str:
+    hostapis = sd.query_hostapis()
     if device_value is None:
         default_in, _ = sd.default.device
         if default_in is None or int(default_in) < 0:
-            return "unknown"
-        return str(sd.query_devices(int(default_in))["name"])
+            return {
+                "index": None,
+                "name": "unknown",
+                "hostapi_name": "",
+                "device_id": "",
+            }
+        device_value = int(default_in)
     if isinstance(device_value, int):
-        return str(sd.query_devices(device_value)["name"])
+        dev = sd.query_devices(int(device_value))
+        hostapi_name = str(hostapis[int(dev["hostapi"])]["name"])
+        name = str(dev["name"])
+        return {
+            "index": int(device_value),
+            "name": name,
+            "hostapi_name": hostapi_name,
+            "device_id": normalize_device_id(
+                device_name=name,
+                hostapi_name=hostapi_name,
+                device_index=int(device_value),
+            ),
+        }
     target = str(device_value).strip().lower()
-    for _, dev in enumerate(sd.query_devices()):
+    for idx, dev in enumerate(devices):
         if int(dev["max_input_channels"]) <= 0:
             continue
         if target in str(dev["name"]).lower():
-            return str(dev["name"])
-    return str(device_value)
+            hostapi_name = str(hostapis[int(dev["hostapi"])]["name"])
+            name = str(dev["name"])
+            return {
+                "index": int(idx),
+                "name": name,
+                "hostapi_name": hostapi_name,
+                "device_id": normalize_device_id(
+                    device_name=name,
+                    hostapi_name=hostapi_name,
+                    device_index=int(idx),
+                ),
+            }
+    return {
+        "index": None,
+        "name": str(device_value),
+        "hostapi_name": "",
+        "device_id": normalize_device_id(device_name=str(device_value), hostapi_name=""),
+    }
+def _query_output_device_info(device_value: int | str | None) -> dict[str, object]:
+    devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
+    if device_value is None:
+        _, default_out = sd.default.device
+        if default_out is None or int(default_out) < 0:
+            return {
+                "index": None,
+                "name": "unknown",
+                "hostapi_name": "",
+                "device_id": "",
+            }
+        device_value = int(default_out)
+    if isinstance(device_value, int):
+        dev = sd.query_devices(int(device_value))
+        hostapi_name = str(hostapis[int(dev["hostapi"])]["name"])
+        name = str(dev["name"])
+        return {
+            "index": int(device_value),
+            "name": name,
+            "hostapi_name": hostapi_name,
+            "device_id": normalize_device_id(
+                device_name=name,
+                hostapi_name=hostapi_name,
+                device_index=int(device_value),
+            ),
+        }
+    target = str(device_value).strip().lower()
+    for idx, dev in enumerate(devices):
+        if int(dev["max_output_channels"]) <= 0:
+            continue
+        if target in str(dev["name"]).lower():
+            hostapi_name = str(hostapis[int(dev["hostapi"])]["name"])
+            name = str(dev["name"])
+            return {
+                "index": int(idx),
+                "name": name,
+                "hostapi_name": hostapi_name,
+                "device_id": normalize_device_id(
+                    device_name=name,
+                    hostapi_name=hostapi_name,
+                    device_index=int(idx),
+                ),
+            }
+    return {
+        "index": None,
+        "name": str(device_value),
+        "hostapi_name": "",
+        "device_id": normalize_device_id(device_name=str(device_value), hostapi_name=""),
+    }
 def _run_bluetooth_preflight_or_fail(
     *,
     input_device: int | str | None,
@@ -10133,15 +12252,15 @@ def _run_bluetooth_preflight_or_fail(
     playback_sample_rate: int,
     preflight_duration_sec: float,
     skip_bluetooth_preflight: bool,
-) -> tuple[int | str | None, int | str | None]:
+) -> tuple[int | str | None, int | str | None, dict[str, object]]:
     if skip_bluetooth_preflight:
-        return input_device, output_device
+        return input_device, output_device, {"ran": False}
     should_run = should_run_bluetooth_preflight(
         input_device=input_device,
         output_device=output_device,
     )
     if not should_run:
-        return input_device, output_device
+        return input_device, output_device, {"ran": False}
     result = run_bluetooth_duplex_preflight(
         BluetoothPreflightConfig(
             input_device=input_device,
@@ -10160,7 +12279,20 @@ def _run_bluetooth_preflight_or_fail(
             f"Output: {result.output_device_name!r}\n"
             f"{notes}"
         )
-    return result.input_device_index, result.output_device_index
+    return (
+        result.input_device_index,
+        result.output_device_index,
+        {
+            "ran": True,
+            "input_device_name": result.input_device_name,
+            "output_device_name": result.output_device_name,
+            "input_hostapi_name": result.input_hostapi_name,
+            "output_hostapi_name": result.output_hostapi_name,
+            "input_family_key": result.input_device_family_key,
+            "output_family_key": result.output_device_family_key,
+            "samplerate": result.samplerate,
+        },
+    )
 def _normalize_for_hotwords(text: str) -> str:
     text = str(text or "").strip()
     text = text.replace("\u3000", " ")
@@ -10299,8 +12431,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile-path", type=str, default="runtime/device_profiles.json")
     parser.add_argument("--session-dir", type=str, default="runtime/latest_session")
     parser.add_argument("--event-logging", action="store_true")
-    parser.add_argument("--startup-grace-sec", type=float, default=2.8)
-    parser.add_argument("--low-confidence-hold-sec", type=float, default=1.8)
+    parser.add_argument("--startup-grace-sec", type=float, default=3.2)
+    parser.add_argument("--low-confidence-hold-sec", type=float, default=2.2)
     parser.add_argument("--hotwords", type=str, default="")
     parser.add_argument("--hotwords-score", type=float, default=1.8)
     parser.add_argument("--disable-auto-hotwords", action="store_true")
@@ -10363,7 +12495,7 @@ def main() -> None:
     sherpa_paths = collect_sherpa_paths()
     if args.asr == "sherpa":
         validate_sherpa_paths(sherpa_paths)
-    effective_input_device, effective_output_device = _run_bluetooth_preflight_or_fail(
+    effective_input_device, effective_output_device, preflight_meta = _run_bluetooth_preflight_or_fail(
         input_device=effective_input_device,
         output_device=parsed_output_device,
         input_samplerate=effective_input_samplerate,
@@ -10371,8 +12503,29 @@ def main() -> None:
         preflight_duration_sec=float(args.preflight_duration_sec),
         skip_bluetooth_preflight=bool(args.skip_bluetooth_preflight),
     )
-    input_device_name = _resolve_input_device_name(effective_input_device)
-    output_device_name = _resolve_output_device_name(effective_output_device)
+    input_info = _query_input_device_info(effective_input_device)
+    output_info = _query_output_device_info(effective_output_device)
+    if bool(preflight_meta.get("ran", False)):
+        if str(preflight_meta.get("input_device_name", "")).strip():
+            input_info["name"] = str(preflight_meta["input_device_name"])
+        if str(preflight_meta.get("output_device_name", "")).strip():
+            output_info["name"] = str(preflight_meta["output_device_name"])
+        preflight_hostapi = str(preflight_meta.get("input_hostapi_name", "")).strip()
+        if preflight_hostapi:
+            input_info["hostapi_name"] = preflight_hostapi
+            if not str(output_info.get("hostapi_name", "")).strip():
+                output_info["hostapi_name"] = preflight_hostapi
+    input_device_name = str(input_info.get("name", "unknown"))
+    output_device_name = str(output_info.get("name", "unknown"))
+    hostapi_name = str(input_info.get("hostapi_name", "") or output_info.get("hostapi_name", "") or "").strip()
+    input_device_id = str(input_info.get("device_id", "")).strip()
+    output_device_id = str(output_info.get("device_id", "")).strip()
+    bluetooth_mode = bool(
+        should_run_bluetooth_preflight(
+            input_device=effective_input_device,
+            output_device=effective_output_device,
+        )
+    )
     auto_hotwords: list[str] = []
     if not args.disable_auto_hotwords and args.hotwords_source != "none":
         if args.hotwords_source == "qwen":
@@ -10465,38 +12618,38 @@ def main() -> None:
                 "debug": bool(args.aligner_debug),
             },
             "control": {
-                "target_lead_sec": 0.15,
-                "hold_if_lead_sec": 0.90,
-                "resume_if_lead_sec": 0.28,
-                "seek_if_lag_sec": -1.80,
-                "min_confidence": 0.72,
-                "seek_cooldown_sec": 1.20,
-                "gain_following": 0.55,
-                "gain_transition": 0.80,
-                "gain_soft_duck": 0.42,
+                "target_lead_sec": 0.18,
+                "hold_if_lead_sec": 1.05,
+                "resume_if_lead_sec": 0.36,
+                "seek_if_lag_sec": -2.60,
+                "min_confidence": 0.70,
+                "seek_cooldown_sec": 2.20,
+                "gain_following": 0.52,
+                "gain_transition": 0.72,
+                "gain_soft_duck": 0.36,
                 "startup_grace_sec": float(args.startup_grace_sec),
                 "low_confidence_hold_sec": float(args.low_confidence_hold_sec),
-                "guide_play_sec": 3.00,
-                "no_progress_hold_min_play_sec": 5.20,
-                "progress_stale_sec": 1.35,
-                "hold_trend_sec": 0.95,
-                "tracking_quality_hold_min": 0.62,
-                "tracking_quality_seek_min": 0.80,
-                "resume_from_hold_speaking_lead_slack_sec": 0.62,
+                "guide_play_sec": 3.20,
+                "no_progress_hold_min_play_sec": 5.80,
+                "progress_stale_sec": 1.45,
+                "hold_trend_sec": 1.00,
+                "tracking_quality_hold_min": 0.60,
+                "tracking_quality_seek_min": 0.84,
+                "resume_from_hold_speaking_lead_slack_sec": 0.72,
                 "disable_seek": False,
-                "bluetooth_long_session_target_lead_sec": 0.35,
-                "bluetooth_long_session_hold_if_lead_sec": 1.20,
-                "bluetooth_long_session_resume_if_lead_sec": 0.22,
-                "bluetooth_long_session_seek_if_lag_sec": -2.80,
-                "bluetooth_long_session_seek_cooldown_sec": 2.60,
-                "bluetooth_long_session_progress_stale_sec": 1.45,
-                "bluetooth_long_session_hold_trend_sec": 1.00,
-                "bluetooth_long_session_tracking_quality_hold_min": 0.64,
-                "bluetooth_long_session_tracking_quality_seek_min": 0.82,
-                "bluetooth_long_session_resume_from_hold_speaking_lead_slack_sec": 0.62,
-                "bluetooth_long_session_gain_following": 0.52,
-                "bluetooth_long_session_gain_transition": 0.72,
-                "bluetooth_long_session_gain_soft_duck": 0.36,
+                "bluetooth_long_session_target_lead_sec": 0.38,
+                "bluetooth_long_session_hold_if_lead_sec": 1.35,
+                "bluetooth_long_session_resume_if_lead_sec": 0.30,
+                "bluetooth_long_session_seek_if_lag_sec": -3.20,
+                "bluetooth_long_session_seek_cooldown_sec": 3.20,
+                "bluetooth_long_session_progress_stale_sec": 1.75,
+                "bluetooth_long_session_hold_trend_sec": 1.15,
+                "bluetooth_long_session_tracking_quality_hold_min": 0.58,
+                "bluetooth_long_session_tracking_quality_seek_min": 0.88,
+                "bluetooth_long_session_resume_from_hold_speaking_lead_slack_sec": 0.82,
+                "bluetooth_long_session_gain_following": 0.50,
+                "bluetooth_long_session_gain_transition": 0.66,
+                "bluetooth_long_session_gain_soft_duck": 0.32,
             },
             "runtime": {
                 "audio_queue_maxsize": 150,
@@ -10517,9 +12670,15 @@ def main() -> None:
             "device_context": {
                 "input_device_name": input_device_name,
                 "output_device_name": output_device_name,
-                "input_sample_rate": effective_input_samplerate,
+                "input_device_id": input_device_id,
+                "output_device_id": output_device_id,
+                "hostapi_name": hostapi_name,
+                "input_sample_rate": int(effective_input_samplerate),
+                "output_sample_rate": int(playback_sample_rate),
                 "noise_floor_rms": 0.0025,
+                "bluetooth_mode": bluetooth_mode,
                 "bluetooth_long_session_mode": bool(args.force_bluetooth_long_session_mode),
+                "preflight_ran": bool(preflight_meta.get("ran", False)),
             },
             "debug": {
                 "enabled": False,
@@ -10527,56 +12686,6 @@ def main() -> None:
         }
     )
     runtime.run(lesson_id)
-if __name__ == "__main__":
-    main()
-```
-
----
-### 文件: `shadowing_app/tools/test_open_input_devices.py`
-
-```python
-from __future__ import annotations
-import _bootstrap
-import sounddevice as sd
-def main() -> None:
-    devices = sd.query_devices()
-    input_devices = [
-        (idx, dev)
-        for idx, dev in enumerate(devices)
-        if int(dev["max_input_channels"]) > 0
-    ]
-    if not input_devices:
-        return
-    for ordinal, (raw_idx, dev) in enumerate(input_devices):
-        name = str(dev["name"])
-        max_in = int(dev["max_input_channels"])
-        default_sr = int(float(dev["default_samplerate"]))
-        candidate_sample_rates: list[int] = []
-        for sr in [48000, 44100, default_sr, 16000]:
-            if sr > 0 and sr not in candidate_sample_rates:
-                candidate_sample_rates.append(sr)
-        candidate_channels: list[int] = []
-        for ch in [1, 2, max_in]:
-            if ch > 0 and ch <= max_in and ch not in candidate_channels:
-                candidate_channels.append(ch)
-        opened = False
-        for sr in candidate_sample_rates:
-            for ch in candidate_channels:
-                try:
-                    stream = sd.InputStream(
-                        samplerate=sr,
-                        device=raw_idx,
-                        channels=ch,
-                        dtype="float32",
-                        latency="low",
-                        blocksize=0,
-                    )
-                    stream.start()
-                    stream.stop()
-                    stream.close()
-                    opened = True
-                except Exception as e:
-        if not opened:
 if __name__ == "__main__":
     main()
 ```

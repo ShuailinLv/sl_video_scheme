@@ -33,11 +33,13 @@ class _RobustBuffer:
     def robust_center(self) -> float | None:
         if not self.values:
             return None
+
         vals = sorted(float(v) for v in self.values)
         if len(vals) >= 5:
             lo = max(0, int(len(vals) * 0.15))
             hi = min(len(vals), max(lo + 1, int(len(vals) * 0.85)))
             vals = vals[lo:hi]
+
         if not vals:
             return None
         return float(median(vals))
@@ -69,7 +71,6 @@ class LatencyCalibrator:
         self._bluetooth_long_session_mode = False
         self._startup_fast_calibration_until_sec = 0.0
 
-        # 第二层：会话内稳态 lead 统计
         self._stable_lead_buffer = _RobustBuffer()
         self._stable_output_error_buffer = _RobustBuffer()
         self._stable_input_error_buffer = _RobustBuffer()
@@ -106,11 +107,11 @@ class LatencyCalibrator:
             calibrated=False,
             baseline_target_lead_sec=float(base_target_lead_sec),
         )
+
         self._last_active_at_sec = 0.0
         self._last_update_at_sec = 0.0
         self._obs_error_ema_ms = 0.0
         self._obs_consistency_run = 0
-
         self._stable_lead_buffer.clear()
         self._stable_output_error_buffer.clear()
         self._stable_input_error_buffer.clear()
@@ -156,6 +157,7 @@ class LatencyCalibrator:
             return
 
         now_sec = max(float(playback_ref_time_sec), float(user_ref_time_sec))
+
         if not allow_observation:
             self._reset_observation_run(decay_only=True)
             return
@@ -196,7 +198,6 @@ class LatencyCalibrator:
             self._reset_observation_run(decay_only=True)
             return
 
-        # 稳态双层统计：只收集高质量片段
         if stable and tracking_quality >= max(self.min_tracking_quality, 0.82 if not self._bluetooth_mode else 0.76):
             self._stable_lead_buffer.add(float(lead_sec), maxlen=48)
             self._stable_output_error_buffer.add(float(error_ms) * 0.80, maxlen=48)
@@ -247,7 +248,6 @@ class LatencyCalibrator:
 
         bounded = float(max(-260.0, min(260.0, error_ms)))
         magnitude = abs(bounded)
-        sign = 1.0 if bounded > 0.0 else -1.0
         fast_startup = self._bluetooth_mode and now_sec <= self._startup_fast_calibration_until_sec
 
         if self._bluetooth_mode:
@@ -261,8 +261,18 @@ class LatencyCalibrator:
             output_step = max(1.0, min(5.0, magnitude * 0.040))
             input_step = max(0.5, min(2.2, magnitude * 0.016))
 
-        self._state.runtime_output_drift_ms += sign * output_step
-        self._state.runtime_input_drift_ms += sign * input_step
+        # error_ms > 0:
+        #   lead is too large -> should reduce heard playback lead
+        #   => reduce output latency OR increase input latency
+        # error_ms < 0:
+        #   lead is too small -> should increase heard playback lead
+        #   => increase output latency OR reduce input latency
+        if bounded > 0.0:
+            self._state.runtime_output_drift_ms -= output_step
+            self._state.runtime_input_drift_ms += input_step
+        else:
+            self._state.runtime_output_drift_ms += output_step
+            self._state.runtime_input_drift_ms -= input_step
 
         self._state.runtime_output_drift_ms = max(
             -self._max_runtime_output_drift_ms,

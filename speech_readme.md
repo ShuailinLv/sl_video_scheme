@@ -25,3 +25,164 @@ python shadowing_app/tools/run_shadowing.py \
   --text-file your_text.txt \
   --event-logging \
   --force-bluetooth-long-session-mode
+
+
+
+
+
+一、最终推荐执行顺序
+标准顺序
+第 1 步：准备 lesson 文本
+
+输入：
+
+lesson_id
+
+lesson_text
+
+产出目标：
+
+这一课的原始文本输入
+
+第 2 步：分句/分 segment 生成 TTS
+
+入口：
+
+ElevenLabsTTSProvider.synthesize_lesson(...)
+
+它现在会做：
+
+segmenter.py 切段
+
+每段带前后文 continuity 调 ElevenLabs
+
+生成逐段 chunks/*
+
+生成逐段 alignments/*.alignment.json
+
+生成 segments_manifest.json
+
+生成初始 SegmentTimelineRecord
+
+这一步的核心目的不是直接给 runtime 播放，而是先把每个局部段落做稳定。
+
+产物：
+
+lesson_manifest.json
+
+reference_map.json（已经比原来好，但还不是最终形态）
+
+chunks/*.wav
+
+alignments/*.alignment.json
+
+segments_manifest.json
+
+第 3 步：assembler 重建连续参考音和真实时间轴
+
+入口：
+
+audio_assembler.py
+
+已经在你现在的 ElevenLabsTTSProvider 第三版里接进去了
+
+它会做：
+
+逐段音频轻量 trim
+
+短 crossfade
+
+生成 assembled_reference.wav
+
+计算每段真实：
+
+trim_head_sec
+
+trim_tail_sec
+
+assembled_start_sec
+
+assembled_end_sec
+
+然后回写到 segments_manifest.json 对应记录中，并且最终用：
+
+ReferenceBuilder.build_from_segment_records(...)
+
+重建新的 reference_map
+
+这一步其实是离线参考链路里最关键的一步。
+因为从这一步开始，你的“参考音频”和“参考时间轴”才真正对齐到连续轨。
+
+产物重点变成：
+
+assembled_reference.wav
+
+更新后的 segments_manifest.json
+
+基于真实时间轴重建后的 reference_map.json
+
+第 4 步：对 assembled 参考音提 acoustic features
+
+入口：
+
+ReferenceAudioFeaturePipeline.run(lesson_id)
+
+现在这条 pipeline 已经改成优先：
+
+assembled_reference.wav
+
+segments_manifest.json
+
+如果存在，就不再优先分析老的逐 chunk 轨道，而是分析连续参考音。
+
+这一步会生成：
+
+reference_audio_features.json
+
+这份特征会被 runtime 的：
+
+LiveAudioMatcher
+
+ReferenceAudioStore.load(...)
+
+直接吃掉。
+
+第 5 步：进入 runtime 跟读
+
+入口：
+
+tools/run_shadowing.py
+
+build_runtime(...)
+
+ShadowingOrchestrator.start_session(...)
+
+runtime 阶段优先依赖这些资产：
+
+lesson_manifest.json
+
+reference_map.json
+
+reference_audio_features.json
+
+其中最关键的是：
+
+reference_map.json 必须是 assembler 后真实时间轴版
+
+reference_audio_features.json 必须优先来自 assembled_reference.wav
+
+这样 matcher、fusion、progress estimator 才会站在正确地基上。
+
+
+
+
+python tools/preprocess_lesson.py \
+  --text-file /path/to/lesson.txt \
+  --lesson-base-dir assets/lessons \
+  --elevenlabs-api-key "$ELEVENLABS_API_KEY" \
+  --voice-id "$ELEVENLABS_VOICE_ID" \
+  --model-id "$ELEVENLABS_MODEL_ID" \
+  --print-summary
+
+
+

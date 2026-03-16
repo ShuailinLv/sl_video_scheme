@@ -1,8 +1,6 @@
 from __future__ import annotations
-
 import time
 from dataclasses import dataclass
-
 from shadowing.realtime.control.policy import ControlPolicy
 from shadowing.realtime.sync_evidence import SyncEvidence, SyncState, TrackingState
 from shadowing.types import ControlAction, ControlDecision, FusionEvidence, PlaybackState
@@ -14,7 +12,6 @@ class _PressureState:
     resume_pressure: float = 0.0
     seek_pressure: float = 0.0
     soft_duck_pressure: float = 0.0
-
     lead_error_ema: float = 0.0
     lead_error_derivative_ema: float = 0.0
     tracking_quality_ema: float = 0.0
@@ -73,17 +70,22 @@ class StateMachineController:
         fusion_fused_conf = 0.0 if fusion_evidence is None else float(fusion_evidence.fused_confidence)
 
         if progress is None:
-            if fusion_evidence is None or max(fusion_fused_conf, fusion_still_following) < 0.60:
+            if fusion_evidence is None or max(fusion_fused_conf, fusion_still_following, fusion_reentry) < 0.58:
                 return ControlDecision(
                     action=ControlAction.NOOP,
                     reason="no_progress",
-                    target_gain=self._gain_for_state(playback.state, following=False, bluetooth_long_session_mode=False),
+                    target_gain=self._gain_for_state(
+                        playback.state,
+                        following=False,
+                        bluetooth_long_session_mode=False,
+                    ),
                     confidence=0.0,
                 )
+
             effective_idx = int(getattr(fusion_evidence, "estimated_ref_idx_hint", 0))
-            tracking_quality = max(0.0, min(1.0, fusion_fused_conf * 0.86))
+            tracking_quality = max(0.0, min(1.0, fusion_fused_conf * 0.84))
             confidence = fusion_fused_conf
-            active_speaking = bool(fusion_still_following >= 0.62 or fusion_reentry >= 0.58)
+            active_speaking = bool(fusion_still_following >= 0.60 or fusion_reentry >= 0.56)
             recently_progressed = False
             progress_age_sec = 9999.0
             estimated_ref_time_sec = float(fusion_evidence.estimated_ref_time_sec)
@@ -100,7 +102,7 @@ class StateMachineController:
             stable = bool(getattr(progress, "stable", False))
             position_source = str(getattr(progress, "position_source", "text"))
 
-        if active_speaking or recently_progressed or fusion_still_following >= 0.66 or fusion_reentry >= 0.58:
+        if active_speaking or recently_progressed or fusion_still_following >= 0.62 or fusion_reentry >= 0.56:
             self._last_voice_like_at = now
 
         if effective_idx > self._last_effective_idx:
@@ -167,20 +169,23 @@ class StateMachineController:
             else self.policy.resume_from_hold_speaking_lead_slack_sec
         )
 
-        in_startup_grace = (now - self._started_at) < (self.policy.startup_grace_sec + (1.0 if bluetooth_long_session_mode else 0.0))
-        in_resume_cooldown = (now - self._last_resume_at) < (0.55 if bluetooth_long_session_mode else 0.35)
+        in_startup_grace = (now - self._started_at) < (
+            self.policy.startup_grace_sec + (1.2 if bluetooth_long_session_mode else 0.6)
+        )
+        in_resume_cooldown = (now - self._last_resume_at) < (0.70 if bluetooth_long_session_mode else 0.45)
         in_seek_cooldown = (now - self._last_seek_at) < seek_cooldown_sec
-        in_soft_duck_cooldown = (now - self._last_soft_duck_at) < (0.35 if bluetooth_long_session_mode else 0.25)
-        speaking_recent = (now - self._last_voice_like_at) <= (self.policy.speaking_recent_sec + (0.25 if bluetooth_long_session_mode else 0.0))
+        in_soft_duck_cooldown = (now - self._last_soft_duck_at) < (0.45 if bluetooth_long_session_mode else 0.30)
+        speaking_recent = (now - self._last_voice_like_at) <= (
+            self.policy.speaking_recent_sec + (0.35 if bluetooth_long_session_mode else 0.15)
+        )
         progress_stale = progress_age_sec >= progress_stale_threshold
 
         playback_ref = float(playback.t_ref_heard_content_sec)
-        if fusion_evidence is not None and fusion_evidence.fused_confidence >= 0.58 and tracking_quality < 0.55:
+        if fusion_evidence is not None and fusion_evidence.fused_confidence >= 0.60 and tracking_quality < 0.56:
             user_ref = float(fusion_evidence.estimated_ref_time_sec)
         else:
             user_ref = float(estimated_ref_time_sec)
 
-        # 目标 lead 收敛控制：误差 = 当前 lead - 目标 lead
         lead_sec = playback_ref - user_ref
         lead_error_sec = float(lead_sec - target_lead_sec)
 
@@ -195,30 +200,34 @@ class StateMachineController:
             speech_confidence=speech_conf,
         )
 
+        engaged_recent = bool(
+            speaking_recent
+            or fusion_still_following >= 0.62
+            or fusion_reentry >= 0.56
+            or recently_progressed
+            or (active_speaking and tracking_quality >= tracking_quality_hold_min - 0.08)
+        )
+
         strong_resume_ok = bool(
             (
                 recently_progressed
                 or active_speaking
-                or fusion_reentry >= 0.65
-                or fusion_still_following >= 0.76
+                or fusion_reentry >= 0.62
+                or fusion_still_following >= 0.74
             )
-            and tracking_quality >= tracking_quality_hold_min
-            and confidence >= self.policy.min_confidence - (0.10 if fusion_still_following >= 0.72 else 0.0)
-            and lead_error_sec >= -resume_from_hold_speaking_lead_slack_sec
-        )
-        weak_resume_ok = bool(
-            (
-                active_speaking
-                or fusion_reentry >= 0.60
-                or fusion_still_following >= 0.72
-            )
-            and tracking_quality >= tracking_quality_hold_min - 0.06
-            and confidence >= max(0.54, self.policy.min_confidence - 0.18)
-            and speaking_recent
+            and tracking_quality >= tracking_quality_hold_min - 0.04
+            and confidence >= self.policy.min_confidence - 0.14
             and lead_error_sec >= -resume_from_hold_speaking_lead_slack_sec
         )
 
-        following = (
+        weak_resume_ok = bool(
+            engaged_recent
+            and tracking_quality >= tracking_quality_hold_min - 0.10
+            and confidence >= max(0.48, self.policy.min_confidence - 0.22)
+            and lead_error_sec >= -resume_from_hold_speaking_lead_slack_sec
+        )
+
+        following = bool(
             strong_resume_ok
             or weak_resume_ok
             or tracking_state in (TrackingState.RELIABLE, TrackingState.LOCKED)
@@ -235,6 +244,7 @@ class StateMachineController:
             confidence=confidence,
             stable=stable,
             speaking_recent=speaking_recent,
+            engaged_recent=engaged_recent,
             in_startup_grace=in_startup_grace,
             strong_resume_ok=strong_resume_ok,
             weak_resume_ok=weak_resume_ok,
@@ -256,42 +266,65 @@ class StateMachineController:
 
         if fusion_evidence is not None:
             if fusion_evidence.should_prevent_hold:
-                self._pressure.hold_pressure *= 0.18
-                self._pressure.soft_duck_pressure *= 0.72
+                self._pressure.hold_pressure *= 0.12
             if fusion_evidence.should_prevent_seek:
-                self._pressure.seek_pressure *= 0.12
+                self._pressure.seek_pressure *= 0.08
+
             if playback.state == PlaybackState.HOLDING and (
                 fusion_still_following >= 0.74 or fusion_reentry >= 0.60
             ):
                 self._pressure.resume_pressure = max(
                     self._pressure.resume_pressure,
-                    1.06 if bluetooth_long_session_mode else 1.04,
+                    1.04 if bluetooth_long_session_mode else 1.02,
                 )
 
-        # HOLDING -> RESUME
         if playback.state == PlaybackState.HOLDING and self._pressure.resume_pressure >= 1.0:
             self._last_resume_at = now
             self._pressure.hold_pressure *= 0.25
             self._pressure.resume_pressure = 0.0
             return ControlDecision(
                 action=ControlAction.RESUME,
-                reason="resume_to_target_lead",
+                reason="resume_on_engaged_user",
                 lead_sec=lead_sec,
                 target_gain=self._gain_for_state(
                     PlaybackState.PLAYING,
                     following=True,
                     bluetooth_long_session_mode=bluetooth_long_session_mode,
                 ),
-                confidence=max(confidence, fusion_still_following * 0.88, fusion_fused_conf * 0.82),
-                aggressiveness="low" if bluetooth_long_session_mode else "medium",
+                confidence=max(confidence, fusion_still_following * 0.88, fusion_fused_conf * 0.84),
+                aggressiveness="low",
             )
 
-        # PLAYING -> HOLD
-        if playback.state == PlaybackState.PLAYING and self._pressure.hold_pressure >= 1.0:
+        if (
+            playback.state == PlaybackState.PLAYING
+            and self._pressure.soft_duck_pressure >= (0.58 if bluetooth_long_session_mode else 0.62)
+            and not in_soft_duck_cooldown
+        ):
+            self._last_soft_duck_at = now
+            return ControlDecision(
+                action=ControlAction.SOFT_DUCK,
+                reason="soft_duck_wait_for_user",
+                lead_sec=lead_sec,
+                target_gain=self._gain_for_state(
+                    PlaybackState.HOLDING,
+                    following=False,
+                    bluetooth_long_session_mode=bluetooth_long_session_mode,
+                ),
+                confidence=max(confidence, fusion_still_following * 0.66, fusion_fused_conf * 0.60),
+                aggressiveness="low",
+            )
+
+        if (
+            playback.state == PlaybackState.PLAYING
+            and self._pressure.hold_pressure >= 1.0
+            and not engaged_recent
+            and fusion_repeated < 0.60
+            and fusion_reentry < 0.54
+        ):
             self._last_hold_at = now
             return ControlDecision(
                 action=ControlAction.HOLD,
-                reason="hold_for_lead_convergence",
+                reason="hold_when_user_disengaged",
                 lead_sec=lead_sec,
                 target_gain=self._gain_for_state(
                     PlaybackState.HOLDING,
@@ -299,16 +332,18 @@ class StateMachineController:
                     bluetooth_long_session_mode=bluetooth_long_session_mode,
                 ),
                 confidence=confidence,
-                aggressiveness="low" if bluetooth_long_session_mode else "medium",
+                aggressiveness="low",
             )
 
-        # PLAYING/HOLDING -> SEEK
         if (
             playback.state in (PlaybackState.PLAYING, PlaybackState.HOLDING)
             and self._pressure.seek_pressure >= 1.0
             and not self.disable_seek
             and allow_seek
-            and fusion_repeated < 0.55
+            and not bluetooth_mode
+            and fusion_repeated < 0.42
+            and fusion_reentry < 0.42
+            and not engaged_recent
             and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
         ):
             self._last_seek_at = now
@@ -317,7 +352,7 @@ class StateMachineController:
             target_time_sec = max(0.0, user_ref - target_lead_sec)
             return ControlDecision(
                 action=ControlAction.SEEK,
-                reason="seek_to_target_lead",
+                reason="seek_only_when_clearly_derailed",
                 target_time_sec=target_time_sec,
                 lead_sec=lead_sec,
                 target_gain=self._gain_for_state(
@@ -325,40 +360,20 @@ class StateMachineController:
                     following=False,
                     bluetooth_long_session_mode=bluetooth_long_session_mode,
                 ),
-                confidence=max(confidence, 0.35 + 0.45 * fusion_still_following),
-                aggressiveness="low" if (bluetooth_mode or bluetooth_long_session_mode) else "medium",
-            )
-
-        # PLAYING -> SOFT_DUCK
-        if (
-            playback.state == PlaybackState.PLAYING
-            and self._pressure.soft_duck_pressure >= (0.58 if bluetooth_long_session_mode else 0.65)
-            and not in_soft_duck_cooldown
-        ):
-            self._last_soft_duck_at = now
-            return ControlDecision(
-                action=ControlAction.SOFT_DUCK,
-                reason="soft_duck_for_lead_convergence",
-                lead_sec=lead_sec,
-                target_gain=self._gain_for_state(
-                    PlaybackState.HOLDING,
-                    following=False,
-                    bluetooth_long_session_mode=bluetooth_long_session_mode,
-                ),
-                confidence=max(confidence, fusion_still_following * 0.62),
+                confidence=max(confidence, 0.30 + 0.40 * fusion_still_following),
                 aggressiveness="low",
             )
 
         return ControlDecision(
             action=ControlAction.NOOP,
-            reason="track_target_lead",
+            reason="follow_user_smoothly",
             lead_sec=lead_sec,
             target_gain=self._gain_for_state(
                 playback.state,
                 following=following,
                 bluetooth_long_session_mode=bluetooth_long_session_mode,
             ),
-            confidence=max(confidence, fusion_still_following * 0.58, fusion_fused_conf * 0.52),
+            confidence=max(confidence, fusion_still_following * 0.56, fusion_fused_conf * 0.52),
             aggressiveness="low",
         )
 
@@ -403,6 +418,7 @@ class StateMachineController:
         confidence: float,
         stable: bool,
         speaking_recent: bool,
+        engaged_recent: bool,
         in_startup_grace: bool,
         strong_resume_ok: bool,
         weak_resume_ok: bool,
@@ -421,7 +437,7 @@ class StateMachineController:
         fusion_evidence: FusionEvidence | None,
         position_source: str,
     ) -> None:
-        decay = (0.86 if bluetooth_long_session_mode else 0.82) ** max(1.0, dt * 15.0)
+        decay = (0.88 if bluetooth_long_session_mode else 0.84) ** max(1.0, dt * 15.0)
         self._pressure.hold_pressure *= decay
         self._pressure.resume_pressure *= decay
         self._pressure.seek_pressure *= decay
@@ -434,56 +450,57 @@ class StateMachineController:
         lead_err = float(self._pressure.lead_error_ema)
         lead_err_d = float(self._pressure.lead_error_derivative_ema)
 
-        large_positive_error = lead_err >= max(0.18, hold_if_lead_sec - (0.35 if bluetooth_long_session_mode else 0.28))
+        large_positive_error = lead_sec >= hold_if_lead_sec
         large_negative_error = lead_sec <= seek_if_lag_sec
         near_target = abs(lead_err) <= resume_if_lead_sec
 
         if playback_state == PlaybackState.PLAYING:
-            # lead 明显偏大：优先 soft_duck，再到 hold
             if large_positive_error:
-                self._pressure.soft_duck_pressure += 0.18 if bluetooth_long_session_mode else 0.24
-                if lead_err >= (0.34 if bluetooth_long_session_mode else 0.28):
-                    self._pressure.hold_pressure += 0.20 if bluetooth_long_session_mode else 0.28
+                self._pressure.soft_duck_pressure += 0.26 if bluetooth_long_session_mode else 0.30
 
-            # 如果误差还在变大，增加 hold 压力
-            if lead_err > 0.10 and lead_err_d > 0.04:
-                self._pressure.hold_pressure += 0.08
+                if (
+                    lead_sec >= (hold_if_lead_sec + (0.28 if bluetooth_long_session_mode else 0.20))
+                    and not engaged_recent
+                    and not in_startup_grace
+                ):
+                    self._pressure.hold_pressure += 0.18 if bluetooth_long_session_mode else 0.24
 
-            # 没进展且非说话态
-            hold_scale = 0.40 if (fusion_still_following >= 0.65 or fusion_reentry >= 0.58) else 1.0
-            if not in_startup_grace and progress_stale and not speaking_recent:
-                self._pressure.hold_pressure += (0.24 if bluetooth_long_session_mode else 0.34) * hold_scale
-            if (
-                not in_startup_grace
-                and progress_stale
-                and tracking_quality < tracking_quality_hold_min
-            ):
-                self._pressure.hold_pressure += (0.18 if bluetooth_long_session_mode else 0.28) * hold_scale
+            if lead_err > 0.12 and lead_err_d > 0.05 and not engaged_recent:
+                self._pressure.soft_duck_pressure += 0.10
+
+            if progress_stale and not engaged_recent and not in_startup_grace:
+                self._pressure.soft_duck_pressure += 0.16 if bluetooth_long_session_mode else 0.20
+                if tracking_quality < tracking_quality_hold_min - 0.04:
+                    self._pressure.hold_pressure += 0.14 if bluetooth_long_session_mode else 0.18
 
             if tracking_state == TrackingState.WEAK or sync_state == SyncState.DEGRADED:
-                self._pressure.soft_duck_pressure += 0.20 if not bluetooth_long_session_mode else 0.26
-            if confidence < max(0.55, self.policy.min_confidence - 0.15):
+                if engaged_recent:
+                    self._pressure.soft_duck_pressure += 0.10
+                else:
+                    self._pressure.soft_duck_pressure += 0.16 if bluetooth_long_session_mode else 0.20
+
+            if confidence < max(0.50, self.policy.min_confidence - 0.18) and not engaged_recent:
                 self._pressure.soft_duck_pressure += 0.08
-            if stable and tracking_quality >= 0.76 and near_target:
-                self._pressure.hold_pressure *= 0.92
-                self._pressure.soft_duck_pressure *= 0.90
+
+            if stable and tracking_quality >= 0.78 and near_target:
+                self._pressure.hold_pressure *= 0.90
+                self._pressure.soft_duck_pressure *= 0.88
 
         if playback_state == PlaybackState.HOLDING and not in_resume_cooldown:
             if strong_resume_ok and near_target:
-                self._pressure.resume_pressure += 0.40 if bluetooth_long_session_mode else 0.48
+                self._pressure.resume_pressure += 0.44 if bluetooth_long_session_mode else 0.50
             elif strong_resume_ok:
-                self._pressure.resume_pressure += 0.28
-            elif weak_resume_ok and lead_err >= -0.12:
-                self._pressure.resume_pressure += 0.22 if bluetooth_long_session_mode else 0.28
+                self._pressure.resume_pressure += 0.30
+            elif weak_resume_ok and lead_err >= -0.16:
+                self._pressure.resume_pressure += 0.24 if bluetooth_long_session_mode else 0.30
 
-            if fusion_reentry >= 0.62:
-                self._pressure.resume_pressure += 0.26
+            if fusion_reentry >= 0.60:
+                self._pressure.resume_pressure += 0.24
             elif fusion_still_following >= 0.74:
                 self._pressure.resume_pressure += 0.18
 
-            # HOLD 状态下如果误差持续回到目标附近，更积极 resume
             if near_target and speaking_recent:
-                self._pressure.resume_pressure += 0.14
+                self._pressure.resume_pressure += 0.12
 
         seek_trigger = bool(
             allow_seek
@@ -491,15 +508,18 @@ class StateMachineController:
             and playback_state == PlaybackState.PLAYING
             and large_negative_error
             and tracking_quality >= tracking_quality_seek_min
-            and confidence >= max(0.70, self.policy.min_confidence)
+            and confidence >= max(0.74, self.policy.min_confidence)
             and tracking_state == TrackingState.LOCKED
             and sync_state == SyncState.STABLE
-            and fusion_repeated < 0.60
-            and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
+            and fusion_repeated < 0.40
+            and fusion_reentry < 0.40
             and position_source != "audio"
+            and not engaged_recent
+            and not bluetooth_mode
+            and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
         )
         if seek_trigger:
-            self._pressure.seek_pressure += 0.18 if (bluetooth_mode or bluetooth_long_session_mode) else 0.34
+            self._pressure.seek_pressure += 0.18
 
         self._pressure.hold_pressure = max(0.0, min(1.4, self._pressure.hold_pressure))
         self._pressure.resume_pressure = max(0.0, min(1.4, self._pressure.resume_pressure))
@@ -513,6 +533,7 @@ class StateMachineController:
             if following:
                 return self.policy.bluetooth_long_session_gain_following
             return self.policy.bluetooth_long_session_gain_transition
+
         if state == PlaybackState.HOLDING:
             return self.policy.gain_soft_duck
         if following:
