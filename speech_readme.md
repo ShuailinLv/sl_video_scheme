@@ -176,13 +176,55 @@ reference_audio_features.json 必须优先来自 assembled_reference.wav
 
 
 
-python tools/preprocess_lesson.py \
-  --text-file /path/to/lesson.txt \
+
+
+
+cd shadowing_app
+
+PYTHONPATH=src python tools/preprocess_lesson.py \
+  --text-file assets/text/lesson.txt \
   --lesson-base-dir assets/lessons \
   --elevenlabs-api-key "$ELEVENLABS_API_KEY" \
   --voice-id "$ELEVENLABS_VOICE_ID" \
   --model-id "$ELEVENLABS_MODEL_ID" \
+  --output-format pcm_44100 \
+  --timeout-sec 120 \
+  --seed 2025 \
+  --target-chars-per-segment 28 \
+  --hard-max-chars-per-segment 54 \
+  --min-chars-per-segment 6 \
+  --context-window-segments 2 \
+  --continuity-context-chars-prev 100 \
+  --continuity-context-chars-next 100 \
+  --max-retries-per-segment 2 \
+  --assembled-reference-filename assembled_reference.wav \
+  --silence-rms-threshold 0.0035 \
+  --min-silence-keep-sec 0.035 \
+  --max-trim-head-sec 0.180 \
+  --max-trim-tail-sec 0.220 \
+  --crossfade-sec 0.025 \
+  --reference-frame-size-sec 0.025 \
+  --reference-hop-sec 0.010 \
+  --reference-n-bands 6 \
   --print-summary
 
 
 
+PYTHONPATH=src python tools/run_shadowing.py \
+  --text-file assets/text/your_lesson.txt \
+  --lesson-base-dir assets/lessons \
+  --asr sherpa \
+  --capture-backend sounddevice \
+  --input-device "AirPods" \
+  --output-device "AirPods" \
+  --input-samplerate 48000 \
+  --bluetooth-offset-sec 0.30 \
+  --playback-latency low \
+  --playback-blocksize 512 \
+  --preflight-duration-sec 6.0 \
+  --tick-sleep-sec 0.03 \
+  --profile-path runtime/device_profiles.json \
+  --session-dir runtime/latest_session \
+  --event-logging \
+  --force-bluetooth-long-session-mode \
+  --hotwords-source local
