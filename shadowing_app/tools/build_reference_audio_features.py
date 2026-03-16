@@ -10,7 +10,9 @@ from shadowing.infrastructure.lesson_repo import FileLessonRepository
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build reference audio features for a lesson")
+    parser = argparse.ArgumentParser(
+        description="Build reference audio features for a lesson"
+    )
     parser.add_argument("--lesson-id", type=str, required=True)
     parser.add_argument("--lesson-base-dir", type=str, default="assets/lessons")
     parser.add_argument("--frame-size-sec", type=float, default=0.025)
@@ -26,6 +28,7 @@ def main() -> None:
         hop_sec=float(args.hop_sec),
         n_bands=int(args.n_bands),
     )
+
     ref_map = repo.load_reference_map(args.lesson_id)
     chunks = repo.load_audio_chunks(args.lesson_id)
     features = analyzer.analyze(

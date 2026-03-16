@@ -19,25 +19,6 @@ def _safe_ratio(a: int, b: int) -> float:
     return max(0.0, min(1.0, float(a) / float(b)))
 
 
-def _lcp_len(a: str, b: str) -> int:
-    n = min(len(a), len(b))
-    i = 0
-    while i < n and a[i] == b[i]:
-        i += 1
-    return i
-
-
-def _char_overlap_ratio(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    matched = 0
-    n = min(len(a), len(b))
-    for i in range(n):
-        if a[i] == b[i]:
-            matched += 1
-    return matched / max(1, len(a))
-
-
 @dataclass(slots=True)
 class AlignmentResult:
     committed: int
@@ -64,49 +45,42 @@ class AlignmentResult:
 
 
 class IncrementalAligner:
+    """
+    改进点：
+    1. 不再主要依赖 LCP 前缀命中，而是用“局部子串编辑相似度 + 前后缀锚点 + ngram 重叠”综合评分。
+    2. 对 partial 回改、插字漏字、长 partial 漂移更稳。
+    3. 通过 recovery 模式自动放宽搜索窗，参数明显减少。
+    """
+
     def __init__(
         self,
         reference_text: str | Sequence[str] | None = None,
         *,
-        window_back: int = 8,
-        window_ahead: int = 40,
-        stable_frames: int = 2,
-        min_confidence: float = 0.60,
-        backward_lock_frames: int = 3,
-        clause_boundary_bonus: float = 0.15,
-        cross_clause_backward_extra_penalty: float = 0.20,
+        window_back: int = 10,
+        window_ahead: int = 48,
+        stable_hits: int = 2,
+        min_confidence: float = 0.62,
         debug: bool = False,
-        max_hyp_tokens: int = 16,
-        weak_commit_min_conf: float = 0.82,
-        weak_commit_min_local_match: float = 0.80,
-        weak_commit_min_advance: int = 3,
     ) -> None:
-        self.debug = bool(debug)
         self.window_back = int(window_back)
         self.window_ahead = int(window_ahead)
-        self.stable_frames = max(1, int(stable_frames))
+        self.stable_hits = max(1, int(stable_hits))
         self.min_confidence = float(min_confidence)
-        self.backward_lock_frames = int(backward_lock_frames)
-        self.clause_boundary_bonus = float(clause_boundary_bonus)
-        self.cross_clause_backward_extra_penalty = float(cross_clause_backward_extra_penalty)
-        self.max_hyp_tokens = int(max_hyp_tokens)
-        self.weak_commit_min_conf = float(weak_commit_min_conf)
-        self.weak_commit_min_local_match = float(weak_commit_min_local_match)
-        self.weak_commit_min_advance = int(weak_commit_min_advance)
+        self.debug = bool(debug)
 
         self.reference_text = ""
         self.reference_norm = ""
 
         self._committed = 0
         self._last_candidate = 0
-        self._same_candidate_repeat = 0
+        self._same_candidate_hits = 0
+        self._same_zone_hits = 0
         self._last_zone_anchor = 0
-        self._same_forward_zone_repeat = 0
 
         self._forced_center: int | None = None
+        self._forced_budget = 0
         self._forced_window_back: int | None = None
         self._forced_window_ahead: int | None = None
-        self._forced_budget = 0
 
         if reference_text is not None:
             self.set_reference(reference_text)
@@ -126,18 +100,18 @@ class IncrementalAligner:
         self.reset(committed=0)
 
     def reset(self, committed: int | None = None) -> None:
-        if committed is not None:
-            self._committed = max(0, min(len(self.reference_norm), int(committed)))
-        else:
+        if committed is None:
             self._committed = 0
+        else:
+            self._committed = max(0, min(int(committed), len(self.reference_norm)))
         self._last_candidate = self._committed
-        self._same_candidate_repeat = 0
-        self._last_zone_anchor = self._committed
-        self._same_forward_zone_repeat = 0
+        self._same_candidate_hits = 0
+        self._same_zone_hits = 0
+        self._last_zone_anchor = (self._committed // 4) * 4
         self._forced_center = None
+        self._forced_budget = 0
         self._forced_window_back = None
         self._forced_window_ahead = None
-        self._forced_budget = 0
 
     def force_recenter(
         self,
@@ -151,8 +125,8 @@ class IncrementalAligner:
             return
         hint = max(0, min(int(committed_hint), len(self.reference_norm)))
         self._forced_center = hint
-        self._forced_window_back = int(window_back) if window_back is not None else max(self.window_back + 4, 12)
-        self._forced_window_ahead = int(window_ahead) if window_ahead is not None else max(self.window_ahead // 2, 24)
+        self._forced_window_back = int(window_back) if window_back is not None else max(16, self.window_back + 6)
+        self._forced_window_ahead = int(window_ahead) if window_ahead is not None else max(32, self.window_ahead // 2)
         self._forced_budget = max(1, int(budget_events))
         self._committed = min(self._committed, hint)
 
@@ -183,7 +157,7 @@ class IncrementalAligner:
             return AlignmentResult(
                 committed=self._committed,
                 candidate=self._committed,
-                score=-1.5,
+                score=-1.0,
                 conf=0.0,
                 stable=False,
                 backward=False,
@@ -197,41 +171,40 @@ class IncrementalAligner:
 
         candidate, matched_n, score, conf, backward, mode, window, local_match = self._search_best_candidate(hyp)
 
-        repeated_candidate = False
-        if candidate == self._last_candidate:
-            self._same_candidate_repeat += 1
-            repeated_candidate = True
+        repeated_candidate = candidate == self._last_candidate
+        if repeated_candidate:
+            self._same_candidate_hits += 1
         else:
-            self._same_candidate_repeat = 0
+            self._same_candidate_hits = 1
 
-        zone_anchor = (candidate // 3) * 3
+        zone_anchor = (candidate // 4) * 4
         if zone_anchor == self._last_zone_anchor and candidate >= self._committed:
-            self._same_forward_zone_repeat += 1
+            self._same_zone_hits += 1
         else:
-            self._same_forward_zone_repeat = 0
+            self._same_zone_hits = 1
         self._last_zone_anchor = zone_anchor
 
         advance = candidate - self._committed
-        hard_commit = (
+        strong_accept = (
             not backward
             and advance >= 1
             and conf >= self.min_confidence
-            and local_match >= 0.62
-            and self._same_candidate_repeat >= (self.stable_frames - 1)
+            and local_match >= 0.60
+            and self._same_candidate_hits >= self.stable_hits
         )
         weak_forward = (
             not backward
-            and advance >= self.weak_commit_min_advance
-            and conf >= self.weak_commit_min_conf
-            and local_match >= self.weak_commit_min_local_match
-            and self._same_forward_zone_repeat >= 1
+            and advance >= 3
+            and conf >= max(0.80, self.min_confidence + 0.16)
+            and local_match >= 0.76
+            and self._same_zone_hits >= 2
         )
 
         accepted = False
         soft_committed = False
         stable = False
 
-        if hard_commit:
+        if strong_accept:
             self._committed = max(self._committed, candidate)
             accepted = True
             stable = True
@@ -239,7 +212,6 @@ class IncrementalAligner:
             self._committed = max(self._committed, candidate)
             accepted = True
             soft_committed = True
-            stable = False
 
         result = AlignmentResult(
             committed=self._committed,
@@ -260,6 +232,7 @@ class IncrementalAligner:
             repeated_candidate=repeated_candidate,
             weak_forward=weak_forward,
         )
+
         self._last_candidate = candidate
 
         if self._forced_budget > 0:
@@ -269,8 +242,6 @@ class IncrementalAligner:
                 self._forced_window_back = None
                 self._forced_window_ahead = None
 
-        if self.debug:
-            self._print_debug(result)
         return result
 
     def _search_best_candidate(
@@ -280,109 +251,181 @@ class IncrementalAligner:
         ref = self.reference_norm
         committed = self._committed
 
-        if self._forced_center is not None and self._forced_budget > 0:
-            center = max(committed, int(self._forced_center))
-            start = max(0, center - int(self._forced_window_back or self.window_back))
-            end = min(len(ref), center + int(self._forced_window_ahead or self.window_ahead))
-            forced_mode = True
-        else:
-            start = max(0, committed - self.window_back)
-            end = min(len(ref), committed + self.window_ahead)
-            center = committed
-            forced_mode = False
+        start, end, mode = self._build_search_window(hyp)
 
         best_candidate = committed
-        best_matched = 0
+        best_matched_n = 0
         best_score = -1e9
         best_conf = 0.0
         best_local_match = 0.0
-        best_mode = "normal"
 
         for cand in range(start, end + 1):
-            max_take = min(len(hyp), len(ref) - cand)
-            if max_take <= 0:
+            seg = ref[cand : min(len(ref), cand + max(len(hyp) + 10, 18))]
+            if not seg:
                 continue
 
-            ref_seg = ref[cand : cand + max_take]
-            matched = _lcp_len(hyp, ref_seg)
-            local_match = _char_overlap_ratio(
-                hyp[: min(12, len(hyp))],
-                ref_seg[: min(12, len(ref_seg))],
-            )
+            sim, matched_n = self._substring_similarity(hyp, seg)
+            prefix = self._prefix_match_ratio(hyp, seg)
+            suffix = self._suffix_match_ratio(hyp, seg)
+            bigram = self._bigram_overlap(hyp, seg)
+            local_match = 0.45 * sim + 0.25 * prefix + 0.20 * suffix + 0.10 * bigram
 
             advance = cand - committed
             backward = advance < 0
 
             score = (
-                matched * 3.2
-                + local_match * 7.0
-                - abs(advance) * 0.30
-                - (2.5 if backward else 0.0)
+                10.0 * sim
+                + 4.2 * prefix
+                + 3.4 * suffix
+                + 2.8 * bigram
+                + 0.12 * matched_n
+                - 0.14 * abs(advance)
+                - (1.8 if backward else 0.0)
             )
+
+            if not backward and matched_n >= min(4, len(hyp)):
+                score += 0.8
+            if not backward and suffix >= 0.68:
+                score += 0.5
+            if backward and sim < 0.62:
+                score -= 1.2
 
             conf = max(
                 0.0,
                 min(
                     0.999,
-                    0.58 * _safe_ratio(matched, len(hyp))
-                    + 0.32 * local_match
-                    + 0.10 * (1.0 if not backward else 0.0),
+                    0.55 * sim + 0.18 * prefix + 0.14 * suffix + 0.08 * bigram + 0.05 * (0.0 if backward else 1.0),
                 ),
             )
 
-            if not backward and matched >= min(3, len(hyp)):
-                score += 1.2
-                conf = min(0.999, conf + 0.04)
-
-            if not backward and matched <= 2 and local_match >= 0.84:
-                score += 1.3
-                conf = min(0.999, conf + 0.06)
-
-            if advance > self.window_ahead * 0.7 and matched <= 1 and local_match < 0.55:
-                score -= 2.5
-                conf = max(0.0, conf - 0.10)
-
-            if forced_mode:
-                dist_from_center = abs(cand - center)
-                score -= 0.08 * dist_from_center
-                if cand >= center - 2 and matched >= 2:
-                    score += 0.8
-                    conf = min(0.999, conf + 0.03)
-
             if score > best_score:
-                best_candidate = cand + matched
-                if matched <= 2 and not backward and local_match >= 0.84:
-                    best_candidate = max(best_candidate, min(cand + max_take, cand + matched + 2))
-                best_matched = matched
                 best_score = score
                 best_conf = conf
                 best_local_match = local_match
-                best_mode = "forced_recenter" if forced_mode else ("backward" if backward else "normal")
+                best_matched_n = matched_n
+                best_candidate = min(len(ref), cand + max(matched_n, int(round(len(hyp) * max(sim, 0.35)))))
 
         backward = best_candidate < committed
-        if backward and best_conf <= 0.55:
+        if backward and best_conf < 0.58:
             best_candidate = committed
-            best_mode = "backward"
-            best_score = min(best_score, -1.5)
+            best_score = min(best_score, -0.8)
+            mode = "backward_rejected"
+        elif best_conf < 0.44 and mode == "normal":
+            mode = "low_confidence"
 
         return (
             best_candidate,
-            best_matched,
-            best_score,
-            best_conf,
-            backward,
-            best_mode,
+            best_matched_n,
+            float(best_score),
+            float(best_conf),
+            bool(backward),
+            mode,
             (start, end),
-            best_local_match,
+            float(best_local_match),
         )
 
-    def _print_debug(self, result: AlignmentResult) -> None:
-        tag = "[ALIGN]" if result.accepted else "[ALIGN-REJECT]"
-        extra = " soft_commit=True" if result.soft_committed else ""
-        if result.weak_forward and not result.soft_committed:
-            extra += " weak_forward=True"
-        print(
-            f"{tag} committed={result.committed} candidate={result.candidate} "
-            f"conf={result.conf:.3f} local={result.local_match:.3f} "
-            f"matched={result.matched_n}/{result.hyp_n} mode={result.mode}{extra}"
+    def _build_search_window(self, hyp: str) -> tuple[int, int, str]:
+        ref = self.reference_norm
+        committed = self._committed
+
+        if self._forced_center is not None and self._forced_budget > 0:
+            center = max(committed, int(self._forced_center))
+            back = int(self._forced_window_back or self.window_back)
+            ahead = int(self._forced_window_ahead or self.window_ahead)
+            return (
+                max(0, center - back),
+                min(len(ref), center + ahead),
+                "forced_recenter",
+            )
+
+        long_partial = len(hyp) >= 12
+        repeated_zone = self._same_zone_hits >= 3
+        recovery_mode = long_partial or repeated_zone
+
+        back = self.window_back + (6 if recovery_mode else 0)
+        ahead = self.window_ahead + (10 if recovery_mode else 0)
+
+        return (
+            max(0, committed - back),
+            min(len(ref), committed + ahead),
+            "recovery" if recovery_mode else "normal",
         )
+
+    def _substring_similarity(self, hyp: str, seg: str) -> tuple[float, int]:
+        if not hyp or not seg:
+            return 0.0, 0
+
+        n = len(hyp)
+        m = len(seg)
+        best_sim = 0.0
+        best_match = 0
+
+        min_len = max(1, int(round(n * 0.70)))
+        max_len = min(m, n + 6)
+
+        for take in range(min_len, max_len + 1):
+            ref_sub = seg[:take]
+            dist = self._edit_distance_banded(hyp, ref_sub, band=max(2, abs(len(hyp) - len(ref_sub)) + 3))
+            denom = max(len(hyp), len(ref_sub), 1)
+            sim = max(0.0, 1.0 - dist / denom)
+            matched = max(0, len(hyp) - dist)
+            if sim > best_sim:
+                best_sim = sim
+                best_match = matched
+
+        return best_sim, best_match
+
+    def _edit_distance_banded(self, a: str, b: str, band: int) -> int:
+        n = len(a)
+        m = len(b)
+        inf = 10**9
+        prev = [inf] * (m + 1)
+        prev[0] = 0
+        for j in range(1, m + 1):
+            prev[j] = j
+        for i in range(1, n + 1):
+            cur = [inf] * (m + 1)
+            lo = max(1, i - band)
+            hi = min(m, i + band)
+            if lo == 1:
+                cur[0] = i
+            for j in range(lo, hi + 1):
+                cost = 0 if a[i - 1] == b[j - 1] else 1
+                cur[j] = min(
+                    prev[j] + 1,
+                    cur[j - 1] + 1,
+                    prev[j - 1] + cost,
+                )
+            prev = cur
+        return int(prev[m])
+
+    def _prefix_match_ratio(self, a: str, b: str) -> float:
+        n = min(len(a), len(b))
+        if n <= 0:
+            return 0.0
+        hit = 0
+        for i in range(n):
+            if a[i] != b[i]:
+                break
+            hit += 1
+        return _safe_ratio(hit, min(len(a), 10))
+
+    def _suffix_match_ratio(self, a: str, b: str) -> float:
+        n = min(len(a), len(b))
+        if n <= 0:
+            return 0.0
+        hit = 0
+        for i in range(1, n + 1):
+            if a[-i] != b[-i]:
+                break
+            hit += 1
+        return _safe_ratio(hit, min(len(a), 10))
+
+    def _bigram_overlap(self, a: str, b: str) -> float:
+        if len(a) < 2 or len(b) < 2:
+            return 0.0
+        aset = {a[i : i + 2] for i in range(len(a) - 1)}
+        bset = {b[i : i + 2] for i in range(len(b) - 1)}
+        if not aset:
+            return 0.0
+        return _safe_ratio(len(aset & bset), len(aset))

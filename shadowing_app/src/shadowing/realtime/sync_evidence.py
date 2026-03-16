@@ -1,8 +1,6 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from enum import Enum
-
 from shadowing.types import FusionEvidence, ProgressEstimate, SignalQuality, TrackingMode
 
 
@@ -41,6 +39,7 @@ class SyncEvidence:
     allow_seek: bool
     startup_mode: bool
     bluetooth_mode: bool
+    bluetooth_long_session_mode: bool
     audio_confidence: float = 0.0
     still_following_likelihood: float = 0.0
     reentry_likelihood: float = 0.0
@@ -73,11 +72,15 @@ class SyncEvidenceBuilder:
         progress: ProgressEstimate | None,
         fusion_evidence: FusionEvidence | None,
         bluetooth_mode: bool,
+        bluetooth_long_session_mode: bool = False,
     ) -> SyncEvidence:
-        startup_mode = (now_sec - self._session_started_at_sec) <= self.startup_window_sec
+        startup_window = self.startup_window_sec + (1.5 if bluetooth_mode else 0.0)
+        startup_mode = (now_sec - self._session_started_at_sec) <= startup_window
+
         speech_conf = self._speech_confidence(signal_quality)
-        if speech_conf >= 0.44:
+        if speech_conf >= 0.40:
             self._last_speech_like_at_sec = float(now_sec)
+
         speech_state = self._speech_state(
             now_sec=now_sec,
             signal_quality=signal_quality,
@@ -85,12 +88,16 @@ class SyncEvidenceBuilder:
         )
         tracking_conf = self._tracking_confidence(progress, fusion_evidence)
         tracking_state = self._tracking_state(progress, tracking_conf)
+
         audio_conf = 0.0 if fusion_evidence is None else float(fusion_evidence.audio_confidence)
         still_following = 0.0 if fusion_evidence is None else float(fusion_evidence.still_following_likelihood)
         reentry = 0.0 if fusion_evidence is None else float(fusion_evidence.reentry_likelihood)
         repeated = 0.0 if fusion_evidence is None else float(fusion_evidence.repeated_likelihood)
 
-        sync_conf = max(0.0, min(1.0, 0.40 * speech_conf + 0.40 * tracking_conf + 0.20 * max(audio_conf, still_following)))
+        sync_conf = max(
+            0.0,
+            min(1.0, 0.36 * speech_conf + 0.40 * tracking_conf + 0.24 * max(audio_conf, still_following)),
+        )
         sync_state = self._sync_state(
             startup_mode=startup_mode,
             speech_state=speech_state,
@@ -98,26 +105,40 @@ class SyncEvidenceBuilder:
             sync_confidence=sync_conf,
             fusion_evidence=fusion_evidence,
         )
-        should_open_asr_gate = speech_state in (SpeechState.POSSIBLE, SpeechState.ACTIVE, SpeechState.SUSTAINED)
+
+        should_open_asr_gate = speech_state in (
+            SpeechState.POSSIBLE,
+            SpeechState.ACTIVE,
+            SpeechState.SUSTAINED,
+        )
         should_keep_asr_gate = should_open_asr_gate or (
             self._last_speech_like_at_sec > 0.0
-            and (now_sec - self._last_speech_like_at_sec) <= (0.70 if bluetooth_mode else 0.45)
+            and (now_sec - self._last_speech_like_at_sec) <= (0.90 if bluetooth_mode else 0.45)
         )
+
         allow_latency_observation = bool(
             speech_state in (SpeechState.ACTIVE, SpeechState.SUSTAINED)
             and tracking_state in (TrackingState.RELIABLE, TrackingState.LOCKED)
             and sync_state in (SyncState.CONVERGING, SyncState.STABLE)
-            and (fusion_evidence is None or fusion_evidence.fused_confidence >= 0.58)
+            and (
+                fusion_evidence is None
+                or fusion_evidence.fused_confidence >= (0.54 if bluetooth_mode else 0.58)
+            )
         )
-        allow_seek = bool(
-            (now_sec - self._session_started_at_sec) >= self.seek_enable_after_sec
-            and tracking_state == TrackingState.LOCKED
-            and sync_state == SyncState.STABLE
-            and not startup_mode
-            and not bluetooth_mode
-            and repeated < 0.55
-            and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
-        )
+
+        if bluetooth_mode:
+            # 蓝牙模式默认禁主动 seek；长课更是如此
+            allow_seek = False
+        else:
+            allow_seek = bool(
+                (now_sec - self._session_started_at_sec) >= self.seek_enable_after_sec
+                and tracking_state == TrackingState.LOCKED
+                and sync_state == SyncState.STABLE
+                and not startup_mode
+                and repeated < 0.55
+                and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
+            )
+
         return SyncEvidence(
             speech_state=speech_state,
             tracking_state=tracking_state,
@@ -131,6 +152,7 @@ class SyncEvidenceBuilder:
             allow_seek=allow_seek,
             startup_mode=startup_mode,
             bluetooth_mode=bluetooth_mode,
+            bluetooth_long_session_mode=bool(bluetooth_long_session_mode),
             audio_confidence=audio_conf,
             still_following_likelihood=still_following,
             reentry_likelihood=reentry,
@@ -165,11 +187,17 @@ class SyncEvidenceBuilder:
             return SpeechState.NONE
         if speech_confidence < 0.42:
             return SpeechState.POSSIBLE
-        if self._last_speech_like_at_sec > 0.0 and (now_sec - self._last_speech_like_at_sec) <= self.sustained_speaking_sec:
+        if self._last_speech_like_at_sec > 0.0 and (
+            now_sec - self._last_speech_like_at_sec
+        ) <= self.sustained_speaking_sec:
             return SpeechState.SUSTAINED
         return SpeechState.ACTIVE
 
-    def _tracking_confidence(self, progress: ProgressEstimate | None, fusion_evidence: FusionEvidence | None) -> float:
+    def _tracking_confidence(
+        self,
+        progress: ProgressEstimate | None,
+        fusion_evidence: FusionEvidence | None,
+    ) -> float:
         score = 0.0
         if progress is not None:
             score += min(0.45, float(progress.tracking_quality) * 0.50)
@@ -185,7 +213,11 @@ class SyncEvidenceBuilder:
             score += min(0.14, float(fusion_evidence.still_following_likelihood) * 0.18)
         return max(0.0, min(1.0, score))
 
-    def _tracking_state(self, progress: ProgressEstimate | None, tracking_confidence: float) -> TrackingState:
+    def _tracking_state(
+        self,
+        progress: ProgressEstimate | None,
+        tracking_confidence: float,
+    ) -> TrackingState:
         if progress is None:
             return TrackingState.NONE
         mode = progress.tracking_mode
@@ -208,7 +240,11 @@ class SyncEvidenceBuilder:
     ) -> SyncState:
         if startup_mode:
             return SyncState.BOOTSTRAP
-        if speech_state in (SpeechState.ACTIVE, SpeechState.SUSTAINED) and tracking_state == TrackingState.LOCKED and sync_confidence >= 0.72:
+        if (
+            speech_state in (SpeechState.ACTIVE, SpeechState.SUSTAINED)
+            and tracking_state == TrackingState.LOCKED
+            and sync_confidence >= 0.72
+        ):
             return SyncState.STABLE
         if fusion_evidence is not None and fusion_evidence.still_following_likelihood >= 0.68 and sync_confidence >= 0.56:
             return SyncState.CONVERGING

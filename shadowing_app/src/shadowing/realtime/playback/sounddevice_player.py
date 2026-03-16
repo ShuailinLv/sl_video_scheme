@@ -11,14 +11,20 @@ from shadowing.interfaces.player import Player
 from shadowing.realtime.playback.chunk_queue import ChunkQueue
 from shadowing.realtime.playback.command_queue import PlayerCommandQueue
 from shadowing.realtime.playback.playback_clock import PlaybackClock
-from shadowing.types import AudioChunk, PlaybackState, PlaybackStatus, PlayerCommand, PlayerCommandType
+from shadowing.types import (
+    AudioChunk,
+    PlaybackState,
+    PlaybackStatus,
+    PlayerCommand,
+    PlayerCommandType,
+)
 
 
 @dataclass(slots=True)
 class PlaybackConfig:
     sample_rate: int
     channels: int
-    device: int | None = None
+    device: int | str | None = None
     latency: str | float = "low"
     blocksize: int = 0
     bluetooth_output_offset_sec: float = 0.0
@@ -36,14 +42,16 @@ class _OutputResampler:
         arr = np.asarray(audio, dtype=np.float32)
         if arr.ndim != 2:
             raise ValueError(f"Expected 2D audio array, got shape={arr.shape}")
-
         if self.src_rate == self.dst_rate or arr.shape[0] == 0:
             return arr.astype(np.float32, copy=False)
 
         channels = arr.shape[1]
         pieces: list[np.ndarray] = []
         for ch in range(channels):
-            y = resample_poly(arr[:, ch], self.up, self.down).astype(np.float32, copy=False)
+            y = resample_poly(arr[:, ch], self.up, self.down).astype(
+                np.float32,
+                copy=False,
+            )
             pieces.append(y)
 
         min_len = min(piece.shape[0] for piece in pieces)
@@ -93,7 +101,9 @@ class SoundDevicePlayer(Player):
 
     def load_chunks(self, chunks: list[AudioChunk]) -> None:
         if chunks and any(c.sample_rate != self.config.sample_rate for c in chunks):
-            raise ValueError("Chunk sample rate does not match player config sample rate.")
+            raise ValueError(
+                "Chunk sample rate does not match player config sample rate."
+            )
         self.queue.load(chunks)
         self._content_sample_rate = int(self.config.sample_rate)
 
@@ -103,8 +113,8 @@ class SoundDevicePlayer(Player):
 
         actual_device = self._resolve_output_device(self.config.device)
         dev_info = sd.query_devices(actual_device, "output")
-
         opened_sr = self._pick_openable_output_samplerate(actual_device, dev_info)
+
         self._opened_output_sample_rate = int(opened_sr)
         self._output_resampler = (
             None
@@ -146,7 +156,9 @@ class SoundDevicePlayer(Player):
         return self._status_snapshot
 
     def stop(self) -> None:
-        self.submit_command(PlayerCommand(cmd=PlayerCommandType.STOP, reason="external_stop"))
+        self.submit_command(
+            PlayerCommand(cmd=PlayerCommandType.STOP, reason="external_stop")
+        )
 
     def close(self) -> None:
         if self._stream is not None:
@@ -185,24 +197,33 @@ class SoundDevicePlayer(Player):
             self._state = PlaybackState.HOLDING
 
     def _audio_callback(self, outdata, frames, time_info, status) -> None:
+        _ = status
         self._callback_count += 1
         self._apply_merged_commands()
 
         block_start = self.queue.get_content_time_sec()
 
-        if self._state in (PlaybackState.STOPPED, PlaybackState.HOLDING, PlaybackState.FINISHED):
+        if self._state in (
+            PlaybackState.STOPPED,
+            PlaybackState.HOLDING,
+            PlaybackState.FINISHED,
+        ):
             outdata.fill(0.0)
             self._silent_branch_logged = True
         else:
             self._silent_branch_logged = False
-
             if self._output_resampler is None:
-                block = self.queue.read_frames(frames=frames, channels=self.config.channels)
+                block = self.queue.read_frames(
+                    frames=frames,
+                    channels=self.config.channels,
+                )
             else:
                 src_frames = self._estimate_source_frames(frames)
-                source_block = self.queue.read_frames(frames=src_frames, channels=self.config.channels)
+                source_block = self.queue.read_frames(
+                    frames=src_frames,
+                    channels=self.config.channels,
+                )
                 block = self._output_resampler.process(source_block)
-
                 if block.shape[0] < frames:
                     padded = np.zeros((frames, self.config.channels), dtype=np.float32)
                     if block.shape[0] > 0:
@@ -218,7 +239,7 @@ class SoundDevicePlayer(Player):
 
         block_end = self.queue.get_content_time_sec()
         snapshot = self.clock.compute(
-            output_buffer_dac_time_sec=time_info.outputBufferDacTime,
+            output_buffer_dac_time_sec=float(time_info.outputBufferDacTime),
             block_start_content_sec=block_start,
             block_end_content_sec=block_end,
         )
@@ -236,8 +257,8 @@ class SoundDevicePlayer(Player):
             t_ref_heard_content_sec=snapshot.t_ref_heard_content_sec,
         )
 
-    def _resolve_output_device(self, requested_device: int | None) -> int:
-        if requested_device is not None:
+    def _resolve_output_device(self, requested_device: int | str | None) -> int:
+        if isinstance(requested_device, int):
             dev_info = sd.query_devices(requested_device)
             if int(dev_info["max_output_channels"]) <= 0:
                 raise ValueError(
@@ -245,6 +266,27 @@ class SoundDevicePlayer(Player):
                     f"device={requested_device}, name={dev_info['name']}"
                 )
             return int(requested_device)
+
+        if isinstance(requested_device, str):
+            target = requested_device.strip().lower()
+            if target:
+                devices = sd.query_devices()
+                for idx, dev in enumerate(devices):
+                    if int(dev["max_output_channels"]) <= 0:
+                        continue
+                    if target in str(dev["name"]).lower():
+                        return int(idx)
+
+                candidates = [
+                    f"[{idx}] {dev['name']}"
+                    for idx, dev in enumerate(devices)
+                    if int(dev["max_output_channels"]) > 0
+                ]
+                joined = "\n".join(candidates[:50])
+                raise ValueError(
+                    "Output device name not found: "
+                    f"{requested_device!r}\nAvailable output devices:\n{joined}"
+                )
 
         default_in, default_out = sd.default.device
         candidates: list[int] = []

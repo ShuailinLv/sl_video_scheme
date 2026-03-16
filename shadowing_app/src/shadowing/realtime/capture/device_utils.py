@@ -1,6 +1,8 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any
+
 import sounddevice as sd
 
 
@@ -40,7 +42,12 @@ def print_input_devices() -> None:
         print("No input devices found.")
         return
     for d in devices:
-        print(f"[{d.index}] {d.name} | in={d.max_input_channels} | sr={int(d.default_samplerate)} | hostapi={d.hostapi_name}")
+        print(
+            f"[{d.index}] {d.name} | "
+            f"in={d.max_input_channels} | "
+            f"default_sr={int(d.default_samplerate)} | "
+            f"hostapi={d.hostapi_name}"
+        )
 
 
 def get_default_input_device_index() -> int | None:
@@ -50,41 +57,79 @@ def get_default_input_device_index() -> int | None:
     return int(default_input)
 
 
-def choose_input_device(preferred_index: int | None = None, preferred_name_substring: str | None = None) -> int | None:
+def choose_input_device(
+    preferred_index: int | None = None,
+    preferred_name_substring: str | None = None,
+) -> int | None:
     devices = list_input_devices()
     if not devices:
         return None
+
     if preferred_index is not None:
         for d in devices:
             if d.index == preferred_index:
                 return d.index
+
     if preferred_name_substring:
         keyword = preferred_name_substring.lower().strip()
         for d in devices:
             if keyword and keyword in d.name.lower():
                 return d.index
+
     default_idx = get_default_input_device_index()
     if default_idx is not None:
         return default_idx
+
     return devices[0].index
 
 
-def check_input_settings(device: int | None, samplerate: int, channels: int = 1, dtype: str = "float32") -> bool:
+def check_input_settings(
+    device: int | None,
+    samplerate: int,
+    channels: int = 1,
+    dtype: str = "float32",
+) -> bool:
     try:
-        sd.check_input_settings(device=device, samplerate=int(samplerate), channels=int(channels), dtype=str(dtype))
+        sd.check_input_settings(
+            device=device,
+            samplerate=int(samplerate),
+            channels=int(channels),
+            dtype=str(dtype),
+        )
         return True
     except Exception:
         return False
 
 
-def pick_working_input_config(preferred_device: int | None = None, preferred_name_substring: str | None = None, preferred_rates: list[int] | None = None, channels: int = 1, dtype: str = "float32") -> dict[str, Any] | None:
+def pick_working_input_config(
+    preferred_device: int | None = None,
+    preferred_name_substring: str | None = None,
+    preferred_rates: list[int] | None = None,
+    channels: int = 1,
+    dtype: str = "float32",
+) -> dict[str, Any] | None:
     preferred_rates = preferred_rates or [48000, 44100, 16000]
-    device = choose_input_device(preferred_index=preferred_device, preferred_name_substring=preferred_name_substring)
+    device = choose_input_device(
+        preferred_index=preferred_device,
+        preferred_name_substring=preferred_name_substring,
+    )
     if device is None:
         return None
+
     for sr in preferred_rates:
         if int(sr) <= 0:
             continue
-        if check_input_settings(device=device, samplerate=int(sr), channels=int(channels), dtype=str(dtype)):
-            return {"device": int(device), "samplerate": int(sr), "channels": int(channels), "dtype": str(dtype)}
+        if check_input_settings(
+            device=device,
+            samplerate=int(sr),
+            channels=int(channels),
+            dtype=str(dtype),
+        ):
+            return {
+                "device": int(device),
+                "samplerate": int(sr),
+                "channels": int(channels),
+                "dtype": str(dtype),
+            }
+
     return None

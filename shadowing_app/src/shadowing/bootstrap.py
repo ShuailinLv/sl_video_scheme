@@ -41,6 +41,7 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
     session_dir = str(session_cfg.get("session_dir", "runtime/latest_session"))
     event_logging = bool(session_cfg.get("event_logging", False))
     debug_enabled = bool(debug_cfg.get("enabled", False))
+
     repo = FileLessonRepository(lesson_base_dir)
 
     player = SoundDevicePlayer(
@@ -50,13 +51,16 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
             device=playback_cfg.get("device"),
             latency=playback_cfg.get("latency", "low"),
             blocksize=int(playback_cfg.get("blocksize", 0)),
-            bluetooth_output_offset_sec=float(playback_cfg.get("bluetooth_output_offset_sec", 0.0)),
+            bluetooth_output_offset_sec=float(
+                playback_cfg.get("bluetooth_output_offset_sec", 0.0)
+            ),
         )
     )
 
     capture_backend = str(capture_cfg.get("backend", "sounddevice")).strip().lower()
     if capture_backend == "soundcard":
         from shadowing.realtime.capture.soundcard_recorder import SoundCardRecorder
+
         recorder = SoundCardRecorder(
             sample_rate_in=int(capture_cfg.get("device_sample_rate", 48000)),
             target_sample_rate=int(capture_cfg.get("target_sample_rate", 16000)),
@@ -66,6 +70,7 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
         )
     elif capture_backend == "sounddevice":
         from shadowing.realtime.capture.sounddevice_recorder import SoundDeviceRecorder
+
         recorder = SoundDeviceRecorder(
             sample_rate_in=int(capture_cfg.get("device_sample_rate", 48000)),
             target_sample_rate=int(capture_cfg.get("target_sample_rate", 16000)),
@@ -97,35 +102,32 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
     aligner = IncrementalAligner(
         window_back=int(alignment_cfg.get("window_back", 8)),
         window_ahead=int(alignment_cfg.get("window_ahead", 40)),
-        stable_frames=int(alignment_cfg.get("stable_frames", 2)),
+        stable_hits=int(alignment_cfg.get("stable_hits", alignment_cfg.get("stable_frames", 2))),
         min_confidence=float(alignment_cfg.get("min_confidence", 0.60)),
-        backward_lock_frames=int(alignment_cfg.get("backward_lock_frames", 3)),
-        clause_boundary_bonus=float(alignment_cfg.get("clause_boundary_bonus", 0.15)),
-        cross_clause_backward_extra_penalty=float(alignment_cfg.get("cross_clause_backward_extra_penalty", 0.20)),
         debug=bool(alignment_cfg.get("debug", False)),
-        max_hyp_tokens=int(alignment_cfg.get("max_hyp_tokens", 16)),
-        weak_commit_min_conf=float(alignment_cfg.get("weak_commit_min_conf", 0.82)),
-        weak_commit_min_local_match=float(alignment_cfg.get("weak_commit_min_local_match", 0.80)),
-        weak_commit_min_advance=int(alignment_cfg.get("weak_commit_min_advance", 3)),
     )
+
     policy = ControlPolicy(**control_cfg)
     controller = StateMachineController(
         policy=policy,
         disable_seek=bool(control_cfg.get("disable_seek", False)),
         debug=debug_enabled,
     )
+
     signal_monitor = SignalQualityMonitor(
         min_vad_rms=float(signal_cfg.get("min_vad_rms", 0.006)),
         vad_noise_multiplier=float(signal_cfg.get("vad_noise_multiplier", 2.8)),
     )
+
     latency_calibrator = LatencyCalibrator()
     auto_tuner = RuntimeAutoTuner()
 
     profile_path = str(adaptation_cfg.get("profile_path", "runtime/device_profiles.json"))
     profile_store = ProfileStore(profile_path)
-    event_logger = EventLogger(session_dir=session_dir, enabled=event_logging)
 
+    event_logger = EventLogger(session_dir=session_dir, enabled=event_logging)
     reference_audio_store = ReferenceAudioStore(lesson_base_dir)
+
     live_audio_matcher = LiveAudioMatcher(
         search_window_sec=float(audio_match_cfg.get("search_window_sec", 3.0)),
         match_window_sec=float(audio_match_cfg.get("match_window_sec", 1.8)),
@@ -133,7 +135,9 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
         min_frames_for_match=int(audio_match_cfg.get("min_frames_for_match", 20)),
         ring_buffer_sec=float(audio_match_cfg.get("ring_buffer_sec", 6.0)),
     )
+
     audio_behavior_classifier = AudioBehaviorClassifier()
+
     evidence_fuser = EvidenceFuser(
         text_priority_threshold=float(audio_match_cfg.get("text_priority_threshold", 0.72)),
         audio_takeover_threshold=float(audio_match_cfg.get("audio_takeover_threshold", 0.62)),
@@ -164,6 +168,7 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
         loop_interval_sec=float(runtime_cfg.get("loop_interval_sec", 0.03)),
         debug=debug_enabled,
     )
+
     runtime = ShadowingRuntime(
         orchestrator=orchestrator,
         config=RealtimeRuntimeConfig(

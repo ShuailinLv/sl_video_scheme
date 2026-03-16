@@ -3,2581 +3,6 @@
 自动生成。已移除 Python 注释、docstring、print 和空行。
 
 ---
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/audio/frame_feature_extractor.py`
-
-```python
-from __future__ import annotations
-from dataclasses import dataclass, field
-import numpy as np
-@dataclass(slots=True)
-class AudioFrameFeature:
-    observed_at_sec: float
-    envelope: float
-    onset_strength: float
-    voiced_ratio: float
-    band_energy: list[float]
-    embedding: list[float] = field(default_factory=list)
-class FrameFeatureExtractor:
-    def __init__(
-        self,
-        sample_rate: int,
-        frame_size_sec: float = 0.025,
-        hop_sec: float = 0.010,
-        n_bands: int = 6,
-        min_voiced_rms: float = 0.005,
-        n_mels: int = 24,
-        embedding_alpha: float = 0.35,
-    ) -> None:
-        self.sample_rate = int(sample_rate)
-        self.frame_size_sec = float(frame_size_sec)
-        self.hop_sec = float(hop_sec)
-        self.n_bands = max(2, int(n_bands))
-        self.min_voiced_rms = float(min_voiced_rms)
-        self.n_mels = max(8, int(n_mels))
-        self.embedding_alpha = float(max(0.0, min(1.0, embedding_alpha)))
-        self.frame_size = max(16, int(round(self.sample_rate * self.frame_size_sec)))
-        self.hop_size = max(8, int(round(self.sample_rate * self.hop_sec)))
-        self._tail = np.zeros((0,), dtype=np.float32)
-        self._last_envelope = 0.0
-        self._last_log_mel = np.zeros((self.n_mels,), dtype=np.float32)
-    def reset(self) -> None:
-        self._tail = np.zeros((0,), dtype=np.float32)
-        self._last_envelope = 0.0
-        self._last_log_mel = np.zeros((self.n_mels,), dtype=np.float32)
-    def process_pcm16(self, pcm_bytes: bytes, *, observed_at_sec: float) -> list[AudioFrameFeature]:
-        if not pcm_bytes:
-            return []
-        audio_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
-        if audio_i16.size == 0:
-            return []
-        audio_f32 = (audio_i16.astype(np.float32) / 32768.0).astype(np.float32, copy=False)
-        start_time_sec = float(observed_at_sec) - (audio_f32.shape[0] / float(self.sample_rate))
-        return self.process_float_audio(audio_f32, start_time_sec=start_time_sec)
-    def process_float_audio(self, audio_f32: np.ndarray, *, start_time_sec: float) -> list[AudioFrameFeature]:
-        arr = np.asarray(audio_f32, dtype=np.float32).reshape(-1)
-        if arr.size == 0:
-            return []
-        full = np.concatenate([self._tail, arr], axis=0)
-        out: list[AudioFrameFeature] = []
-        pos = 0
-        while pos + self.frame_size <= full.shape[0]:
-            frame = full[pos : pos + self.frame_size]
-            frame_time_sec = float(start_time_sec) + max(0, pos - self._tail.shape[0]) / float(self.sample_rate)
-            out.append(self._extract_frame_feature(frame, frame_time_sec))
-            pos += self.hop_size
-        self._tail = full[pos:].astype(np.float32, copy=False)
-        max_tail = max(self.frame_size, self.hop_size) * 2
-        if self._tail.shape[0] > max_tail:
-            self._tail = self._tail[-max_tail:]
-        return out
-    def _extract_frame_feature(self, frame: np.ndarray, frame_time_sec: float) -> AudioFrameFeature:
-        eps = 1e-8
-        envelope = float(np.sqrt(np.mean(np.square(frame)))) if frame.size else 0.0
-        onset_strength = max(0.0, envelope - self._last_envelope)
-        self._last_envelope = envelope
-        abs_frame = np.abs(frame)
-        voiced_ratio = float(np.mean(abs_frame >= max(self.min_voiced_rms, envelope * 0.55))) if frame.size else 0.0
-        win = np.hanning(frame.shape[0]).astype(np.float32, copy=False)
-        spec = np.abs(np.fft.rfft(frame * win))
-        if spec.size <= 1:
-            band_energy = [0.0] * self.n_bands
-            log_mel = np.zeros((self.n_mels,), dtype=np.float32)
-        else:
-            band_energy = self._compute_band_energy(spec)
-            log_mel = self._compute_log_mel(spec)
-        delta = log_mel - self._last_log_mel
-        smoothed = (1.0 - self.embedding_alpha) * self._last_log_mel + self.embedding_alpha * log_mel
-        self._last_log_mel = smoothed.astype(np.float32, copy=False)
-        embedding = np.concatenate(
-            [
-                smoothed,
-                delta,
-                np.asarray([envelope, onset_strength, voiced_ratio], dtype=np.float32),
-            ],
-            axis=0,
-        )
-        norm = float(np.linalg.norm(embedding))
-        if norm > 1e-6:
-            embedding = embedding / norm
-        return AudioFrameFeature(
-            observed_at_sec=float(frame_time_sec),
-            envelope=float(envelope),
-            onset_strength=float(onset_strength),
-            voiced_ratio=float(voiced_ratio),
-            band_energy=band_energy,
-            embedding=embedding.astype(np.float32, copy=False).tolist(),
-        )
-    def _compute_band_energy(self, spec: np.ndarray) -> list[float]:
-        eps = 1e-8
-        edges = np.linspace(0, spec.shape[0], self.n_bands + 1, dtype=int)
-        band_energy: list[float] = []
-        total = float(np.sum(spec) + eps)
-        for i in range(self.n_bands):
-            lo = int(edges[i])
-            hi = int(edges[i + 1])
-            if hi <= lo:
-                band_energy.append(0.0)
-            else:
-                band_energy.append(float(np.sum(spec[lo:hi]) / total))
-        return band_energy
-    def _compute_log_mel(self, spec: np.ndarray) -> np.ndarray:
-        power = np.square(np.asarray(spec, dtype=np.float32))
-        n_bins = power.shape[0]
-        edges = np.linspace(0, n_bins, self.n_mels + 1, dtype=int)
-        mel = np.zeros((self.n_mels,), dtype=np.float32)
-        for i in range(self.n_mels):
-            lo = int(edges[i])
-            hi = max(lo + 1, int(edges[i + 1]))
-            mel[i] = float(np.mean(power[lo:hi]))
-        mel = np.log1p(mel)
-        mu = float(np.mean(mel))
-        sigma = float(np.std(mel))
-        if sigma > 1e-6:
-            mel = (mel - mu) / sigma
-        else:
-            mel = mel - mu
-        return mel.astype(np.float32, copy=False)
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/audio/live_audio_matcher.py`
-
-```python
-from __future__ import annotations
-from bisect import bisect_right
-from dataclasses import dataclass
-import numpy as np
-from shadowing.audio.audio_feature_ring_buffer import AudioFeatureRingBuffer
-from shadowing.audio.frame_feature_extractor import AudioFrameFeature
-from shadowing.audio.reference_audio_features import ReferenceAudioFeatures
-from shadowing.types import AudioMatchSnapshot
-@dataclass(slots=True)
-class _Candidate:
-    idx: int
-    env_score: float
-    onset_score: float
-    band_score: float
-    embed_score: float
-    stretch_factor: float
-    total_score: float
-    rank: int = 0
-class LiveAudioMatcher:
-    def __init__(
-        self,
-        *,
-        search_window_sec: float = 3.0,
-        match_window_sec: float = 1.8,
-        update_interval_sec: float = 0.12,
-        min_frames_for_match: int = 20,
-        ring_buffer_sec: float = 6.0,
-        stretch_factors: tuple[float, ...] = (0.92, 1.00, 1.08),
-        boundary_bonus_radius_sec: float = 0.22,
-        dtw_top_k: int = 3,
-        dtw_band_ratio: float = 0.18,
-    ) -> None:
-        self.search_window_sec = float(search_window_sec)
-        self.match_window_sec = float(match_window_sec)
-        self.update_interval_sec = float(update_interval_sec)
-        self.min_frames_for_match = max(8, int(min_frames_for_match))
-        self.ring = AudioFeatureRingBuffer(max_duration_sec=ring_buffer_sec)
-        self.stretch_factors = tuple(float(x) for x in stretch_factors if x > 0.0) or (1.0,)
-        self.boundary_bonus_radius_sec = float(boundary_bonus_radius_sec)
-        self.dtw_top_k = max(1, int(dtw_top_k))
-        self.dtw_band_ratio = float(max(0.05, min(0.45, dtw_band_ratio)))
-        self._ref_features: ReferenceAudioFeatures | None = None
-        self._ref_times = np.zeros((0,), dtype=np.float32)
-        self._ref_env = np.zeros((0,), dtype=np.float32)
-        self._ref_onset = np.zeros((0,), dtype=np.float32)
-        self._ref_band = np.zeros((0, 0), dtype=np.float32)
-        self._ref_embed = np.zeros((0, 0), dtype=np.float32)
-        self._boundary_times = np.zeros((0,), dtype=np.float32)
-        self._last_snapshot: AudioMatchSnapshot | None = None
-        self._last_emit_at_sec = 0.0
-    def reset(self, ref_features: ReferenceAudioFeatures, ref_map) -> None:
-        _ = ref_map
-        self._ref_features = ref_features
-        self.ring.reset()
-        self._last_snapshot = None
-        self._last_emit_at_sec = 0.0
-        self._ref_times = np.asarray([x.time_sec for x in ref_features.frames], dtype=np.float32)
-        self._ref_env = np.asarray([x.envelope for x in ref_features.frames], dtype=np.float32)
-        self._ref_onset = np.asarray([x.onset_strength for x in ref_features.frames], dtype=np.float32)
-        if ref_features.frames and ref_features.frames[0].band_energy:
-            self._ref_band = np.asarray([x.band_energy for x in ref_features.frames], dtype=np.float32)
-        else:
-            self._ref_band = np.zeros((len(ref_features.frames), 0), dtype=np.float32)
-        if ref_features.frames and ref_features.frames[0].embedding:
-            self._ref_embed = np.asarray([x.embedding for x in ref_features.frames], dtype=np.float32)
-        else:
-            self._ref_embed = np.zeros((len(ref_features.frames), 0), dtype=np.float32)
-        self._boundary_times = np.asarray([float(x.time_sec) for x in ref_features.boundaries], dtype=np.float32)
-    def feed_features(self, frames: list[AudioFrameFeature]) -> None:
-        self.ring.append_many(frames)
-    def snapshot(self, *, now_sec: float, progress_hint_ref_time_sec: float | None, playback_ref_time_sec: float | None, text_tracking_confidence: float) -> AudioMatchSnapshot | None:
-        if self._ref_features is None or self._ref_env.size == 0:
-            return None
-        if self._last_snapshot is not None and (now_sec - self._last_emit_at_sec) < self.update_interval_sec:
-            return self._last_snapshot
-        live = self.ring.get_recent(self.match_window_sec)
-        if len(live) < self.min_frames_for_match:
-            return self._last_snapshot
-        live_env = np.asarray([x.envelope for x in live], dtype=np.float32)
-        live_onset = np.asarray([x.onset_strength for x in live], dtype=np.float32)
-        live_band = np.asarray([x.band_energy for x in live], dtype=np.float32) if live and live[0].band_energy else np.zeros((len(live), 0), dtype=np.float32)
-        live_embed = np.asarray([x.embedding for x in live], dtype=np.float32) if live and live[0].embedding else np.zeros((len(live), 0), dtype=np.float32)
-        center_time = self._choose_search_center(progress_hint_ref_time_sec=progress_hint_ref_time_sec, playback_ref_time_sec=playback_ref_time_sec, text_tracking_confidence=text_tracking_confidence)
-        candidates = self._search_candidates(live_env=live_env, live_onset=live_onset, live_band=live_band, live_embed=live_embed, center_time_sec=center_time)
-        if not candidates:
-            return self._last_snapshot
-        best = candidates[0]
-        dtw_score, dtw_cost, dtw_coverage, best_idx = self._refine_with_dtw(live_embed=live_embed, candidates=candidates, live_len=len(live))
-        if best_idx >= 0:
-            best = next((c for c in candidates if c.idx == best_idx), best)
-        rhythm_score = self._rhythm_consistency(live_onset, best.idx, len(live_onset))
-        boundary_bonus = self._boundary_bonus(best.idx, len(live_onset))
-        stretch_bonus = self._stretch_bonus(best.stretch_factor)
-        local_similarity = max(0.0, min(1.0, 0.24 * best.env_score + 0.15 * best.onset_score + 0.13 * best.band_score + 0.20 * best.embed_score + 0.14 * rhythm_score + 0.10 * dtw_score + 0.02 * boundary_bonus + 0.02 * stretch_bonus))
-        conf = float(max(0.0, min(1.0, 0.10 + 0.90 * local_similarity)))
-        center_ref_idx = min(best.idx + max(0, len(live) // 2 - 1), len(self._ref_times) - 1)
-        ref_time = float(self._ref_times[center_ref_idx])
-        ref_idx_hint = self._time_to_ref_idx(ref_time)
-        repeated_pattern_score = 0.0
-        if progress_hint_ref_time_sec is not None:
-            delta = float(progress_hint_ref_time_sec) - ref_time
-            if 0.30 <= delta <= 2.40 and local_similarity >= 0.56:
-                repeated_pattern_score = min(1.0, 0.35 * (delta / 2.40) + 0.65 * max(0.0, 1.0 - dtw_coverage))
-        drift_sec = 0.0 if progress_hint_ref_time_sec is None else float(ref_time - progress_hint_ref_time_sec)
-        mode = "tracking"
-        if text_tracking_confidence < 0.42 and conf >= 0.62:
-            mode = "bootstrap"
-        if repeated_pattern_score >= 0.55:
-            mode = "repeat"
-        if playback_ref_time_sec is not None and abs(ref_time - float(playback_ref_time_sec)) <= 0.55 and text_tracking_confidence < 0.52 and conf >= 0.58:
-            mode = "reentry"
-        snap = AudioMatchSnapshot(
-            estimated_ref_time_sec=ref_time,
-            estimated_ref_idx_hint=int(ref_idx_hint),
-            confidence=conf,
-            local_similarity=float(local_similarity),
-            envelope_alignment_score=float(best.env_score),
-            onset_alignment_score=float(best.onset_score),
-            band_alignment_score=float(best.band_score),
-            rhythm_consistency_score=float(rhythm_score),
-            repeated_pattern_score=float(repeated_pattern_score),
-            drift_sec=float(drift_sec),
-            mode=mode,
-            emitted_at_sec=float(now_sec),
-            dtw_cost=float(dtw_cost),
-            dtw_path_score=float(dtw_score),
-            dtw_coverage=float(dtw_coverage),
-            coarse_candidate_rank=int(best.rank),
-            time_offset_sec=float(drift_sec),
-        )
-        self._last_snapshot = snap
-        self._last_emit_at_sec = float(now_sec)
-        return snap
-    def _choose_search_center(self, *, progress_hint_ref_time_sec: float | None, playback_ref_time_sec: float | None, text_tracking_confidence: float) -> float:
-        if progress_hint_ref_time_sec is not None and text_tracking_confidence >= 0.58:
-            return float(progress_hint_ref_time_sec)
-        if playback_ref_time_sec is not None:
-            return float(playback_ref_time_sec)
-        if self._last_snapshot is not None:
-            return float(self._last_snapshot.estimated_ref_time_sec)
-        return 0.0
-    def _search_candidates(self, *, live_env: np.ndarray, live_onset: np.ndarray, live_band: np.ndarray, live_embed: np.ndarray, center_time_sec: float) -> list[_Candidate]:
-        ref_n = int(self._ref_env.shape[0])
-        live_n = int(live_env.shape[0])
-        if live_n <= 0 or ref_n < live_n or self._ref_times.size == 0:
-            return []
-        center_idx = int(np.searchsorted(self._ref_times, center_time_sec))
-        radius_frames = max(live_n, int(round(self.search_window_sec / max(1e-6, self._ref_features.frame_hop_sec))))
-        start = max(0, center_idx - radius_frames)
-        end = min(ref_n - live_n, center_idx + radius_frames)
-        if end < start:
-            start, end = 0, max(0, ref_n - live_n)
-        scores: list[_Candidate] = []
-        for stretch in self.stretch_factors:
-            warped_env = self._time_warp_1d(live_env, target_len=live_n, stretch_factor=stretch)
-            warped_onset = self._time_warp_1d(live_onset, target_len=live_n, stretch_factor=stretch)
-            warped_band = self._time_warp_2d(live_band, target_len=live_n, stretch_factor=stretch)
-            warped_embed = self._time_warp_2d(live_embed, target_len=live_n, stretch_factor=stretch)
-            live_env_z = self._zscore(warped_env)
-            live_onset_z = self._zscore(warped_onset)
-            live_band_z = self._zscore_rows(warped_band)
-            live_embed_z = self._zscore_rows(warped_embed)
-            for idx in range(start, end + 1):
-                ref_env = self._ref_env[idx : idx + live_n]
-                ref_onset = self._ref_onset[idx : idx + live_n]
-                ref_band = self._ref_band[idx : idx + live_n] if self._ref_band.size > 0 else np.zeros((live_n, 0), dtype=np.float32)
-                ref_embed = self._ref_embed[idx : idx + live_n] if self._ref_embed.size > 0 else np.zeros((live_n, 0), dtype=np.float32)
-                env_score = self._corr(live_env_z, self._zscore(ref_env))
-                onset_score = self._corr(live_onset_z, self._zscore(ref_onset))
-                band_score = self._band_similarity(live_band_z, self._zscore_rows(ref_band))
-                embed_score = self._band_similarity(live_embed_z, self._zscore_rows(ref_embed))
-                boundary_bonus = self._boundary_bonus(idx, live_n)
-                total = 0.28 * env_score + 0.12 * onset_score + 0.14 * band_score + 0.38 * embed_score + 0.08 * boundary_bonus
-                scores.append(_Candidate(idx=idx, env_score=float(env_score), onset_score=float(onset_score), band_score=float(band_score), embed_score=float(embed_score), stretch_factor=float(stretch), total_score=float(total)))
-        scores.sort(key=lambda x: x.total_score, reverse=True)
-        deduped: list[_Candidate] = []
-        seen: set[int] = set()
-        for cand in scores:
-            bucket = int(cand.idx // max(3, len(live_env) // 4))
-            if bucket in seen:
-                continue
-            seen.add(bucket)
-            deduped.append(cand)
-            if len(deduped) >= max(self.dtw_top_k, 5):
-                break
-        for i, cand in enumerate(deduped, start=1):
-            cand.rank = i
-        return deduped
-    def _refine_with_dtw(self, *, live_embed: np.ndarray, candidates: list[_Candidate], live_len: int) -> tuple[float, float, float, int]:
-        if live_embed.size == 0 or self._ref_embed.size == 0:
-            best = candidates[0]
-            return max(0.0, min(1.0, best.embed_score)), 0.0, 0.0, int(best.idx)
-        best_score = -1.0
-        best_cost = 1e9
-        best_coverage = 0.0
-        best_idx = -1
-        for cand in candidates[: self.dtw_top_k]:
-            lo = max(0, cand.idx - max(2, live_len // 8))
-            hi = min(self._ref_embed.shape[0], cand.idx + live_len + max(2, live_len // 8))
-            ref_seg = self._ref_embed[lo:hi]
-            score, cost, coverage = self._constrained_dtw_similarity(live_embed, ref_seg)
-            if score > best_score:
-                best_score = score
-                best_cost = cost
-                best_coverage = coverage
-                best_idx = int(lo)
-        return max(0.0, best_score), float(best_cost), float(best_coverage), best_idx
-    def _constrained_dtw_similarity(self, live: np.ndarray, ref: np.ndarray) -> tuple[float, float, float]:
-        n = int(live.shape[0])
-        m = int(ref.shape[0])
-        if n == 0 or m == 0:
-            return 0.0, 1e9, 0.0
-        band = max(2, int(round(max(n, m) * self.dtw_band_ratio)))
-        dp = np.full((n + 1, m + 1), np.inf, dtype=np.float32)
-        dp[0, 0] = 0.0
-        for i in range(1, n + 1):
-            j0 = max(1, i - band)
-            j1 = min(m, i + band + (m - n if m > n else 0))
-            for j in range(j0, j1 + 1):
-                cost = 1.0 - self._cosine(live[i - 1], ref[j - 1])
-                dp[i, j] = cost + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1])
-        end_j = int(np.argmin(dp[n, 1:])) + 1
-        final_cost = float(dp[n, end_j])
-        path_len = float(n + end_j)
-        mean_cost = final_cost / max(1.0, path_len)
-        score = max(0.0, min(1.0, 1.0 - mean_cost * 1.6))
-        coverage = max(0.0, min(1.0, end_j / max(1, m)))
-        return score, final_cost, coverage
-    def _time_to_ref_idx(self, ref_time_sec: float) -> int:
-        assert self._ref_features is not None
-        hints = self._ref_features.token_time_hints_sec
-        if not hints:
-            return 0
-        idx = bisect_right(hints, float(ref_time_sec)) - 1
-        return max(0, min(idx, len(hints) - 1))
-    def _rhythm_consistency(self, live_onset: np.ndarray, ref_start_idx: int, n: int) -> float:
-        ref_onset = self._ref_onset[ref_start_idx : ref_start_idx + n]
-        if live_onset.size <= 2 or ref_onset.size != live_onset.size:
-            return 0.0
-        live_peaks = np.where(live_onset >= max(1e-6, np.percentile(live_onset, 75)))[0]
-        ref_peaks = np.where(ref_onset >= max(1e-6, np.percentile(ref_onset, 75)))[0]
-        if live_peaks.size == 0 or ref_peaks.size == 0:
-            return 0.0
-        live_gaps = np.diff(live_peaks)
-        ref_gaps = np.diff(ref_peaks)
-        if live_gaps.size == 0 or ref_gaps.size == 0:
-            return 0.55
-        a = float(np.mean(live_gaps))
-        b = float(np.mean(ref_gaps))
-        if max(a, b) <= 1e-6:
-            return 0.0
-        return float(max(0.0, min(1.0, 1.0 - abs(a - b) / max(a, b))))
-    def _boundary_bonus(self, ref_start_idx: int, n: int) -> float:
-        if self._boundary_times.size == 0 or self._ref_times.size == 0:
-            return 0.0
-        center_idx = min(ref_start_idx + max(0, n // 2), len(self._ref_times) - 1)
-        center_time = float(self._ref_times[center_idx])
-        nearest = np.min(np.abs(self._boundary_times - center_time))
-        if nearest > self.boundary_bonus_radius_sec:
-            return 0.0
-        return float(max(0.0, 1.0 - nearest / max(1e-6, self.boundary_bonus_radius_sec)))
-    def _stretch_bonus(self, stretch_factor: float) -> float:
-        diff = abs(float(stretch_factor) - 1.0)
-        return float(max(0.0, 1.0 - diff / 0.12))
-    def _time_warp_1d(self, x: np.ndarray, *, target_len: int, stretch_factor: float) -> np.ndarray:
-        if x.size == 0 or target_len <= 0:
-            return np.zeros((0,), dtype=np.float32)
-        src = np.asarray(x, dtype=np.float32).reshape(-1)
-        src_len = src.shape[0]
-        if src_len == target_len and abs(stretch_factor - 1.0) <= 1e-6:
-            return src
-        mid = (src_len - 1) * 0.5
-        out_pos = np.arange(target_len, dtype=np.float32)
-        base_pos = out_pos * (src_len - 1) / max(1, target_len - 1)
-        warped_pos = mid + (base_pos - mid) / max(1e-6, stretch_factor)
-        warped_pos = np.clip(warped_pos, 0.0, src_len - 1.0)
-        lo = np.floor(warped_pos).astype(np.int32)
-        hi = np.clip(lo + 1, 0, src_len - 1)
-        frac = warped_pos - lo
-        return ((1.0 - frac) * src[lo] + frac * src[hi]).astype(np.float32, copy=False)
-    def _time_warp_2d(self, x: np.ndarray, *, target_len: int, stretch_factor: float) -> np.ndarray:
-        arr = np.asarray(x, dtype=np.float32)
-        if arr.size == 0 or target_len <= 0 or arr.ndim != 2:
-            return np.zeros((target_len, 0), dtype=np.float32)
-        pieces = [self._time_warp_1d(arr[:, i], target_len=target_len, stretch_factor=stretch_factor) for i in range(arr.shape[1])]
-        return np.stack(pieces, axis=1).astype(np.float32, copy=False)
-    def _corr(self, a: np.ndarray, b: np.ndarray) -> float:
-        if a.size == 0 or b.size == 0 or a.size != b.size:
-            return 0.0
-        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-        if denom <= 1e-8:
-            return 0.0
-        return float(max(0.0, min(1.0, (np.dot(a, b) / denom + 1.0) * 0.5)))
-    def _band_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
-        if a.size == 0 or b.size == 0 or a.shape != b.shape:
-            return 0.0
-        diff = np.mean(np.abs(a - b))
-        return float(max(0.0, min(1.0, 1.0 - diff)))
-    def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
-        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-        if denom <= 1e-8:
-            return 0.0
-        return float(max(-1.0, min(1.0, np.dot(a, b) / denom)))
-    def _zscore(self, x: np.ndarray) -> np.ndarray:
-        if x.size == 0:
-            return x
-        mu = float(np.mean(x))
-        sigma = float(np.std(x))
-        if sigma <= 1e-6:
-            return x - mu
-        return (x - mu) / sigma
-    def _zscore_rows(self, x: np.ndarray) -> np.ndarray:
-        if x.size == 0:
-            return x
-        mu = np.mean(x, axis=0, keepdims=True)
-        sigma = np.std(x, axis=0, keepdims=True)
-        sigma = np.where(sigma <= 1e-6, 1.0, sigma)
-        return (x - mu) / sigma
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/audio/reference_audio_analyzer.py`
-
-```python
-from __future__ import annotations
-import numpy as np
-from shadowing.audio.frame_feature_extractor import FrameFeatureExtractor
-from shadowing.audio.reference_audio_features import (
-    ReferenceAudioFeatures,
-    ReferenceAudioFrameFeatures,
-    ReferenceBoundaryHint,
-    ReferenceTokenAcousticTemplate,
-)
-class ReferenceAudioAnalyzer:
-    def __init__(self, frame_size_sec: float = 0.025, hop_sec: float = 0.010, n_bands: int = 6) -> None:
-        self.frame_size_sec = float(frame_size_sec)
-        self.hop_sec = float(hop_sec)
-        self.n_bands = int(n_bands)
-    def analyze(self, *, lesson_id: str, chunks: list, reference_map) -> ReferenceAudioFeatures:
-        if not chunks:
-            return ReferenceAudioFeatures(
-                lesson_id=lesson_id,
-                frame_hop_sec=self.hop_sec,
-                frame_size_sec=self.frame_size_sec,
-                sample_rate=16000,
-            )
-        sample_rate = int(chunks[0].sample_rate)
-        extractor = FrameFeatureExtractor(
-            sample_rate=sample_rate,
-            frame_size_sec=self.frame_size_sec,
-            hop_sec=self.hop_sec,
-            n_bands=self.n_bands,
-        )
-        frames: list[ReferenceAudioFrameFeatures] = []
-        for chunk in chunks:
-            samples = np.asarray(chunk.samples, dtype=np.float32)
-            if samples.ndim == 2:
-                samples = np.mean(samples, axis=1).astype(np.float32, copy=False)
-            features = extractor.process_float_audio(samples, start_time_sec=float(chunk.start_time_sec))
-            for item in features:
-                frames.append(
-                    ReferenceAudioFrameFeatures(
-                        time_sec=float(item.observed_at_sec),
-                        envelope=float(item.envelope),
-                        onset_strength=float(item.onset_strength),
-                        voiced_ratio=float(item.voiced_ratio),
-                        band_energy=list(item.band_energy),
-                        embedding=list(item.embedding),
-                    )
-                )
-        boundaries: list[ReferenceBoundaryHint] = []
-        seen_clause_ids: set[int] = set()
-        seen_sentence_ids: set[int] = set()
-        for token in getattr(reference_map, "tokens", []):
-            clause_id = int(getattr(token, "clause_id", -1))
-            sentence_id = int(getattr(token, "sentence_id", -1))
-            t_start = float(getattr(token, "t_start", 0.0))
-            if clause_id >= 0 and clause_id not in seen_clause_ids:
-                boundaries.append(ReferenceBoundaryHint(time_sec=t_start, kind="clause", weight=1.0))
-                seen_clause_ids.add(clause_id)
-            if sentence_id >= 0 and sentence_id not in seen_sentence_ids:
-                boundaries.append(ReferenceBoundaryHint(time_sec=t_start, kind="sentence", weight=1.2))
-                seen_sentence_ids.add(sentence_id)
-        if frames:
-            onset_values = np.asarray([x.onset_strength for x in frames], dtype=np.float32)
-            if onset_values.size >= 5:
-                threshold = float(np.percentile(onset_values, 85))
-                for idx in range(1, len(frames) - 1):
-                    cur = frames[idx].onset_strength
-                    if cur >= threshold and cur >= frames[idx - 1].onset_strength and cur >= frames[idx + 1].onset_strength:
-                        boundaries.append(ReferenceBoundaryHint(time_sec=float(frames[idx].time_sec), kind="peak", weight=0.7))
-        boundaries.sort(key=lambda x: (x.time_sec, x.kind))
-        token_time_hints_sec = [float(getattr(t, "t_start", 0.0)) for t in getattr(reference_map, "tokens", [])]
-        token_templates = self._build_token_templates(frames, reference_map)
-        total_duration_sec = float(getattr(reference_map, "total_duration_sec", 0.0))
-        return ReferenceAudioFeatures(
-            lesson_id=str(lesson_id),
-            frame_hop_sec=self.hop_sec,
-            frame_size_sec=self.frame_size_sec,
-            sample_rate=sample_rate,
-            frames=frames,
-            boundaries=boundaries,
-            token_time_hints_sec=token_time_hints_sec,
-            token_acoustic_templates=token_templates,
-            total_duration_sec=total_duration_sec,
-        )
-    def _build_token_templates(self, frames: list[ReferenceAudioFrameFeatures], reference_map) -> list[ReferenceTokenAcousticTemplate]:
-        if not frames:
-            return []
-        frame_times = np.asarray([f.time_sec for f in frames], dtype=np.float32)
-        embeddings = np.asarray([f.embedding for f in frames], dtype=np.float32) if frames[0].embedding else np.zeros((len(frames), 0), dtype=np.float32)
-        if embeddings.size == 0:
-            return []
-        templates: list[ReferenceTokenAcousticTemplate] = []
-        for token in getattr(reference_map, "tokens", []):
-            t0 = float(getattr(token, "t_start", 0.0)) - 0.03
-            t1 = float(getattr(token, "t_end", t0 + 0.06)) + 0.03
-            mask = np.where((frame_times >= t0) & (frame_times <= t1))[0]
-            if mask.size == 0:
-                idx = int(np.argmin(np.abs(frame_times - float(getattr(token, "t_start", 0.0)))))
-                mask = np.asarray([idx], dtype=np.int32)
-            emb = np.mean(embeddings[mask], axis=0)
-            norm = float(np.linalg.norm(emb))
-            if norm > 1e-6:
-                emb = emb / norm
-            templates.append(
-                ReferenceTokenAcousticTemplate(
-                    token_idx=int(getattr(token, "idx", len(templates))),
-                    time_sec=float(getattr(token, "t_start", 0.0)),
-                    embedding=emb.astype(np.float32, copy=False).tolist(),
-                )
-            )
-        return templates
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/audio/reference_audio_features.py`
-
-```python
-from __future__ import annotations
-from dataclasses import dataclass, field
-@dataclass(slots=True)
-class ReferenceAudioFrameFeatures:
-    time_sec: float
-    envelope: float
-    onset_strength: float
-    voiced_ratio: float
-    band_energy: list[float]
-    embedding: list[float] = field(default_factory=list)
-@dataclass(slots=True)
-class ReferenceBoundaryHint:
-    time_sec: float
-    kind: str
-    weight: float = 1.0
-@dataclass(slots=True)
-class ReferenceTokenAcousticTemplate:
-    token_idx: int
-    time_sec: float
-    embedding: list[float] = field(default_factory=list)
-@dataclass(slots=True)
-class ReferenceAudioFeatures:
-    lesson_id: str
-    frame_hop_sec: float
-    frame_size_sec: float
-    sample_rate: int
-    frames: list[ReferenceAudioFrameFeatures] = field(default_factory=list)
-    boundaries: list[ReferenceBoundaryHint] = field(default_factory=list)
-    token_time_hints_sec: list[float] = field(default_factory=list)
-    token_acoustic_templates: list[ReferenceTokenAcousticTemplate] = field(default_factory=list)
-    total_duration_sec: float = 0.0
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/audio/reference_audio_store.py`
-
-```python
-from __future__ import annotations
-import json
-from dataclasses import asdict
-from pathlib import Path
-from shadowing.audio.reference_audio_features import (
-    ReferenceAudioFeatures,
-    ReferenceAudioFrameFeatures,
-    ReferenceBoundaryHint,
-    ReferenceTokenAcousticTemplate,
-)
-class ReferenceAudioStore:
-    def __init__(self, base_dir: str) -> None:
-        self.base_dir = Path(base_dir)
-    def _path_for(self, lesson_id: str) -> Path:
-        return self.base_dir / lesson_id / "reference_audio_features.json"
-    def save(self, lesson_id: str, features: ReferenceAudioFeatures) -> str:
-        path = self._path_for(lesson_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(features), ensure_ascii=False, indent=2), encoding="utf-8")
-        return str(path)
-    def exists(self, lesson_id: str) -> bool:
-        return self._path_for(lesson_id).exists()
-    def load(self, lesson_id: str) -> ReferenceAudioFeatures:
-        path = self._path_for(lesson_id)
-        data = json.loads(path.read_text(encoding="utf-8"))
-        frames = [ReferenceAudioFrameFeatures(**item) for item in data.get("frames", [])]
-        boundaries = [ReferenceBoundaryHint(**item) for item in data.get("boundaries", [])]
-        token_templates = [ReferenceTokenAcousticTemplate(**item) for item in data.get("token_acoustic_templates", [])]
-        return ReferenceAudioFeatures(
-            lesson_id=str(data["lesson_id"]),
-            frame_hop_sec=float(data.get("frame_hop_sec", 0.010)),
-            frame_size_sec=float(data.get("frame_size_sec", 0.025)),
-            sample_rate=int(data.get("sample_rate", 16000)),
-            frames=frames,
-            boundaries=boundaries,
-            token_time_hints_sec=[float(x) for x in data.get("token_time_hints_sec", [])],
-            token_acoustic_templates=token_templates,
-            total_duration_sec=float(data.get("total_duration_sec", 0.0)),
-        )
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/progress/audio_aware_progress_estimator.py`
-
-```python
-from __future__ import annotations
-from shadowing.progress.behavior_interpreter import BehaviorInterpreter
-from shadowing.types import ProgressEstimate, ReferenceMap, SignalQuality, TrackingMode, TrackingSnapshot, UserReadState
-class AudioAwareProgressEstimator:
-    def __init__(
-        self,
-        recent_progress_sec: float = 0.90,
-        active_speaking_signal_min: float = 0.45,
-        min_tracking_for_follow: float = 0.58,
-        audio_takeover_confidence: float = 0.66,
-        audio_retain_confidence: float = 0.56,
-        max_audio_pull_sec: float = 1.2,
-    ) -> None:
-        self.recent_progress_sec = float(recent_progress_sec)
-        self.active_speaking_signal_min = float(active_speaking_signal_min)
-        self.min_tracking_for_follow = float(min_tracking_for_follow)
-        self.audio_takeover_confidence = float(audio_takeover_confidence)
-        self.audio_retain_confidence = float(audio_retain_confidence)
-        self.max_audio_pull_sec = float(max_audio_pull_sec)
-        self.behavior_interpreter = BehaviorInterpreter(recent_progress_sec=recent_progress_sec)
-        self._ref_map: ReferenceMap | None = None
-        self._estimated_idx_f = 0.0
-        self._last_progress_at_sec = 0.0
-        self._last_event_at_sec = 0.0
-        self._last_velocity = 0.0
-        self._last_estimated_idx_at_progress = 0.0
-        self._last_tracking: TrackingSnapshot | None = None
-        self._last_snapshot: ProgressEstimate | None = None
-        self._force_reacquire_until_sec = 0.0
-        self._last_audio_progress_at_sec = 0.0
-    def reset(self, reference_map: ReferenceMap, start_idx: int = 0) -> None:
-        self._ref_map = reference_map
-        start_idx = max(0, min(int(start_idx), max(0, len(reference_map.tokens) - 1)))
-        self._estimated_idx_f = float(start_idx)
-        self._last_progress_at_sec = 0.0
-        self._last_event_at_sec = 0.0
-        self._last_velocity = 0.0
-        self._last_estimated_idx_at_progress = float(start_idx)
-        self._last_tracking = None
-        self._last_snapshot = None
-        self._force_reacquire_until_sec = 0.0
-        self._last_audio_progress_at_sec = 0.0
-    def on_playback_generation_changed(self, now_sec: float) -> None:
-        self._force_reacquire_until_sec = float(now_sec) + 0.80
-    def update(self, *, tracking: TrackingSnapshot | None, audio_match, audio_behavior, signal_quality: SignalQuality | None, now_sec: float) -> ProgressEstimate | None:
-        if self._ref_map is None or not self._ref_map.tokens:
-            return None
-        if tracking is not None:
-            self._last_tracking = tracking
-            self._last_event_at_sec = float(tracking.emitted_at_sec)
-        current_idx = int(round(self._estimated_idx_f))
-        text_candidate_idx = current_idx
-        text_committed_idx = current_idx
-        text_quality = 0.0
-        text_conf = 0.0
-        text_stable = False
-        tracking_mode = TrackingMode.BOOTSTRAP
-        if tracking is not None:
-            text_candidate_idx = int(tracking.candidate_ref_idx)
-            text_committed_idx = int(tracking.committed_ref_idx)
-            text_quality = float(tracking.tracking_quality.overall_score)
-            text_conf = float(tracking.confidence)
-            text_stable = bool(tracking.stable)
-            tracking_mode = tracking.tracking_mode
-        audio_idx = current_idx
-        audio_conf = 0.0
-        audio_time_sec = None
-        repeated = 0.0
-        reentry = 0.0
-        still_following = 0.0
-        if audio_match is not None:
-            audio_idx = max(0, min(int(getattr(audio_match, "estimated_ref_idx_hint", current_idx)), len(self._ref_map.tokens) - 1))
-            audio_conf = float(getattr(audio_match, "confidence", 0.0))
-            audio_time_sec = float(getattr(audio_match, "estimated_ref_time_sec", 0.0))
-            repeated = float(getattr(audio_match, "repeated_pattern_score", 0.0))
-        if audio_behavior is not None:
-            audio_conf = max(audio_conf, float(getattr(audio_behavior, "confidence", 0.0)) * 0.96)
-            still_following = float(getattr(audio_behavior, "still_following_likelihood", 0.0))
-            repeated = max(repeated, float(getattr(audio_behavior, "repeated_likelihood", 0.0)))
-            reentry = float(getattr(audio_behavior, "reentry_likelihood", 0.0))
-        target_idx = float(max(current_idx, text_committed_idx))
-        position_source = "text"
-        if tracking is not None:
-            weight = self._weight_for_tracking(tracking)
-            target_idx = max(target_idx, (1.0 - weight) * self._estimated_idx_f + weight * float(max(text_candidate_idx, text_committed_idx)))
-            if tracking.tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED) and tracking.local_match_ratio >= 0.68 and text_candidate_idx > current_idx:
-                target_idx = max(target_idx, float(current_idx) + 0.60)
-        audio_can_assist = bool(audio_conf >= self.audio_retain_confidence and still_following >= 0.58 and repeated < 0.82)
-        audio_can_takeover = bool(audio_conf >= self.audio_takeover_confidence and still_following >= 0.64 and (tracking is None or text_quality < 0.56 or tracking_mode in (TrackingMode.REACQUIRING, TrackingMode.LOST)))
-        if audio_can_assist:
-            audio_push = max(0, audio_idx - current_idx)
-            if audio_push > 0:
-                target_idx = max(target_idx, float(current_idx) + min(2.0, 0.45 + 0.35 * min(audio_push, 4)))
-                self._last_audio_progress_at_sec = float(now_sec)
-                position_source = "joint"
-        if audio_can_takeover:
-            target_idx = max(target_idx, float(audio_idx))
-            self._last_audio_progress_at_sec = float(now_sec)
-            position_source = "audio"
-        estimated_idx = max(0, min(int(round(target_idx)), len(self._ref_map.tokens) - 1))
-        progressed = estimated_idx > current_idx
-        if progressed:
-            if self._last_progress_at_sec > 0.0 and now_sec > self._last_progress_at_sec:
-                dt = max(1e-6, now_sec - self._last_progress_at_sec)
-                self._last_velocity = (estimated_idx - self._last_estimated_idx_at_progress) / dt
-            self._last_progress_at_sec = float(now_sec)
-            self._last_estimated_idx_at_progress = float(estimated_idx)
-        self._estimated_idx_f = float(estimated_idx)
-        self._last_snapshot = self._render_snapshot(now_sec=now_sec, signal_quality=signal_quality, audio_conf=audio_conf, still_following=still_following, reentry=reentry, position_source=position_source)
-        return self._last_snapshot
-    def snapshot(self, *, now_sec: float, signal_quality: SignalQuality | None, audio_match=None, audio_behavior=None) -> ProgressEstimate | None:
-        if self._ref_map is None or not self._ref_map.tokens:
-            return None
-        audio_conf = 0.0
-        still_following = 0.0
-        reentry = 0.0
-        position_source = "text"
-        if audio_match is not None:
-            audio_conf = float(getattr(audio_match, "confidence", 0.0))
-        if audio_behavior is not None:
-            audio_conf = max(audio_conf, float(getattr(audio_behavior, "confidence", 0.0)) * 0.96)
-            still_following = float(getattr(audio_behavior, "still_following_likelihood", 0.0))
-            reentry = float(getattr(audio_behavior, "reentry_likelihood", 0.0))
-            if audio_conf >= self.audio_retain_confidence:
-                position_source = "joint"
-        self._last_snapshot = self._render_snapshot(now_sec=now_sec, signal_quality=signal_quality, audio_conf=audio_conf, still_following=still_following, reentry=reentry, position_source=position_source)
-        return self._last_snapshot
-    def _weight_for_tracking(self, tracking: TrackingSnapshot) -> float:
-        if tracking.tracking_mode == TrackingMode.LOCKED:
-            return 0.82 if tracking.stable else 0.68
-        if tracking.tracking_mode == TrackingMode.WEAK_LOCKED:
-            return 0.42
-        if tracking.tracking_mode == TrackingMode.REACQUIRING:
-            return 0.16
-        return 0.05
-    def _render_snapshot(self, *, now_sec: float, signal_quality: SignalQuality | None, audio_conf: float, still_following: float, reentry: float, position_source: str) -> ProgressEstimate:
-        assert self._ref_map is not None
-        tracking = self._last_tracking
-        estimated_idx = max(0, min(int(round(self._estimated_idx_f)), len(self._ref_map.tokens) - 1))
-        estimated_ref_time_sec = float(self._ref_map.tokens[estimated_idx].t_start)
-        progress_age = 9999.0
-        if self._last_progress_at_sec > 0.0:
-            progress_age = max(0.0, now_sec - self._last_progress_at_sec)
-        if self._last_audio_progress_at_sec > 0.0 and audio_conf >= self.audio_retain_confidence:
-            progress_age = min(progress_age, max(0.0, now_sec - self._last_audio_progress_at_sec))
-        recently_progressed = progress_age <= self.recent_progress_sec
-        signal_speaking = False
-        if signal_quality is not None:
-            signal_speaking = signal_quality.vad_active or signal_quality.speaking_likelihood >= self.active_speaking_signal_min
-        tracking_mode = TrackingMode.BOOTSTRAP
-        tracking_quality = 0.0
-        confidence = 0.0
-        stable = False
-        source_candidate_ref_idx = estimated_idx
-        source_committed_ref_idx = estimated_idx
-        event_emitted_at_sec = self._last_event_at_sec
-        if tracking is not None:
-            tracking_mode = tracking.tracking_mode
-            tracking_quality = tracking.tracking_quality.overall_score
-            confidence = tracking.confidence
-            stable = tracking.stable
-            source_candidate_ref_idx = tracking.candidate_ref_idx
-            source_committed_ref_idx = tracking.committed_ref_idx
-        if now_sec <= self._force_reacquire_until_sec:
-            tracking_mode = TrackingMode.REACQUIRING
-            tracking_quality = min(tracking_quality, 0.55)
-        active_speaking = False
-        if recently_progressed:
-            active_speaking = True
-        elif signal_speaking and tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED):
-            active_speaking = True
-        elif signal_speaking and tracking_quality >= 0.70:
-            active_speaking = True
-        elif audio_conf >= self.audio_retain_confidence and (still_following >= 0.62 or reentry >= 0.58):
-            active_speaking = True
-        joint_conf = max(confidence, 0.55 * confidence + 0.45 * audio_conf, 0.52 * tracking_quality + 0.48 * audio_conf)
-        if audio_conf >= self.audio_takeover_confidence and joint_conf < audio_conf:
-            joint_conf = 0.92 * audio_conf
-        user_state = self.behavior_interpreter.infer(
-            progress_age=progress_age,
-            signal_quality=signal_quality,
-            tracking=tracking,
-            tracking_mode=tracking_mode,
-            tracking_quality=max(tracking_quality, audio_conf * 0.82),
-            candidate_idx=max(source_candidate_ref_idx, estimated_idx),
-            estimated_idx=estimated_idx,
-        )
-        if audio_conf >= self.audio_takeover_confidence and still_following >= 0.62 and user_state in (UserReadState.NOT_STARTED, UserReadState.PAUSED):
-            user_state = UserReadState.FOLLOWING
-        return ProgressEstimate(
-            estimated_ref_idx=estimated_idx,
-            estimated_ref_time_sec=estimated_ref_time_sec,
-            progress_velocity_idx_per_sec=float(self._last_velocity),
-            event_emitted_at_sec=float(event_emitted_at_sec),
-            last_progress_at_sec=float(self._last_progress_at_sec),
-            progress_age_sec=float(progress_age),
-            source_candidate_ref_idx=int(source_candidate_ref_idx),
-            source_committed_ref_idx=int(source_committed_ref_idx),
-            tracking_mode=tracking_mode,
-            tracking_quality=float(max(tracking_quality, audio_conf * 0.72 if position_source != "text" else tracking_quality)),
-            stable=bool(stable),
-            confidence=float(max(confidence, audio_conf * 0.80 if position_source == "audio" else confidence)),
-            active_speaking=bool(active_speaking),
-            recently_progressed=bool(recently_progressed),
-            user_state=user_state,
-            audio_confidence=float(audio_conf),
-            joint_confidence=float(max(0.0, min(1.0, joint_conf))),
-            position_source=str(position_source),
-            audio_support_strength=float(max(still_following, reentry, audio_conf)),
-        )
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/realtime/capture/device_utils.py`
-
-```python
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any
-import sounddevice as sd
-@dataclass(slots=True)
-class InputDeviceInfo:
-    index: int
-    name: str
-    max_input_channels: int
-    default_samplerate: float
-    hostapi_name: str
-def list_input_devices() -> list[InputDeviceInfo]:
-    devices = sd.query_devices()
-    hostapis = sd.query_hostapis()
-    results: list[InputDeviceInfo] = []
-    for idx, dev in enumerate(devices):
-        max_in = int(dev["max_input_channels"])
-        if max_in <= 0:
-            continue
-        hostapi_name = hostapis[int(dev["hostapi"])]["name"]
-        results.append(
-            InputDeviceInfo(
-                index=int(idx),
-                name=str(dev["name"]),
-                max_input_channels=max_in,
-                default_samplerate=float(dev["default_samplerate"]),
-                hostapi_name=str(hostapi_name),
-            )
-        )
-    return results
-def print_input_devices() -> None:
-    devices = list_input_devices()
-    if not devices:
-        return
-    for d in devices:
-def get_default_input_device_index() -> int | None:
-    default_input, _ = sd.default.device
-    if default_input is None or int(default_input) < 0:
-        return None
-    return int(default_input)
-def choose_input_device(preferred_index: int | None = None, preferred_name_substring: str | None = None) -> int | None:
-    devices = list_input_devices()
-    if not devices:
-        return None
-    if preferred_index is not None:
-        for d in devices:
-            if d.index == preferred_index:
-                return d.index
-    if preferred_name_substring:
-        keyword = preferred_name_substring.lower().strip()
-        for d in devices:
-            if keyword and keyword in d.name.lower():
-                return d.index
-    default_idx = get_default_input_device_index()
-    if default_idx is not None:
-        return default_idx
-    return devices[0].index
-def check_input_settings(device: int | None, samplerate: int, channels: int = 1, dtype: str = "float32") -> bool:
-    try:
-        sd.check_input_settings(device=device, samplerate=int(samplerate), channels=int(channels), dtype=str(dtype))
-        return True
-    except Exception:
-        return False
-def pick_working_input_config(preferred_device: int | None = None, preferred_name_substring: str | None = None, preferred_rates: list[int] | None = None, channels: int = 1, dtype: str = "float32") -> dict[str, Any] | None:
-    preferred_rates = preferred_rates or [48000, 44100, 16000]
-    device = choose_input_device(preferred_index=preferred_device, preferred_name_substring=preferred_name_substring)
-    if device is None:
-        return None
-    for sr in preferred_rates:
-        if int(sr) <= 0:
-            continue
-        if check_input_settings(device=device, samplerate=int(sr), channels=int(channels), dtype=str(dtype)):
-            return {"device": int(device), "samplerate": int(sr), "channels": int(channels), "dtype": str(dtype)}
-    return None
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/realtime/capture/soundcard_recorder.py`
-
-```python
-from __future__ import annotations
-import threading
-import time
-from collections.abc import Callable
-import numpy as np
-import pythoncom
-import soundcard as sc
-from shadowing.interfaces.recorder import Recorder
-from shadowing.realtime.capture.resampler import AudioResampler
-class SoundCardRecorder(Recorder):
-    def __init__(
-        self,
-        sample_rate_in: int,
-        target_sample_rate: int,
-        channels: int = 1,
-        device: int | str | None = None,
-        block_frames: int = 1440,
-        include_loopback: bool = False,
-        debug_level_meter: bool = False,
-        debug_level_every_n_blocks: int = 20,
-    ) -> None:
-        self.sample_rate_in = int(sample_rate_in)
-        self.target_sample_rate = int(target_sample_rate)
-        self.channels = int(channels)
-        self.device = device
-        self.block_frames = max(128, int(block_frames))
-        self.include_loopback = bool(include_loopback)
-        self.debug_level_meter = bool(debug_level_meter)
-        self.debug_level_every_n_blocks = max(1, int(debug_level_every_n_blocks))
-        self._callback: Callable[[bytes], None] | None = None
-        self._mic = None
-        self._thread: threading.Thread | None = None
-        self._running = False
-        self._opened_channels: int | None = None
-        self._opened_samplerate: int | None = None
-        self._debug_counter = 0
-        self._resampler: AudioResampler | None = None
-        self._last_error: Exception | None = None
-    def start(self, on_audio_frame: Callable[[bytes], None]) -> None:
-        if self._running:
-            return
-        self._callback = on_audio_frame
-        self._mic = self._resolve_microphone(self.device, self.include_loopback)
-        open_candidates = self._build_open_candidates()
-        last_error: Exception | None = None
-        for sr, ch in open_candidates:
-            try:
-                with self._mic.recorder(samplerate=sr, channels=ch) as rec:
-                    _ = rec.record(numframes=min(self.block_frames, 256))
-                self._opened_samplerate = int(sr)
-                self._opened_channels = int(ch)
-                self._resampler = AudioResampler(src_rate=self._opened_samplerate, dst_rate=self.target_sample_rate)
-                last_error = None
-                break
-            except Exception as e:
-                last_error = e
-        if last_error is not None or self._opened_samplerate is None or self._opened_channels is None:
-            msg = str(last_error)
-            if "0x80070005" in msg:
-                raise RuntimeError(
-                    "Failed to open microphone with soundcard: access denied (0x80070005). Please enable Windows microphone privacy permissions and close apps using the mic."
-                )
-            raise RuntimeError(f"Failed to open microphone with soundcard. device={self.device!r}, last_error={last_error}")
-        self._running = True
-        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self._thread.start()
-    def stop(self) -> None:
-        self._running = False
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        self._thread = None
-    def close(self) -> None:
-        self.stop()
-    def _capture_loop(self) -> None:
-        assert self._mic is not None
-        assert self._callback is not None
-        assert self._opened_samplerate is not None
-        assert self._opened_channels is not None
-        pythoncom.CoInitialize()
-        try:
-            with self._mic.recorder(samplerate=self._opened_samplerate, channels=self._opened_channels) as rec:
-                while self._running:
-                    data = rec.record(numframes=self.block_frames)
-                    if data is None:
-                        time.sleep(0.005)
-                        continue
-                    audio = np.asarray(data, dtype=np.float32)
-                    if audio.ndim == 1:
-                        audio = audio[:, None]
-                    if audio.shape[1] > 1:
-                        audio = np.mean(audio, axis=1, keepdims=True)
-                    mono = np.squeeze(audio, axis=1).astype(np.float32, copy=False)
-                    self._debug_counter += 1
-                    if self.debug_level_meter and (self._debug_counter <= 3 or self._debug_counter % self.debug_level_every_n_blocks == 0):
-                        _rms = float(np.sqrt(np.mean(np.square(mono)))) if mono.size else 0.0
-                        _peak = float(np.max(np.abs(mono))) if mono.size else 0.0
-                    if self._resampler is None:
-                        raise RuntimeError("SoundCardRecorder resampler is not initialized.")
-                    pcm16_bytes = self._resampler.process_float_mono(mono)
-                    self._callback(pcm16_bytes)
-        except Exception as e:
-            self._last_error = e
-        finally:
-            pythoncom.CoUninitialize()
-            self._running = False
-    def _build_open_candidates(self) -> list[tuple[int, int]]:
-        candidates: list[tuple[int, int]] = []
-        candidate_srs: list[int] = []
-        for sr in [self.sample_rate_in, 48000, 44100, 16000]:
-            if sr > 0 and sr not in candidate_srs:
-                candidate_srs.append(sr)
-        candidate_channels: list[int] = []
-        for ch in [1, self.channels, 2]:
-            if ch > 0 and ch not in candidate_channels:
-                candidate_channels.append(ch)
-        for sr in candidate_srs:
-            for ch in candidate_channels:
-                candidates.append((int(sr), int(ch)))
-        return candidates
-    def _resolve_microphone(self, device: int | str | None, include_loopback: bool):
-        mics = list(sc.all_microphones(include_loopback=include_loopback))
-        if not mics:
-            raise RuntimeError("No microphones found via soundcard.")
-        if device is None:
-            default_mic = sc.default_microphone()
-            if default_mic is None:
-                raise RuntimeError("No default microphone found via soundcard.")
-            return default_mic
-        if isinstance(device, int):
-            if 0 <= device < len(mics):
-                return mics[device]
-            raise ValueError(
-                f"Soundcard microphone index out of range: {device}. Valid range is 0..{len(mics) - 1}. Note: soundcard backend uses its own microphone list index, not sounddevice raw device index."
-            )
-        key = str(device).strip().lower()
-        if key.isdigit():
-            idx = int(key)
-            if 0 <= idx < len(mics):
-                return mics[idx]
-            raise ValueError(
-                f"Soundcard microphone index out of range: {idx}. Valid range is 0..{len(mics) - 1}. Note: soundcard backend uses its own microphone list index, not sounddevice raw device index."
-            )
-        for mic in mics:
-            if key in mic.name.lower():
-                return mic
-        raise ValueError(
-            f"No matching microphone found for {device!r}. For soundcard backend, pass either a soundcard microphone list index or a device name substring."
-        )
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/realtime/orchestrator.py`
-
-```python
-from __future__ import annotations
-import json
-import queue
-import time
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any
-from shadowing.adaptation.profile_store import ProfileStore
-from shadowing.adaptation.runtime_auto_tuner import RuntimeAutoTuner
-from shadowing.audio.device_profile import DeviceProfile, build_device_profile
-from shadowing.audio.frame_feature_extractor import FrameFeatureExtractor
-from shadowing.audio.latency_calibrator import LatencyCalibrator
-from shadowing.audio.reference_audio_store import ReferenceAudioStore
-from shadowing.observation.signal_quality import SignalQualityMonitor
-from shadowing.progress.audio_aware_progress_estimator import AudioAwareProgressEstimator
-from shadowing.realtime.asr.normalizer import TextNormalizer
-from shadowing.realtime.sync_evidence import SyncEvidenceBuilder
-from shadowing.telemetry.event_logger import EventLogger
-from shadowing.telemetry.metrics import MetricsAggregator
-from shadowing.tracking.tracking_engine import TrackingEngine
-from shadowing.types import AsrEventType, PlaybackState, PlayerCommand, PlayerCommandType, ReferenceMap
-@dataclass(slots=True)
-class OrchestratorStats:
-    audio_enqueued: int = 0
-    audio_dropped: int = 0
-    audio_q_high_watermark: int = 0
-    raw_asr_events: int = 0
-    normalized_asr_events: int = 0
-    ticks: int = 0
-    asr_frames_fed: int = 0
-    asr_frames_skipped: int = 0
-    asr_gate_open_count: int = 0
-    asr_gate_close_count: int = 0
-    asr_resets_from_silence: int = 0
-class ShadowingOrchestrator:
-    def __init__(
-        self,
-        *,
-        repo,
-        player,
-        recorder,
-        asr,
-        aligner,
-        controller,
-        device_context: dict[str, Any] | None = None,
-        signal_monitor: SignalQualityMonitor | None = None,
-        latency_calibrator: LatencyCalibrator | None = None,
-        auto_tuner: RuntimeAutoTuner | None = None,
-        profile_store: ProfileStore | None = None,
-        event_logger: EventLogger | None = None,
-        reference_audio_store: ReferenceAudioStore | None = None,
-        live_audio_matcher=None,
-        audio_behavior_classifier=None,
-        evidence_fuser=None,
-        audio_queue_maxsize: int = 150,
-        asr_event_queue_maxsize: int = 64,
-        loop_interval_sec: float = 0.03,
-        debug: bool = False,
-    ) -> None:
-        self.repo = repo
-        self.player = player
-        self.recorder = recorder
-        self.asr = asr
-        self.aligner = aligner
-        self.controller = controller
-        self.device_context = dict(device_context or {})
-        self.signal_monitor = signal_monitor or SignalQualityMonitor()
-        self.latency_calibrator = latency_calibrator or LatencyCalibrator()
-        self.auto_tuner = auto_tuner or RuntimeAutoTuner()
-        self.profile_store = profile_store
-        self.event_logger = event_logger
-        self.reference_audio_store = reference_audio_store
-        self.live_audio_matcher = live_audio_matcher
-        self.audio_behavior_classifier = audio_behavior_classifier
-        self.evidence_fuser = evidence_fuser
-        self.audio_queue: queue.Queue[tuple[float, bytes]] = queue.Queue(maxsize=max(16, int(audio_queue_maxsize)))
-        self.loop_interval_sec = float(loop_interval_sec)
-        self.debug = bool(debug)
-        self.normalizer = TextNormalizer()
-        self.tracking_engine = TrackingEngine(self.aligner, debug=debug)
-        self.progress_estimator = AudioAwareProgressEstimator()
-        self.metrics = MetricsAggregator()
-        self.stats = OrchestratorStats()
-        self.sync_builder = SyncEvidenceBuilder()
-        self._lesson_id: str | None = None
-        self._ref_map: ReferenceMap | None = None
-        self._running = False
-        self._last_generation = -1
-        self._last_tracking_mode = None
-        self._last_gain_sent: float | None = None
-        self._last_control_action_key: tuple[str, str] | None = None
-        self._device_profile: DeviceProfile | None = None
-        self._warm_start: dict[str, Any] = {}
-        self._session_started_at_sec = 0.0
-        self._asr_gate_open = False
-        self._asr_gate_last_open_at_sec = 0.0
-        self._asr_gate_last_close_at_sec = 0.0
-        self._last_human_voice_like_at_sec = 0.0
-        self._last_asr_reset_at_sec = 0.0
-        self._speech_open_rms = 0.010
-        self._speech_keep_rms = 0.0065
-        self._speech_open_peak = 0.030
-        self._speech_keep_peak = 0.018
-        self._speech_open_likelihood = 0.58
-        self._speech_keep_likelihood = 0.42
-        self._speech_tail_hold_sec = 0.38
-        self._asr_reset_after_silence_sec = 1.60
-        self._asr_reset_cooldown_sec = 1.20
-        self._reference_audio_features = None
-        self._latest_audio_match = None
-        self._latest_audio_behavior = None
-        self._latest_fusion_evidence = None
-        self._last_audio_recentering_at_sec = 0.0
-        target_sr = 16000
-        try:
-            target_sr = int(getattr(self.asr, "sample_rate", 16000))
-        except Exception:
-            pass
-        self._audio_feature_extractor = FrameFeatureExtractor(sample_rate=target_sr)
-        _ = asr_event_queue_maxsize
-    def configure_runtime(self, runtime_cfg: dict[str, Any]) -> None:
-        if "loop_interval_sec" in runtime_cfg:
-            self.loop_interval_sec = float(runtime_cfg["loop_interval_sec"])
-    def configure_debug(self, debug_cfg: dict[str, Any]) -> None:
-        self.debug = bool(debug_cfg.get("enabled", self.debug))
-        self.tracking_engine.debug = self.debug
-    def start_session(self, lesson_id: str) -> None:
-        self._lesson_id = lesson_id
-        self._ref_map = self.repo.load_reference_map(lesson_id)
-        self.metrics = MetricsAggregator()
-        self.stats = OrchestratorStats()
-        self._warm_start = {}
-        self.tracking_engine.reset(self._ref_map)
-        self.progress_estimator.reset(self._ref_map, start_idx=0)
-        self.controller.reset()
-        self._audio_feature_extractor.reset()
-        while True:
-            try:
-                self.audio_queue.get_nowait()
-            except queue.Empty:
-                break
-        chunks = self.repo.load_audio_chunks(lesson_id)
-        self.player.load_chunks(chunks)
-        self._session_started_at_sec = time.monotonic()
-        self.sync_builder.reset(self._session_started_at_sec)
-        self.metrics.mark_session_started(self._session_started_at_sec)
-        self._last_generation = -1
-        self._last_tracking_mode = None
-        self._last_gain_sent = None
-        self._last_control_action_key = None
-        self._asr_gate_open = False
-        self._asr_gate_last_open_at_sec = 0.0
-        self._asr_gate_last_close_at_sec = self._session_started_at_sec
-        self._last_human_voice_like_at_sec = 0.0
-        self._last_asr_reset_at_sec = 0.0
-        self._latest_audio_match = None
-        self._latest_audio_behavior = None
-        self._latest_fusion_evidence = None
-        self._last_audio_recentering_at_sec = 0.0
-        output_sr = chunks[0].sample_rate if chunks else 44100
-        self._device_profile = self._build_initial_device_profile(output_sr)
-        bluetooth_mode = self._is_bluetooth_mode()
-        self.latency_calibrator.reset(self._device_profile)
-        self.auto_tuner.reset(self._device_profile.reliability_tier, bluetooth_mode=bluetooth_mode)
-        if self.profile_store is not None and self._device_profile is not None:
-            self._warm_start = self.profile_store.load_warm_start(
-                input_device_id=self._device_profile.input_device_id,
-                output_device_id=self._device_profile.output_device_id,
-                hostapi_name=str(self.device_context.get("hostapi_name", "")),
-                capture_backend=str(self.device_context.get("capture_backend", "")),
-                duplex_sample_rate=int(self.device_context.get("input_sample_rate", 0)),
-                reliability_tier=self._device_profile.reliability_tier,
-                bluetooth_mode=bluetooth_mode,
-            )
-            self.auto_tuner.apply_warm_start(controller_policy=self.controller.policy, player=self.player, signal_monitor=self.signal_monitor, warm_start=self._warm_start)
-        if self.reference_audio_store is not None and self.live_audio_matcher is not None:
-            try:
-                self._reference_audio_features = self.reference_audio_store.load(lesson_id)
-            except Exception:
-                self._reference_audio_features = None
-            if self._reference_audio_features is not None:
-                self.live_audio_matcher.reset(self._reference_audio_features, self._ref_map)
-        if self.audio_behavior_classifier is not None:
-            self.audio_behavior_classifier.reset()
-        if self.evidence_fuser is not None:
-            self.evidence_fuser.reset()
-        try:
-            self.asr.start()
-            self.recorder.start(self._on_audio_frame)
-            self.player.start()
-        except Exception:
-            self._safe_close_startup_resources()
-            raise
-        self._running = True
-    def stop_session(self) -> None:
-        if not self._running:
-            return
-        self._running = False
-        try:
-            self.recorder.stop()
-        except Exception:
-            pass
-        try:
-            self.asr.close()
-        except Exception:
-            pass
-        try:
-            self.player.stop()
-        except Exception:
-            pass
-        self._persist_session_profile()
-        self._persist_summary()
-        try:
-            self.player.close()
-        except Exception:
-            pass
-        try:
-            self.recorder.close()
-        except Exception:
-            pass
-    def tick(self) -> None:
-        if not self._running:
-            return
-        self.stats.ticks += 1
-        self._drain_audio_queue()
-        now_sec = time.monotonic()
-        signal_snapshot = self.signal_monitor.snapshot(now_sec)
-        if signal_snapshot.vad_active or signal_snapshot.speaking_likelihood >= 0.48:
-            self.metrics.observe_signal_active(now_sec)
-        playback_status = self.player.get_status()
-        if playback_status.generation != self._last_generation:
-            self._last_generation = playback_status.generation
-            self.tracking_engine.on_playback_generation_changed(playback_status.generation)
-            self.progress_estimator.on_playback_generation_changed(now_sec)
-        raw_events = self.asr.poll_raw_events()
-        self.stats.raw_asr_events += len(raw_events)
-        last_tracking = None
-        for raw_event in raw_events:
-            if raw_event.event_type == AsrEventType.PARTIAL:
-                self.metrics.observe_asr_partial(raw_event.emitted_at_sec)
-            event = self.normalizer.normalize_raw_event(raw_event)
-            if event is None:
-                continue
-            self.stats.normalized_asr_events += 1
-            tracking = self.tracking_engine.update(event)
-            last_tracking = tracking
-            if tracking is None:
-                continue
-            if self._last_tracking_mode != tracking.tracking_mode:
-                self.metrics.observe_tracking_mode(tracking.tracking_mode.value)
-                self._last_tracking_mode = tracking.tracking_mode
-            if self.event_logger is not None:
-                self.event_logger.log(
-                    "tracking_snapshot",
-                    {
-                        "candidate_ref_idx": tracking.candidate_ref_idx,
-                        "committed_ref_idx": tracking.committed_ref_idx,
-                        "candidate_ref_time_sec": tracking.candidate_ref_time_sec,
-                        "tracking_mode": tracking.tracking_mode.value,
-                        "overall_score": tracking.tracking_quality.overall_score,
-                        "observation_score": tracking.tracking_quality.observation_score,
-                        "temporal_consistency_score": tracking.tracking_quality.temporal_consistency_score,
-                        "anchor_score": tracking.tracking_quality.anchor_score,
-                        "is_reliable": tracking.tracking_quality.is_reliable,
-                        "confidence": tracking.confidence,
-                        "stable": tracking.stable,
-                        "local_match_ratio": tracking.local_match_ratio,
-                        "repeat_penalty": tracking.repeat_penalty,
-                        "monotonic_consistency": tracking.monotonic_consistency,
-                        "anchor_consistency": tracking.anchor_consistency,
-                        "matched_text": tracking.matched_text,
-                        "emitted_at_sec": tracking.emitted_at_sec,
-                    },
-                    ts_monotonic_sec=tracking.emitted_at_sec,
-                    session_tick=self.stats.ticks,
-                )
-        audio_match = None
-        if self.live_audio_matcher is not None:
-            progress_hint = None if self.progress_estimator._last_snapshot is None else float(self.progress_estimator._last_snapshot.estimated_ref_time_sec)
-            text_conf = 0.0 if self.progress_estimator._last_snapshot is None else float(self.progress_estimator._last_snapshot.tracking_quality)
-            audio_match = self.live_audio_matcher.snapshot(now_sec=now_sec, progress_hint_ref_time_sec=progress_hint, playback_ref_time_sec=float(playback_status.t_ref_heard_content_sec), text_tracking_confidence=text_conf)
-            self._latest_audio_match = audio_match
-        audio_behavior = None
-        if self.audio_behavior_classifier is not None:
-            audio_behavior = self.audio_behavior_classifier.update(audio_match=audio_match, signal_quality=signal_snapshot, progress=self.progress_estimator._last_snapshot, playback_status=playback_status)
-            self._latest_audio_behavior = audio_behavior
-        progress = self.progress_estimator.update(tracking=last_tracking, audio_match=audio_match, audio_behavior=audio_behavior, signal_quality=signal_snapshot, now_sec=now_sec)
-        if progress is None:
-            progress = self.progress_estimator.snapshot(now_sec=now_sec, signal_quality=signal_snapshot, audio_match=audio_match, audio_behavior=audio_behavior)
-        if progress is not None:
-            is_reliable = bool(progress.joint_confidence >= self.controller.policy.min_confidence and progress.tracking_quality >= self.controller.policy.tracking_quality_hold_min)
-            self.metrics.observe_progress(now_sec=now_sec, tracking_quality=progress.tracking_quality, is_reliable=is_reliable)
-        fusion_evidence = None
-        if self.evidence_fuser is not None:
-            fusion_evidence = self.evidence_fuser.fuse(now_sec=now_sec, tracking=last_tracking, progress=progress, audio_match=audio_match, audio_behavior=audio_behavior, signal_quality=signal_snapshot, playback_status=playback_status)
-            self._latest_fusion_evidence = fusion_evidence
-        self._maybe_recenter_from_audio(now_sec=now_sec, fusion_evidence=fusion_evidence)
-        sync_evidence = self.sync_builder.build(now_sec=now_sec, signal_quality=signal_snapshot, progress=progress, fusion_evidence=fusion_evidence, bluetooth_mode=self._is_bluetooth_mode())
-        if progress is not None:
-            self.latency_calibrator.observe_sync(
-                playback_ref_time_sec=playback_status.t_ref_heard_content_sec,
-                user_ref_time_sec=progress.estimated_ref_time_sec,
-                tracking_quality=progress.tracking_quality,
-                stable=progress.stable,
-                active_speaking=progress.active_speaking,
-                allow_observation=sync_evidence.allow_latency_observation,
-            )
-        playback_status = self.player.get_status()
-        decision = self.controller.decide(playback=playback_status, progress=progress, signal_quality=signal_snapshot, sync_evidence=sync_evidence, fusion_evidence=fusion_evidence)
-        self._apply_decision(decision, playback_status)
-        self._run_auto_tuning(now_sec=now_sec, progress=progress, signal_snapshot=signal_snapshot)
-        self._log_event(progress=progress, signal_snapshot=signal_snapshot, decision=decision, sync_evidence=sync_evidence, audio_match=audio_match, audio_behavior=audio_behavior, fusion_evidence=fusion_evidence)
-    def _maybe_recenter_from_audio(self, *, now_sec: float, fusion_evidence) -> None:
-        if fusion_evidence is None:
-            return
-        if (now_sec - self._last_audio_recentering_at_sec) < 0.45:
-            return
-        if not (fusion_evidence.should_recenter_aligner_window or fusion_evidence.should_widen_reacquire_window):
-            return
-        ref_idx_hint = int(getattr(fusion_evidence, "estimated_ref_idx_hint", 0))
-        if fusion_evidence.should_widen_reacquire_window:
-            back = 16
-            ahead = 36
-            budget = 8
-        else:
-            back = 10
-            ahead = 24
-            budget = 6
-        self.tracking_engine.recenter_from_audio(ref_idx_hint=ref_idx_hint, search_back=back, search_ahead=ahead, budget_events=budget)
-        self._last_audio_recentering_at_sec = float(now_sec)
-        if self.event_logger is not None:
-            self.event_logger.log(
-                "audio_recentering",
-                {
-                    "estimated_ref_idx_hint": ref_idx_hint,
-                    "estimated_ref_time_sec": float(getattr(fusion_evidence, "estimated_ref_time_sec", 0.0)),
-                    "audio_confidence": float(getattr(fusion_evidence, "audio_confidence", 0.0)),
-                    "fused_confidence": float(getattr(fusion_evidence, "fused_confidence", 0.0)),
-                    "should_recenter_aligner_window": bool(getattr(fusion_evidence, "should_recenter_aligner_window", False)),
-                    "should_widen_reacquire_window": bool(getattr(fusion_evidence, "should_widen_reacquire_window", False)),
-                },
-                ts_monotonic_sec=now_sec,
-                session_tick=self.stats.ticks,
-            )
-    def _on_audio_frame(self, pcm_bytes: bytes) -> None:
-        item = (time.monotonic(), pcm_bytes)
-        try:
-            self.audio_queue.put_nowait(item)
-            self.stats.audio_enqueued += 1
-            self.stats.audio_q_high_watermark = max(self.stats.audio_q_high_watermark, self.audio_queue.qsize())
-        except queue.Full:
-            try:
-                _ = self.audio_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self.audio_queue.put_nowait(item)
-            except queue.Full:
-                pass
-            self.stats.audio_dropped += 1
-    def _drain_audio_queue(self) -> None:
-        while True:
-            try:
-                observed_at_sec, pcm_bytes = self.audio_queue.get_nowait()
-            except queue.Empty:
-                break
-            self.signal_monitor.feed_pcm16(pcm_bytes, observed_at_sec)
-            signal_snapshot = self.signal_monitor.snapshot(observed_at_sec)
-            self.latency_calibrator.observe_signal(signal_snapshot)
-            if self.live_audio_matcher is not None:
-                feat_frames = self._audio_feature_extractor.process_pcm16(pcm_bytes, observed_at_sec=observed_at_sec)
-                self.live_audio_matcher.feed_features(feat_frames)
-            bootstrap_mode = (observed_at_sec - self._session_started_at_sec) <= 3.0
-            bluetooth_mode = self._is_bluetooth_mode()
-            should_feed_asr = self._should_feed_asr(signal_snapshot=signal_snapshot, now_sec=observed_at_sec, bootstrap_mode=bootstrap_mode, bluetooth_mode=bluetooth_mode)
-            if should_feed_asr:
-                self.asr.feed_pcm16(pcm_bytes)
-                self.stats.asr_frames_fed += 1
-            else:
-                self.stats.asr_frames_skipped += 1
-                self._maybe_reset_asr_for_silence(signal_snapshot=signal_snapshot, now_sec=observed_at_sec, bootstrap_mode=bootstrap_mode, bluetooth_mode=bluetooth_mode)
-    def _should_feed_asr(self, *, signal_snapshot, now_sec: float, bootstrap_mode: bool, bluetooth_mode: bool) -> bool:
-        open_rms = 0.0085 if bootstrap_mode else self._speech_open_rms
-        open_peak = 0.022 if bootstrap_mode else self._speech_open_peak
-        open_likelihood = 0.48 if bootstrap_mode else self._speech_open_likelihood
-        strong_voice = bool(signal_snapshot.vad_active and signal_snapshot.rms >= open_rms and signal_snapshot.peak >= open_peak)
-        likely_voice = bool(signal_snapshot.speaking_likelihood >= open_likelihood and signal_snapshot.rms >= self._speech_keep_rms)
-        keep_voice = bool(signal_snapshot.vad_active and signal_snapshot.rms >= self._speech_keep_rms and signal_snapshot.peak >= self._speech_keep_peak) or bool(signal_snapshot.speaking_likelihood >= self._speech_keep_likelihood and signal_snapshot.peak >= self._speech_keep_peak)
-        if strong_voice or likely_voice:
-            self._last_human_voice_like_at_sec = float(now_sec)
-        gate_should_open = strong_voice or likely_voice
-        gate_tail_sec = 0.85 if bluetooth_mode else (0.60 if bootstrap_mode else self._speech_tail_hold_sec)
-        gate_should_keep = False
-        if self._asr_gate_open and self._last_human_voice_like_at_sec > 0.0:
-            gate_should_keep = keep_voice or ((now_sec - self._last_human_voice_like_at_sec) <= gate_tail_sec)
-        new_gate_state = gate_should_open or gate_should_keep
-        if new_gate_state and not self._asr_gate_open:
-            self._asr_gate_open = True
-            self._asr_gate_last_open_at_sec = float(now_sec)
-            self.stats.asr_gate_open_count += 1
-        elif (not new_gate_state) and self._asr_gate_open:
-            self._asr_gate_open = False
-            self._asr_gate_last_close_at_sec = float(now_sec)
-            self.stats.asr_gate_close_count += 1
-        return self._asr_gate_open
-    def _maybe_reset_asr_for_silence(self, *, signal_snapshot, now_sec: float, bootstrap_mode: bool, bluetooth_mode: bool) -> None:
-        if self._asr_gate_open or bootstrap_mode or bluetooth_mode:
-            return
-        recently_had_voice = self._last_human_voice_like_at_sec > 0.0 and (now_sec - self._last_human_voice_like_at_sec) <= self._asr_reset_after_silence_sec
-        if recently_had_voice:
-            return
-        recently_reset = self._last_asr_reset_at_sec > 0.0 and (now_sec - self._last_asr_reset_at_sec) <= self._asr_reset_cooldown_sec
-        if recently_reset:
-            return
-        very_quiet = bool(signal_snapshot.rms <= self._speech_keep_rms and signal_snapshot.peak <= self._speech_keep_peak and signal_snapshot.speaking_likelihood <= 0.24)
-        if not very_quiet:
-            return
-        try:
-            self.asr.reset()
-            self._last_asr_reset_at_sec = float(now_sec)
-            self.stats.asr_resets_from_silence += 1
-        except Exception:
-            pass
-    def _apply_decision(self, decision, playback_status) -> None:
-        action_key = (decision.action.value, decision.reason)
-        should_count = action_key != self._last_control_action_key
-        self._last_control_action_key = action_key
-        if decision.action.value == "hold":
-            if playback_status.state != PlaybackState.HOLDING:
-                self.player.submit_command(PlayerCommand(cmd=PlayerCommandType.HOLD, reason=decision.reason))
-                if should_count:
-                    self.metrics.observe_action("hold", decision.reason, time.monotonic())
-        elif decision.action.value == "resume":
-            if playback_status.state == PlaybackState.HOLDING:
-                self.player.submit_command(PlayerCommand(cmd=PlayerCommandType.RESUME, reason=decision.reason))
-                if should_count:
-                    self.metrics.observe_action("resume", decision.reason, time.monotonic())
-        elif decision.action.value == "seek" and decision.target_time_sec is not None:
-            self.player.submit_command(PlayerCommand(cmd=PlayerCommandType.SEEK, target_time_sec=float(decision.target_time_sec), reason=decision.reason))
-            if should_count:
-                self.metrics.observe_action("seek", decision.reason, time.monotonic())
-        elif decision.action.value == "soft_duck" and should_count:
-            self.metrics.observe_action("soft_duck", decision.reason, time.monotonic())
-        desired_gain = decision.target_gain
-        if desired_gain is not None:
-            if self._last_gain_sent is None or abs(float(desired_gain) - float(self._last_gain_sent)) >= 0.01:
-                self.player.submit_command(PlayerCommand(cmd=PlayerCommandType.SET_GAIN, gain=float(desired_gain), reason=decision.reason))
-                self._last_gain_sent = float(desired_gain)
-    def _run_auto_tuning(self, *, now_sec: float, progress, signal_snapshot) -> None:
-        metrics_summary = self.metrics.summary_dict()
-        latency_snapshot = self.latency_calibrator.snapshot()
-        self.auto_tuner.maybe_tune(
-            now_sec=now_sec,
-            controller_policy=self.controller.policy,
-            player=self.player,
-            signal_monitor=self.signal_monitor,
-            metrics_summary=metrics_summary,
-            signal_quality=signal_snapshot,
-            progress=progress,
-            latency_snapshot=latency_snapshot,
-            device_profile=asdict(self._device_profile) if self._device_profile is not None else {},
-        )
-    def _persist_session_profile(self) -> None:
-        if self.profile_store is None or self._device_profile is None:
-            return
-        latency_snapshot = self.latency_calibrator.snapshot()
-        self.profile_store.update_from_session(
-            input_device_id=self._device_profile.input_device_id,
-            output_device_id=self._device_profile.output_device_id,
-            hostapi_name=str(self.device_context.get("hostapi_name", "")),
-            capture_backend=str(self.device_context.get("capture_backend", "")),
-            duplex_sample_rate=int(self.device_context.get("input_sample_rate", 0)),
-            bluetooth_mode=self._is_bluetooth_mode(),
-            device_profile=asdict(self._device_profile),
-            metrics=self.metrics.summary_dict(),
-            latency_calibration=(None if latency_snapshot is None else {
-                "estimated_input_latency_ms": latency_snapshot.estimated_input_latency_ms,
-                "estimated_output_latency_ms": latency_snapshot.estimated_output_latency_ms,
-                "runtime_input_drift_ms": latency_snapshot.runtime_input_drift_ms,
-                "runtime_output_drift_ms": latency_snapshot.runtime_output_drift_ms,
-                "confidence": latency_snapshot.confidence,
-                "calibrated": latency_snapshot.calibrated,
-            }),
-        )
-    def _persist_summary(self) -> None:
-        raw_session_dir = str(self.device_context.get("session_dir", "")).strip()
-        if not raw_session_dir:
-            return
-        session_dir = Path(raw_session_dir).expanduser().resolve()
-        session_dir.mkdir(parents=True, exist_ok=True)
-        latency_snapshot = self.latency_calibrator.snapshot()
-        summary = {
-            "lesson_id": self._lesson_id,
-            "metrics": self.metrics.summary_dict(),
-            "stats": asdict(self.stats),
-            "device_profile": None if self._device_profile is None else asdict(self._device_profile),
-            "latency_calibration": (None if latency_snapshot is None else {
-                "estimated_input_latency_ms": latency_snapshot.estimated_input_latency_ms,
-                "estimated_output_latency_ms": latency_snapshot.estimated_output_latency_ms,
-                "runtime_input_drift_ms": latency_snapshot.runtime_input_drift_ms,
-                "runtime_output_drift_ms": latency_snapshot.runtime_output_drift_ms,
-                "confidence": latency_snapshot.confidence,
-                "calibrated": latency_snapshot.calibrated,
-            }),
-            "controller_policy": asdict(self.controller.policy),
-            "latest_audio_match": None if self._latest_audio_match is None else asdict(self._latest_audio_match),
-            "latest_audio_behavior": None if self._latest_audio_behavior is None else asdict(self._latest_audio_behavior),
-            "latest_fusion_evidence": None if self._latest_fusion_evidence is None else asdict(self._latest_fusion_evidence),
-        }
-        (session_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        if self.event_logger is not None:
-            self.event_logger.log("session_summary", summary, ts_monotonic_sec=time.monotonic(), session_tick=self.stats.ticks)
-    def _log_event(self, *, progress, signal_snapshot, decision, sync_evidence, audio_match, audio_behavior, fusion_evidence) -> None:
-        if self.event_logger is None:
-            return
-        now_sec = time.monotonic()
-        self.event_logger.log("signal_snapshot", {"rms": signal_snapshot.rms, "peak": signal_snapshot.peak, "vad_active": signal_snapshot.vad_active, "speaking_likelihood": signal_snapshot.speaking_likelihood, "quality_score": signal_snapshot.quality_score, "dropout_detected": signal_snapshot.dropout_detected}, ts_monotonic_sec=now_sec, session_tick=self.stats.ticks)
-        if progress is not None:
-            self.event_logger.log(
-                "progress_snapshot",
-                {
-                    "estimated_ref_idx": progress.estimated_ref_idx,
-                    "estimated_ref_time_sec": progress.estimated_ref_time_sec,
-                    "progress_age_sec": progress.progress_age_sec,
-                    "tracking_mode": progress.tracking_mode.value,
-                    "tracking_quality": progress.tracking_quality,
-                    "confidence": progress.confidence,
-                    "joint_confidence": progress.joint_confidence,
-                    "audio_confidence": progress.audio_confidence,
-                    "position_source": progress.position_source,
-                    "active_speaking": progress.active_speaking,
-                    "recently_progressed": progress.recently_progressed,
-                    "user_state": progress.user_state.value,
-                },
-                ts_monotonic_sec=now_sec,
-                session_tick=self.stats.ticks,
-            )
-        self.event_logger.log(
-            "sync_evidence",
-            {
-                "speech_state": sync_evidence.speech_state.value,
-                "tracking_state": sync_evidence.tracking_state.value,
-                "sync_state": sync_evidence.sync_state.value,
-                "speech_confidence": sync_evidence.speech_confidence,
-                "tracking_confidence": sync_evidence.tracking_confidence,
-                "sync_confidence": sync_evidence.sync_confidence,
-                "allow_latency_observation": sync_evidence.allow_latency_observation,
-                "allow_seek": sync_evidence.allow_seek,
-                "startup_mode": sync_evidence.startup_mode,
-                "bluetooth_mode": sync_evidence.bluetooth_mode,
-                "audio_confidence": sync_evidence.audio_confidence,
-                "still_following_likelihood": sync_evidence.still_following_likelihood,
-                "reentry_likelihood": sync_evidence.reentry_likelihood,
-                "repeated_likelihood": sync_evidence.repeated_likelihood,
-            },
-            ts_monotonic_sec=now_sec,
-            session_tick=self.stats.ticks,
-        )
-        if audio_match is not None:
-            self.event_logger.log("audio_match_snapshot", asdict(audio_match), ts_monotonic_sec=now_sec, session_tick=self.stats.ticks)
-        if audio_behavior is not None:
-            self.event_logger.log("audio_behavior_snapshot", asdict(audio_behavior), ts_monotonic_sec=now_sec, session_tick=self.stats.ticks)
-        if fusion_evidence is not None:
-            self.event_logger.log("fusion_evidence", asdict(fusion_evidence), ts_monotonic_sec=now_sec, session_tick=self.stats.ticks)
-        self.event_logger.log(
-            "control_decision",
-            {
-                "action": decision.action.value,
-                "reason": decision.reason,
-                "target_time_sec": decision.target_time_sec,
-                "lead_sec": decision.lead_sec,
-                "target_gain": decision.target_gain,
-                "confidence": decision.confidence,
-                "aggressiveness": decision.aggressiveness,
-            },
-            ts_monotonic_sec=now_sec,
-            session_tick=self.stats.ticks,
-        )
-    def _build_initial_device_profile(self, output_sr: int) -> DeviceProfile:
-        return build_device_profile(
-            input_device_name=self.device_context.get("input_device_name"),
-            output_device_name=self.device_context.get("output_device_name"),
-            input_sample_rate=int(self.device_context.get("input_sample_rate", 16000)),
-            output_sample_rate=int(output_sr),
-            noise_floor_rms=float(self.device_context.get("noise_floor_rms", 0.0025)),
-        )
-    def _is_bluetooth_mode(self) -> bool:
-        profile = self._device_profile
-        if profile is None:
-            return False
-        return bool(profile.input_kind == "bluetooth_headset" or profile.output_kind == "bluetooth_headset")
-    def _safe_close_startup_resources(self) -> None:
-        try:
-            self.recorder.stop()
-        except Exception:
-            pass
-        try:
-            self.recorder.close()
-        except Exception:
-            pass
-        try:
-            self.asr.close()
-        except Exception:
-            pass
-        try:
-            self.player.stop()
-        except Exception:
-            pass
-        try:
-            self.player.close()
-        except Exception:
-            pass
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/telemetry/session_evaluator.py`
-
-```python
-from __future__ import annotations
-from dataclasses import dataclass, asdict
-from pathlib import Path
-import json
-from statistics import mean
-from shadowing.telemetry.replay_loader import ReplayLoader
-@dataclass(slots=True)
-class SessionEvaluationSummary:
-    session_dir: str
-    hold_count: int = 0
-    seek_count: int = 0
-    soft_duck_count: int = 0
-    false_hold_count: int = 0
-    false_seek_count: int = 0
-    reacquire_count: int = 0
-    mean_reacquire_latency_sec: float = 0.0
-    p95_reacquire_latency_sec: float = 0.0
-    max_reacquire_latency_sec: float = 0.0
-    startup_first_reliable_progress_time_sec: float | None = None
-    mean_tracking_quality: float = 0.0
-    max_tracking_quality: float = 0.0
-    def to_dict(self) -> dict:
-        return asdict(self)
-class SessionEvaluator:
-    def __init__(self, events_file: str, summary_file: str | None = None) -> None:
-        self.events_file = Path(events_file)
-        self.summary_file = Path(summary_file) if summary_file else self.events_file.with_name("summary.json")
-    def evaluate(self) -> SessionEvaluationSummary:
-        loader = ReplayLoader(str(self.events_file))
-        out = SessionEvaluationSummary(session_dir=str(self.events_file.parent))
-        tracking_scores: list[float] = []
-        reacquire_started_at: float | None = None
-        reacquire_latencies: list[float] = []
-        recent_signal = 0.0
-        recent_audio_follow = 0.0
-        recent_audio_repeat = 0.0
-        recent_progress_follow = False
-        recent_progress_conf = 0.0
-        seek_recovered_fast = False
-        last_seek_ts: float | None = None
-        for ev in loader:
-            ts = float(ev.ts_monotonic_sec or 0.0)
-            if ev.event_type == "signal_snapshot":
-                recent_signal = max(float(ev.payload.get("speaking_likelihood", 0.0)), 0.75 if ev.payload.get("vad_active") else 0.0)
-            elif ev.event_type == "audio_behavior_snapshot":
-                recent_audio_follow = float(ev.payload.get("still_following_likelihood", 0.0))
-                recent_audio_repeat = float(ev.payload.get("repeated_likelihood", 0.0))
-            elif ev.event_type == "fusion_evidence":
-                recent_audio_follow = max(recent_audio_follow, float(ev.payload.get("still_following_likelihood", 0.0)))
-                recent_audio_repeat = max(recent_audio_repeat, float(ev.payload.get("repeated_likelihood", 0.0)))
-            elif ev.event_type == "progress_snapshot":
-                recent_progress_follow = bool(ev.payload.get("active_speaking", False) or ev.payload.get("recently_progressed", False))
-                recent_progress_conf = float(ev.payload.get("confidence", 0.0))
-                tq = float(ev.payload.get("tracking_quality", 0.0))
-                tracking_scores.append(tq)
-            elif ev.event_type == "tracking_snapshot":
-                tracking_scores.append(float(ev.payload.get("overall_score", 0.0)))
-                mode = str(ev.payload.get("tracking_mode", ""))
-                if mode == "reacquiring" and reacquire_started_at is None:
-                    reacquire_started_at = ts
-                elif reacquire_started_at is not None and mode in {"locked", "weak_locked"} and float(ev.payload.get("overall_score", 0.0)) >= 0.58:
-                    reacquire_latencies.append(max(0.0, ts - reacquire_started_at))
-                    reacquire_started_at = None
-            elif ev.event_type == "control_decision":
-                action = str(ev.payload.get("action", ""))
-                if action == "hold":
-                    out.hold_count += 1
-                    if recent_progress_follow or recent_progress_conf >= 0.64 or recent_audio_follow >= 0.68 or recent_signal >= 0.58:
-                        out.false_hold_count += 1
-                elif action == "seek":
-                    out.seek_count += 1
-                    last_seek_ts = ts
-                    seek_recovered_fast = False
-                    if recent_audio_repeat >= 0.62:
-                        out.false_seek_count += 1
-                elif action == "soft_duck":
-                    out.soft_duck_count += 1
-            elif ev.event_type == "session_summary":
-                metrics = ev.payload.get("metrics", {})
-                out.startup_first_reliable_progress_time_sec = metrics.get("first_reliable_progress_time_sec")
-                out.mean_tracking_quality = float(metrics.get("mean_tracking_quality", out.mean_tracking_quality))
-                out.max_tracking_quality = float(metrics.get("max_tracking_quality", out.max_tracking_quality))
-            if last_seek_ts is not None and ts > 0.0 and (ts - last_seek_ts) <= 1.6 and recent_progress_conf >= 0.74:
-                seek_recovered_fast = True
-            if last_seek_ts is not None and ts > 0.0 and (ts - last_seek_ts) > 1.8:
-                if not seek_recovered_fast and out.seek_count > 0:
-                    out.false_seek_count += 1
-                last_seek_ts = None
-                seek_recovered_fast = False
-        if self.summary_file.exists():
-            try:
-                data = json.loads(self.summary_file.read_text(encoding="utf-8"))
-                metrics = data.get("metrics", {})
-                out.startup_first_reliable_progress_time_sec = metrics.get("first_reliable_progress_time_sec", out.startup_first_reliable_progress_time_sec)
-                out.mean_tracking_quality = float(metrics.get("mean_tracking_quality", out.mean_tracking_quality))
-                out.max_tracking_quality = float(metrics.get("max_tracking_quality", out.max_tracking_quality))
-            except Exception:
-                pass
-        if tracking_scores and out.mean_tracking_quality <= 0.0:
-            out.mean_tracking_quality = float(mean(tracking_scores))
-            out.max_tracking_quality = float(max(tracking_scores))
-        out.reacquire_count = len(reacquire_latencies)
-        if reacquire_latencies:
-            vals = sorted(reacquire_latencies)
-            out.mean_reacquire_latency_sec = float(mean(vals))
-            out.max_reacquire_latency_sec = float(max(vals))
-            p95_index = min(len(vals) - 1, max(0, int(round(0.95 * (len(vals) - 1)))))
-            out.p95_reacquire_latency_sec = float(vals[p95_index])
-        return out
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/tracking/reacquirer.py`
-
-```python
-from __future__ import annotations
-from shadowing.types import ReferenceMap, TrackingMode, TrackingSnapshot
-class Reacquirer:
-    def __init__(self, max_anchor_jump: int = 24, min_anchor_score: float = 0.52) -> None:
-        self.max_anchor_jump = int(max_anchor_jump)
-        self.min_anchor_score = float(min_anchor_score)
-    def maybe_reanchor(self, *, snapshot: TrackingSnapshot, anchor_manager, ref_map: ReferenceMap) -> TrackingSnapshot:
-        _ = ref_map
-        anchor = anchor_manager.strong_anchor() or anchor_manager.weak_anchor()
-        if anchor is None:
-            return snapshot
-        if snapshot.tracking_mode not in (TrackingMode.REACQUIRING, TrackingMode.LOST):
-            return snapshot
-        if snapshot.tracking_quality.anchor_score < self.min_anchor_score:
-            return snapshot
-        anchor_idx = int(anchor.ref_idx)
-        cur_idx = int(snapshot.candidate_ref_idx)
-        if abs(cur_idx - anchor_idx) > self.max_anchor_jump:
-            return snapshot
-        if snapshot.anchor_consistency < self.min_anchor_score:
-            return snapshot
-        return TrackingSnapshot(
-            candidate_ref_idx=max(cur_idx, anchor_idx),
-            committed_ref_idx=max(int(snapshot.committed_ref_idx), anchor_idx),
-            candidate_ref_time_sec=float(snapshot.candidate_ref_time_sec),
-            confidence=float(max(snapshot.confidence, min(0.88, anchor.quality_score))),
-            stable=bool(snapshot.stable),
-            local_match_ratio=float(snapshot.local_match_ratio),
-            repeat_penalty=float(snapshot.repeat_penalty),
-            monotonic_consistency=float(snapshot.monotonic_consistency),
-            anchor_consistency=float(max(snapshot.anchor_consistency, 0.72)),
-            emitted_at_sec=float(snapshot.emitted_at_sec),
-            tracking_mode=TrackingMode.REACQUIRING,
-            tracking_quality=snapshot.tracking_quality,
-            matched_text=snapshot.matched_text,
-        )
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/src/shadowing/types.py`
-
-```python
-from __future__ import annotations
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional
-import re
-import numpy as np
-from numpy.typing import NDArray
-from pypinyin import Style, lazy_pinyin
-class PlaybackState(str, Enum):
-    STOPPED = "stopped"
-    PLAYING = "playing"
-    HOLDING = "holding"
-    SEEKING = "seeking"
-    FINISHED = "finished"
-class ControlAction(str, Enum):
-    NOOP = "noop"
-    SOFT_DUCK = "soft_duck"
-    HOLD = "hold"
-    RESUME = "resume"
-    SEEK = "seek"
-    STOP = "stop"
-class AsrEventType(str, Enum):
-    PARTIAL = "partial"
-    FINAL = "final"
-    ENDPOINT = "endpoint"
-class PlayerCommandType(str, Enum):
-    START = "start"
-    HOLD = "hold"
-    RESUME = "resume"
-    SEEK = "seek"
-    STOP = "stop"
-    SET_GAIN = "set_gain"
-class TrackingMode(str, Enum):
-    BOOTSTRAP = "bootstrap"
-    LOCKED = "locked"
-    WEAK_LOCKED = "weak_locked"
-    REACQUIRING = "reacquiring"
-    LOST = "lost"
-class UserReadState(str, Enum):
-    NOT_STARTED = "not_started"
-    WARMING_UP = "warming_up"
-    FOLLOWING = "following"
-    HESITATING = "hesitating"
-    PAUSED = "paused"
-    REPEATING = "repeating"
-    SKIPPING = "skipping"
-    REJOINING = "rejoining"
-    LOST = "lost"
-@dataclass(slots=True)
-class PlayerCommand:
-    cmd: PlayerCommandType
-    target_time_sec: Optional[float] = None
-    gain: Optional[float] = None
-    reason: str = ""
-@dataclass(slots=True)
-class AudioChunk:
-    chunk_id: int
-    sample_rate: int
-    channels: int
-    samples: NDArray[np.float32]
-    duration_sec: float
-    start_time_sec: float
-    path: Optional[str] = None
-@dataclass(slots=True)
-class RefToken:
-    idx: int
-    char: str
-    pinyin: str
-    t_start: float
-    t_end: float
-    sentence_id: int
-    clause_id: int
-@dataclass(slots=True)
-class ReferenceMap:
-    lesson_id: str
-    tokens: list[RefToken]
-    total_duration_sec: float
-@dataclass(slots=True)
-class LessonManifest:
-    lesson_id: str
-    lesson_text: str
-    sample_rate_out: int
-    chunk_paths: list[str]
-    reference_map_path: str
-    schema_version: int = 1
-    provider_name: str = "elevenlabs"
-    output_format: str = "mp3_44100_128"
-@dataclass(slots=True)
-class PlaybackStatus:
-    state: PlaybackState
-    chunk_id: int
-    frame_index: int
-    gain: float
-    generation: int
-    t_host_output_sec: float
-    t_ref_block_start_content_sec: float
-    t_ref_block_end_content_sec: float
-    t_ref_emitted_content_sec: float
-    t_ref_heard_content_sec: float
-@dataclass(slots=True)
-class RawAsrEvent:
-    event_type: AsrEventType
-    text: str
-    emitted_at_sec: float
-@dataclass(slots=True)
-class AsrEvent:
-    event_type: AsrEventType
-    text: str
-    normalized_text: str
-    chars: list[str]
-    pinyin_seq: list[str]
-    emitted_at_sec: float
-@dataclass(slots=True)
-class HypToken:
-    char: str
-    pinyin: str
-@dataclass(slots=True)
-class CandidateAlignment:
-    ref_start_idx: int
-    ref_end_idx: int
-    score: float
-    confidence: float
-    matched_ref_indices: list[int] = field(default_factory=list)
-    backward_jump: bool = False
-    mode: str = "normal"
-@dataclass(slots=True)
-class AlignResult:
-    committed_ref_idx: int
-    candidate_ref_idx: int
-    ref_time_sec: float
-    confidence: float
-    stable: bool
-    matched_text: str = ""
-    matched_pinyin: list[str] = field(default_factory=list)
-    window_start_idx: int = 0
-    window_end_idx: int = 0
-    alignment_mode: str = "normal"
-    backward_jump_detected: bool = False
-    debug_score: float = 0.0
-    debug_stable_run: int = 0
-    debug_backward_run: int = 0
-    debug_matched_count: int = 0
-    debug_hyp_length: int = 0
-    local_match_ratio: float = 0.0
-    repeat_penalty: float = 0.0
-    emitted_at_sec: float = 0.0
-@dataclass(slots=True)
-class SignalQuality:
-    observed_at_sec: float
-    rms: float
-    peak: float
-    vad_active: bool
-    speaking_likelihood: float
-    silence_run_sec: float
-    clipping_ratio: float
-    dropout_detected: bool
-    quality_score: float
-@dataclass(slots=True)
-class TrackingQuality:
-    overall_score: float
-    observation_score: float
-    temporal_consistency_score: float
-    anchor_score: float
-    mode: TrackingMode
-    is_reliable: bool
-@dataclass(slots=True)
-class TrackingSnapshot:
-    candidate_ref_idx: int
-    committed_ref_idx: int
-    candidate_ref_time_sec: float
-    confidence: float
-    stable: bool
-    local_match_ratio: float
-    repeat_penalty: float
-    monotonic_consistency: float
-    anchor_consistency: float
-    emitted_at_sec: float
-    tracking_mode: TrackingMode
-    tracking_quality: TrackingQuality
-    matched_text: str = ""
-@dataclass(slots=True)
-class ProgressEstimate:
-    estimated_ref_idx: int
-    estimated_ref_time_sec: float
-    progress_velocity_idx_per_sec: float
-    event_emitted_at_sec: float
-    last_progress_at_sec: float
-    progress_age_sec: float
-    source_candidate_ref_idx: int
-    source_committed_ref_idx: int
-    tracking_mode: TrackingMode
-    tracking_quality: float
-    stable: bool
-    confidence: float
-    active_speaking: bool
-    recently_progressed: bool
-    user_state: UserReadState
-    audio_confidence: float = 0.0
-    joint_confidence: float = 0.0
-    position_source: str = "text"
-    audio_support_strength: float = 0.0
-@dataclass(slots=True)
-class ControlDecision:
-    action: ControlAction
-    reason: str
-    target_time_sec: Optional[float] = None
-    lead_sec: Optional[float] = None
-    target_gain: Optional[float] = None
-    replay_lockin: bool = False
-    confidence: float = 0.0
-    aggressiveness: str = "low"
-@dataclass(slots=True)
-class DeviceProfileSnapshot:
-    input_device_id: str
-    output_device_id: str
-    input_kind: str
-    output_kind: str
-    input_sample_rate: int
-    output_sample_rate: int
-    estimated_input_latency_ms: float
-    estimated_output_latency_ms: float
-    noise_floor_rms: float
-    input_gain_hint: str
-    reliability_tier: str
-@dataclass(slots=True)
-class LatencyCalibrationSnapshot:
-    estimated_input_latency_ms: float
-    estimated_output_latency_ms: float
-    confidence: float
-    calibrated: bool
-@dataclass(slots=True)
-class AudioMatchSnapshot:
-    estimated_ref_time_sec: float
-    estimated_ref_idx_hint: int
-    confidence: float
-    local_similarity: float
-    envelope_alignment_score: float
-    onset_alignment_score: float
-    band_alignment_score: float
-    rhythm_consistency_score: float
-    repeated_pattern_score: float
-    drift_sec: float
-    mode: str
-    emitted_at_sec: float
-    dtw_cost: float = 0.0
-    dtw_path_score: float = 0.0
-    dtw_coverage: float = 0.0
-    coarse_candidate_rank: int = 0
-    time_offset_sec: float = 0.0
-@dataclass(slots=True)
-class AudioBehaviorSnapshot:
-    still_following_likelihood: float
-    repeated_likelihood: float
-    reentry_likelihood: float
-    paused_likelihood: float
-    confidence: float
-    emitted_at_sec: float
-@dataclass(slots=True)
-class FusionEvidence:
-    estimated_ref_time_sec: float
-    estimated_ref_idx_hint: int
-    text_confidence: float
-    audio_confidence: float
-    fused_confidence: float
-    still_following_likelihood: float
-    repeated_likelihood: float
-    reentry_likelihood: float
-    should_prevent_hold: bool
-    should_prevent_seek: bool
-    should_widen_reacquire_window: bool
-    should_recenter_aligner_window: bool
-    emitted_at_sec: float
-def _normalize_text(text: str) -> str:
-    if not text:
-        return ""
-    text = text.strip().lower()
-    text = re.sub(r"[，。！？；：、“”‘’\"'（）()\[\]【】<>\-—…,.!?;:/\\|`~@#$%^&*_+=\s]+", "", text)
-    return text
-@dataclass(slots=True)
-class Wording:
-    raw_text: str = ""
-    normalized_text: str = ""
-    pinyins: list[str] = field(default_factory=list)
-    @classmethod
-    def from_text(cls, text: str) -> "Wording":
-        normalized_text = _normalize_text(text)
-        pinyins = lazy_pinyin(normalized_text, style=Style.TONE3)
-        return cls(raw_text=text, normalized_text=normalized_text, pinyins=pinyins)
-    def __len__(self) -> int:
-        return len(self.pinyins)
-    def __getitem__(self, key: int | slice) -> list[str]:
-        return self.pinyins[key]
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/tools/evaluate_session.py`
-
-```python
-from __future__ import annotations
-import _bootstrap
-import argparse
-import json
-from pathlib import Path
-from shadowing.telemetry.session_evaluator import SessionEvaluator
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a recorded shadowing session")
-    parser.add_argument("--events-file", type=str, required=True)
-    parser.add_argument("--summary-file", type=str, default=None)
-    parser.add_argument("--output-json", type=str, default=None)
-    args = parser.parse_args()
-    evaluator = SessionEvaluator(events_file=args.events_file, summary_file=args.summary_file)
-    result = evaluator.evaluate()
-    payload = result.to_dict()
-    if args.output_json:
-        out_path = Path(args.output_json).expanduser().resolve()
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-if __name__ == "__main__":
-    main()
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/tools/replay_session.py`
-
-```python
-from __future__ import annotations
-import _bootstrap
-import argparse
-from collections import Counter
-from shadowing.telemetry.replay_loader import ReplayLoader
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Replay and summarize a recorded runtime session events.jsonl")
-    parser.add_argument("--events-file", type=str, required=True)
-    args = parser.parse_args()
-    loader = ReplayLoader(args.events_file)
-    counts = Counter()
-    last_tracking_mode = None
-    last_user_state = None
-    max_tracking_quality = 0.0
-    max_signal = 0.0
-    first_tick = None
-    last_tick = None
-    first_ts = None
-    last_ts = None
-    for ev in loader:
-        counts[ev.event_type] += 1
-        if ev.session_tick is not None:
-            if first_tick is None:
-                first_tick = ev.session_tick
-            last_tick = ev.session_tick
-        if ev.ts_monotonic_sec is not None:
-            if first_ts is None:
-                first_ts = ev.ts_monotonic_sec
-            last_ts = ev.ts_monotonic_sec
-        if ev.event_type == "tracking_snapshot":
-            mode = ev.payload.get("tracking_mode")
-            tq = float(ev.payload.get("overall_score", 0.0))
-            max_tracking_quality = max(max_tracking_quality, tq)
-            last_tracking_mode = mode
-        elif ev.event_type == "progress_snapshot":
-            last_user_state = ev.payload.get("user_state")
-        elif ev.event_type == "signal_snapshot":
-            max_signal = max(max_signal, float(ev.payload.get("speaking_likelihood", 0.0)))
-    for k in sorted(counts):
-if __name__ == "__main__":
-    main()
-```
-
----
-### 文件: `optimized_shadowing_app_patch/optimized_shadowing_app/shadowing_app/tools/run_shadowing.py`
-
-```python
-from __future__ import annotations
-import _bootstrap
-import argparse
-import json
-import os
-import re
-from pathlib import Path
-import sounddevice as sd
-from shadowing.audio.bluetooth_preflight import (
-    BluetoothPreflightConfig,
-    run_bluetooth_duplex_preflight,
-    should_run_bluetooth_preflight,
-)
-from shadowing.bootstrap import build_runtime
-from shadowing.llm.qwen_hotwords import extract_hotwords_with_qwen
-from shadowing.realtime.capture.device_utils import pick_working_input_config
-def slugify_filename_stem(stem: str) -> str:
-    stem = stem.strip()
-    stem = re.sub(r'[\\/:*?"<>|]+', "_", stem)
-    stem = re.sub(r"\s+", "_", stem)
-    stem = stem.strip("._")
-    return stem or "lesson"
-def validate_lesson_assets(lesson_dir: Path) -> None:
-    manifest = lesson_dir / "lesson_manifest.json"
-    ref_map = lesson_dir / "reference_map.json"
-    chunks_dir = lesson_dir / "chunks"
-    missing: list[str] = []
-    for p in (manifest, ref_map, chunks_dir):
-        if not p.exists():
-            missing.append(str(p))
-    if missing:
-        raise FileNotFoundError("Lesson assets not found. Please run preprocess first.\n" + "\n".join(missing))
-def load_manifest(lesson_dir: Path) -> dict:
-    return json.loads((lesson_dir / "lesson_manifest.json").read_text(encoding="utf-8"))
-def collect_sherpa_paths() -> dict:
-    return {
-        "tokens": os.getenv("SHERPA_TOKENS", ""),
-        "encoder": os.getenv("SHERPA_ENCODER", ""),
-        "decoder": os.getenv("SHERPA_DECODER", ""),
-        "joiner": os.getenv("SHERPA_JOINER", ""),
-    }
-def validate_sherpa_paths(paths: dict) -> None:
-    missing_keys: list[str] = []
-    missing_files: list[str] = []
-    env_map = {"tokens": "SHERPA_TOKENS", "encoder": "SHERPA_ENCODER", "decoder": "SHERPA_DECODER", "joiner": "SHERPA_JOINER"}
-    for key in ("tokens", "encoder", "decoder", "joiner"):
-        value = (paths.get(key) or "").strip()
-        if not value:
-            missing_keys.append(env_map[key])
-            continue
-        if not Path(value).expanduser().exists():
-            missing_files.append(f"{key}: {value}")
-    if missing_keys or missing_files:
-        parts: list[str] = []
-        if missing_keys:
-            parts.append("Missing sherpa env vars: " + ", ".join(missing_keys))
-        if missing_files:
-            parts.append("Non-existent sherpa files:\n" + "\n".join(missing_files))
-        raise FileNotFoundError("Sherpa model configuration is invalid.\n" + "\n".join(parts))
-def _parse_input_device_arg(raw_value: str | None) -> int | str | None:
-    if raw_value is None:
-        return None
-    raw = str(raw_value).strip()
-    if raw == "":
-        return None
-    if raw.isdigit():
-        return int(raw)
-    return raw
-def _resolve_output_device_name(device_value: int | str | None) -> str:
-    if device_value is None:
-        _, default_out = sd.default.device
-        if default_out is None or int(default_out) < 0:
-            return "unknown"
-        return str(sd.query_devices(int(default_out))["name"])
-    if isinstance(device_value, int):
-        return str(sd.query_devices(device_value)["name"])
-    target = str(device_value).strip().lower()
-    for _, dev in enumerate(sd.query_devices()):
-        if int(dev["max_output_channels"]) <= 0:
-            continue
-        if target in str(dev["name"]).lower():
-            return str(dev["name"])
-    return str(device_value)
-def _resolve_input_device_name(device_value: int | str | None) -> str:
-    if device_value is None:
-        default_in, _ = sd.default.device
-        if default_in is None or int(default_in) < 0:
-            return "unknown"
-        return str(sd.query_devices(int(default_in))["name"])
-    if isinstance(device_value, int):
-        return str(sd.query_devices(device_value)["name"])
-    target = str(device_value).strip().lower()
-    for _, dev in enumerate(sd.query_devices()):
-        if int(dev["max_input_channels"]) <= 0:
-            continue
-        if target in str(dev["name"]).lower():
-            return str(dev["name"])
-    return str(device_value)
-def _run_bluetooth_preflight_or_fail(*, input_device: int | str | None, output_device: int | str | None, input_samplerate: int, playback_sample_rate: int, preflight_duration_sec: float, skip_bluetooth_preflight: bool) -> tuple[int | str | None, int | str | None]:
-    if skip_bluetooth_preflight:
-        return input_device, output_device
-    should_run = should_run_bluetooth_preflight(input_device=input_device, output_device=output_device)
-    if not should_run:
-        return input_device, output_device
-    result = run_bluetooth_duplex_preflight(BluetoothPreflightConfig(input_device=input_device, output_device=output_device, preferred_input_samplerate=int(input_samplerate), preferred_output_samplerate=int(playback_sample_rate), duration_sec=float(preflight_duration_sec)))
-    if not result.passed:
-        notes = "\n".join(f"- {x}" for x in result.notes) if result.notes else ""
-        raise RuntimeError(
-            "Bluetooth headset duplex preflight failed.\n"
-            f"Reason: {result.failure_reason}\n"
-            f"Input: {result.input_device_name!r}\n"
-            f"Output: {result.output_device_name!r}\n"
-            f"{notes}"
-        )
-    return result.input_device_index, result.output_device_index
-def _normalize_for_hotwords(text: str) -> str:
-    text = str(text or "").strip()
-    text = text.replace("\u3000", " ")
-    text = re.sub(r"\s+", "", text)
-    text = re.sub(r"[，。！？；：、“”‘’\"'（）()\[\]【】<>\-—…,.!?;:/\\|`~@#$%^&*_+=]+", "", text)
-    return text
-def _looks_like_bad_hotword(term: str) -> bool:
-    if not term:
-        return True
-    n = len(term)
-    if n < 4 or n > 24:
-        return True
-    if term[0] in "的了在和与及并就也又把被将呢啊吗呀":
-        return True
-    if term[-1] in "的了在和与及并就也又呢啊吗呀":
-        return True
-    if re.fullmatch(r"[A-Za-z]+", term):
-        return True
-    if re.search(r"[A-Za-z]", term):
-        if not re.fullmatch(r"[A-Za-z0-9一-龥]+", term):
-            return True
-    return False
-def _split_text_to_sentences(text: str) -> list[str]:
-    parts = re.split(r"[。！？!?；;：:\n\r]+", text)
-    return [p.strip() for p in parts if p.strip()]
-def _split_sentence_to_clauses(text: str) -> list[str]:
-    parts = re.split(r"[，,、]+", text)
-    return [p.strip() for p in parts if p.strip()]
-def _score_hotword(term: str, whole_sentence: str) -> float:
-    score = 0.0
-    n = len(term)
-    if 5 <= n <= 14:
-        score += 5.0
-    elif 4 <= n <= 18:
-        score += 3.0
-    else:
-        score += 1.0
-    if term == whole_sentence:
-        score += 0.8
-    if any(k in term for k in ["华为", "座舱", "车机", "微信", "周杰伦", "支付宝", "PPT", "bug"]):
-        score += 2.0
-    if any(k in term for k in ["技术小组", "智能座舱", "原型车", "红尾灯", "语音助手", "晚高峰"]):
-        score += 2.0
-    if re.search(r"\d", term):
-        score += 0.8
-    if _looks_like_bad_hotword(term):
-        score -= 10.0
-    return score
-def _dedupe_by_containment(terms: list[str], max_terms: int) -> list[str]:
-    kept: list[str] = []
-    for term in terms:
-        if any(term in existed for existed in kept if existed != term):
-            continue
-        kept.append(term)
-        if len(kept) >= max_terms:
-            break
-    return kept
-def _build_hotwords_from_lesson_text_local(lesson_text: str, *, max_terms: int = 20) -> list[str]:
-    normalized_full = _normalize_for_hotwords(lesson_text)
-    if not normalized_full:
-        return []
-    candidates: dict[str, float] = {}
-    def add(term: str, whole_sentence: str = "") -> None:
-        norm = _normalize_for_hotwords(term)
-        if not norm or _looks_like_bad_hotword(norm):
-            return
-        score = _score_hotword(norm, _normalize_for_hotwords(whole_sentence or norm))
-        old = candidates.get(norm)
-        if old is None or score > old:
-            candidates[norm] = score
-    sentences = _split_text_to_sentences(lesson_text)
-    for sent in sentences:
-        sent_norm = _normalize_for_hotwords(sent)
-        if not sent_norm:
-            continue
-        if 6 <= len(sent_norm) <= 20:
-            add(sent_norm, sent_norm)
-        clauses = _split_sentence_to_clauses(sent)
-        for clause in clauses:
-            clause_norm = _normalize_for_hotwords(clause)
-            if 4 <= len(clause_norm) <= 16:
-                add(clause_norm, sent_norm)
-    ranked = sorted(candidates.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
-    ranked_terms = [k for k, _ in ranked]
-    ranked_terms = _dedupe_by_containment(ranked_terms, max_terms=max_terms)
-    return ranked_terms[:max_terms]
-def _merge_hotwords(auto_terms: list[str], user_terms_raw: str, *, max_terms: int = 32) -> list[str]:
-    merged: list[str] = []
-    seen: set[str] = set()
-    def add(term: str) -> None:
-        norm = _normalize_for_hotwords(term)
-        if not norm or _looks_like_bad_hotword(norm) or norm in seen:
-            return
-        seen.add(norm)
-        merged.append(norm)
-    for term in auto_terms:
-        add(term)
-    if user_terms_raw.strip():
-        for term in re.split(r"[,，;\n]+", user_terms_raw):
-            add(term)
-    merged = sorted(merged, key=lambda x: (-len(x), x))
-    merged = _dedupe_by_containment(merged, max_terms=max_terms)
-    return merged[:max_terms]
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run shadowing realtime pipeline")
-    parser.add_argument("--text-file", type=str, required=True)
-    parser.add_argument("--lesson-base-dir", type=str, default="assets/lessons")
-    parser.add_argument("--asr", type=str, default="sherpa", choices=["fake", "sherpa"])
-    parser.add_argument("--output-device", type=int, default=None)
-    parser.add_argument("--input-device", type=str, default=None)
-    parser.add_argument("--input-samplerate", type=int, default=None)
-    parser.add_argument("--capture-backend", type=str, default="sounddevice", choices=["sounddevice", "soundcard"])
-    parser.add_argument("--bluetooth-offset-sec", type=float, default=0.18)
-    parser.add_argument("--playback-latency", type=str, default="high")
-    parser.add_argument("--playback-blocksize", type=int, default=4096)
-    parser.add_argument("--aligner-debug", action="store_true")
-    parser.add_argument("--asr-debug-feed", action="store_true")
-    parser.add_argument("--asr-debug-feed-every", type=int, default=20)
-    parser.add_argument("--skip-bluetooth-preflight", action="store_true")
-    parser.add_argument("--preflight-duration-sec", type=float, default=3.5)
-    parser.add_argument("--tick-sleep-sec", type=float, default=0.03)
-    parser.add_argument("--profile-path", type=str, default="runtime/device_profiles.json")
-    parser.add_argument("--session-dir", type=str, default="runtime/latest_session")
-    parser.add_argument("--event-logging", action="store_true")
-    parser.add_argument("--startup-grace-sec", type=float, default=2.0)
-    parser.add_argument("--low-confidence-hold-sec", type=float, default=1.5)
-    parser.add_argument("--hotwords", type=str, default="")
-    parser.add_argument("--hotwords-score", type=float, default=1.8)
-    parser.add_argument("--disable-auto-hotwords", action="store_true")
-    parser.add_argument("--print-hotwords", action="store_true")
-    parser.add_argument("--hotwords-source", type=str, default="qwen", choices=["qwen", "local", "none"], help="热词来源：qwen / local / none")
-    parser.add_argument("--qwen-api-key", type=str, default=os.getenv("DASHSCOPE_API_KEY", ""), help="DashScope API Key，默认读环境变量 DASHSCOPE_API_KEY")
-    parser.add_argument("--qwen-model", type=str, default=os.getenv("QWEN_CHAT_MODEL", "qwen-plus"), help="Qwen 模型名，默认 qwen-plus")
-    parser.add_argument("--qwen-max-hotwords", type=int, default=24, help="Qwen 提取热词最大数量")
-    return parser
-def main() -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args()
-    text_path = Path(args.text_file).expanduser().resolve()
-    if not text_path.exists():
-        raise FileNotFoundError(f"Text file not found: {text_path}")
-    lesson_text = text_path.read_text(encoding="utf-8").strip()
-    if not lesson_text:
-        raise ValueError(f"Text file is empty: {text_path}")
-    lesson_id = slugify_filename_stem(text_path.stem)
-    lesson_base_dir = Path(args.lesson_base_dir).resolve()
-    lesson_dir = lesson_base_dir / lesson_id
-    validate_lesson_assets(lesson_dir)
-    manifest = load_manifest(lesson_dir)
-    playback_sample_rate = int(manifest["sample_rate_out"])
-    parsed_input_device = _parse_input_device_arg(args.input_device)
-    rec_cfg = pick_working_input_config(preferred_device=parsed_input_device if isinstance(parsed_input_device, int) else None, preferred_name_substring=parsed_input_device if isinstance(parsed_input_device, str) else None, preferred_rates=([args.input_samplerate, 48000, 44100, 16000] if args.input_samplerate is not None else [48000, 44100, 16000])) or {"device": parsed_input_device, "samplerate": args.input_samplerate or 48000}
-    if args.input_samplerate is not None:
-        rec_cfg["samplerate"] = args.input_samplerate
-    effective_input_device = rec_cfg["device"]
-    effective_input_samplerate = int(rec_cfg["samplerate"])
-    sherpa_paths = collect_sherpa_paths()
-    if args.asr == "sherpa":
-        validate_sherpa_paths(sherpa_paths)
-    effective_input_device, effective_output_device = _run_bluetooth_preflight_or_fail(input_device=effective_input_device, output_device=args.output_device, input_samplerate=effective_input_samplerate, playback_sample_rate=playback_sample_rate, preflight_duration_sec=float(args.preflight_duration_sec), skip_bluetooth_preflight=bool(args.skip_bluetooth_preflight))
-    input_device_name = _resolve_input_device_name(effective_input_device)
-    output_device_name = _resolve_output_device_name(effective_output_device)
-    auto_hotwords: list[str] = []
-    if not args.disable_auto_hotwords and args.hotwords_source != "none":
-        if args.hotwords_source == "qwen":
-            if args.qwen_api_key.strip():
-                auto_hotwords = extract_hotwords_with_qwen(lesson_text=lesson_text, api_key=args.qwen_api_key.strip(), model=args.qwen_model.strip(), max_terms=int(args.qwen_max_hotwords))
-                if not auto_hotwords:
-                    auto_hotwords = _build_hotwords_from_lesson_text_local(lesson_text, max_terms=min(20, int(args.qwen_max_hotwords)))
-            else:
-                auto_hotwords = _build_hotwords_from_lesson_text_local(lesson_text, max_terms=min(20, int(args.qwen_max_hotwords)))
-        elif args.hotwords_source == "local":
-            auto_hotwords = _build_hotwords_from_lesson_text_local(lesson_text, max_terms=min(20, int(args.qwen_max_hotwords)))
-    merged_hotwords = _merge_hotwords(auto_hotwords, str(args.hotwords or ""), max_terms=max(16, min(32, int(args.qwen_max_hotwords))))
-    hotwords_str = "\n".join(merged_hotwords)
-    if merged_hotwords:
-        preview = merged_hotwords[:20]
-    else:
-    if args.print_hotwords and merged_hotwords:
-        for term in merged_hotwords:
-    runtime = build_runtime(
-        {
-            "lesson_base_dir": str(lesson_base_dir),
-            "playback": {"sample_rate": playback_sample_rate, "channels": 1, "device": effective_output_device if isinstance(effective_output_device, int) else args.output_device, "latency": args.playback_latency, "blocksize": int(args.playback_blocksize), "bluetooth_output_offset_sec": float(args.bluetooth_offset_sec)},
-            "capture": {"backend": str(args.capture_backend), "device_sample_rate": effective_input_samplerate, "target_sample_rate": 16000, "channels": 1, "device": effective_input_device, "dtype": "float32", "blocksize": 0, "latency": "low"},
-            "asr": {"mode": args.asr, "tokens": sherpa_paths.get("tokens", ""), "encoder": sherpa_paths.get("encoder", ""), "decoder": sherpa_paths.get("decoder", ""), "joiner": sherpa_paths.get("joiner", ""), "sample_rate": 16000, "emit_partial_interval_sec": 0.08, "enable_endpoint": True, "debug_feed": bool(args.asr_debug_feed), "debug_feed_every_n_chunks": int(args.asr_debug_feed_every), "num_threads": 2, "provider": "cpu", "feature_dim": 80, "decoding_method": "greedy_search", "rule1_min_trailing_silence": 1.2, "rule2_min_trailing_silence": 0.8, "rule3_min_utterance_length": 12.0, "hotwords": hotwords_str, "hotwords_score": float(args.hotwords_score), "min_meaningful_text_len": 2, "endpoint_min_interval_sec": 0.35, "reset_on_empty_endpoint": False, "preserve_stream_on_partial_only": True, "force_reset_after_empty_endpoints": 999999999, "info_logging": True, "log_hotwords_on_start": True, "log_hotwords_preview_on_start": True, "hotwords_preview_limit": 12},
-            "alignment": {"window_back": 8, "window_ahead": 40, "stable_frames": 2, "min_confidence": 0.60, "backward_lock_frames": 3, "clause_boundary_bonus": 0.15, "cross_clause_backward_extra_penalty": 0.20, "debug": bool(args.aligner_debug), "max_hyp_tokens": 16, "weak_commit_min_conf": 0.82, "weak_commit_min_local_match": 0.80, "weak_commit_min_advance": 3},
-            "control": {"target_lead_sec": 0.15, "hold_if_lead_sec": 0.90, "resume_if_lead_sec": 0.28, "seek_if_lag_sec": -1.80, "min_confidence": 0.72, "seek_cooldown_sec": 1.20, "gain_following": 0.55, "gain_transition": 0.80, "gain_soft_duck": 0.42, "startup_grace_sec": float(args.startup_grace_sec), "low_confidence_hold_sec": float(args.low_confidence_hold_sec), "guide_play_sec": 2.20, "no_progress_hold_min_play_sec": 4.00, "progress_stale_sec": 1.10, "hold_trend_sec": 0.75, "tracking_quality_hold_min": 0.56, "tracking_quality_seek_min": 0.68, "resume_from_hold_speaking_lead_slack_sec": 0.45, "disable_seek": False},
-            "runtime": {"audio_queue_maxsize": 150, "asr_event_queue_maxsize": 64, "loop_interval_sec": float(args.tick_sleep_sec)},
-            "signal": {"min_vad_rms": 0.006, "vad_noise_multiplier": 2.8},
-            "adaptation": {"profile_path": str(Path(args.profile_path).expanduser().resolve())},
-            "session": {"session_dir": str(Path(args.session_dir).expanduser().resolve()), "event_logging": bool(args.event_logging)},
-            "device_context": {"input_device_name": input_device_name, "output_device_name": output_device_name, "input_sample_rate": effective_input_samplerate, "noise_floor_rms": 0.0025},
-            "debug": {"enabled": False},
-        }
-    )
-    runtime.run(lesson_id)
-if __name__ == "__main__":
-    main()
-```
-
----
 ### shadowing_app/runtime/latest_session/events.jsonl (Skipped Large File)
 
 ---
@@ -3929,25 +1354,44 @@ class FrameFeatureExtractor:
         self._tail = np.zeros((0,), dtype=np.float32)
         self._last_envelope = 0.0
         self._last_log_mel = np.zeros((self.n_mels,), dtype=np.float32)
-    def process_pcm16(self, pcm_bytes: bytes, *, observed_at_sec: float) -> list[AudioFrameFeature]:
+    def process_pcm16(
+        self,
+        pcm_bytes: bytes,
+        *,
+        observed_at_sec: float,
+    ) -> list[AudioFrameFeature]:
         if not pcm_bytes:
             return []
         audio_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
         if audio_i16.size == 0:
             return []
-        audio_f32 = (audio_i16.astype(np.float32) / 32768.0).astype(np.float32, copy=False)
-        start_time_sec = float(observed_at_sec) - (audio_f32.shape[0] / float(self.sample_rate))
+        audio_f32 = (audio_i16.astype(np.float32) / 32768.0).astype(
+            np.float32,
+            copy=False,
+        )
+        start_time_sec = float(observed_at_sec) - (
+            audio_f32.shape[0] / float(self.sample_rate)
+        )
         return self.process_float_audio(audio_f32, start_time_sec=start_time_sec)
-    def process_float_audio(self, audio_f32: np.ndarray, *, start_time_sec: float) -> list[AudioFrameFeature]:
+    def process_float_audio(
+        self,
+        audio_f32: np.ndarray,
+        *,
+        start_time_sec: float,
+    ) -> list[AudioFrameFeature]:
         arr = np.asarray(audio_f32, dtype=np.float32).reshape(-1)
         if arr.size == 0:
             return []
+        old_tail_len = self._tail.shape[0]
         full = np.concatenate([self._tail, arr], axis=0)
+        full_start_time_sec = float(start_time_sec) - (
+            old_tail_len / float(self.sample_rate)
+        )
         out: list[AudioFrameFeature] = []
         pos = 0
         while pos + self.frame_size <= full.shape[0]:
             frame = full[pos : pos + self.frame_size]
-            frame_time_sec = float(start_time_sec) + max(0, pos - self._tail.shape[0]) / float(self.sample_rate)
+            frame_time_sec = full_start_time_sec + pos / float(self.sample_rate)
             out.append(self._extract_frame_feature(frame, frame_time_sec))
             pos += self.hop_size
         self._tail = full[pos:].astype(np.float32, copy=False)
@@ -3955,13 +1399,20 @@ class FrameFeatureExtractor:
         if self._tail.shape[0] > max_tail:
             self._tail = self._tail[-max_tail:]
         return out
-    def _extract_frame_feature(self, frame: np.ndarray, frame_time_sec: float) -> AudioFrameFeature:
-        eps = 1e-8
+    def _extract_frame_feature(
+        self,
+        frame: np.ndarray,
+        frame_time_sec: float,
+    ) -> AudioFrameFeature:
         envelope = float(np.sqrt(np.mean(np.square(frame)))) if frame.size else 0.0
         onset_strength = max(0.0, envelope - self._last_envelope)
         self._last_envelope = envelope
         abs_frame = np.abs(frame)
-        voiced_ratio = float(np.mean(abs_frame >= max(self.min_voiced_rms, envelope * 0.55))) if frame.size else 0.0
+        voiced_ratio = (
+            float(np.mean(abs_frame >= max(self.min_voiced_rms, envelope * 0.55)))
+            if frame.size
+            else 0.0
+        )
         win = np.hanning(frame.shape[0]).astype(np.float32, copy=False)
         spec = np.abs(np.fft.rfft(frame * win))
         if spec.size <= 1:
@@ -3971,13 +1422,19 @@ class FrameFeatureExtractor:
             band_energy = self._compute_band_energy(spec)
             log_mel = self._compute_log_mel(spec)
         delta = log_mel - self._last_log_mel
-        smoothed = (1.0 - self.embedding_alpha) * self._last_log_mel + self.embedding_alpha * log_mel
+        smoothed = (
+            (1.0 - self.embedding_alpha) * self._last_log_mel
+            + self.embedding_alpha * log_mel
+        )
         self._last_log_mel = smoothed.astype(np.float32, copy=False)
         embedding = np.concatenate(
             [
                 smoothed,
                 delta,
-                np.asarray([envelope, onset_strength, voiced_ratio], dtype=np.float32),
+                np.asarray(
+                    [envelope, onset_strength, voiced_ratio],
+                    dtype=np.float32,
+                ),
             ],
             axis=0,
         )
@@ -3994,16 +1451,17 @@ class FrameFeatureExtractor:
         )
     def _compute_band_energy(self, spec: np.ndarray) -> list[float]:
         eps = 1e-8
-        edges = np.linspace(0, spec.shape[0], self.n_bands + 1, dtype=int)
+        power = np.square(np.asarray(spec, dtype=np.float32))
+        edges = np.linspace(0, power.shape[0], self.n_bands + 1, dtype=int)
         band_energy: list[float] = []
-        total = float(np.sum(spec) + eps)
+        total = float(np.sum(power) + eps)
         for i in range(self.n_bands):
             lo = int(edges[i])
             hi = int(edges[i + 1])
             if hi <= lo:
                 band_energy.append(0.0)
             else:
-                band_energy.append(float(np.sum(spec[lo:hi]) / total))
+                band_energy.append(float(np.sum(power[lo:hi]) / total))
         return band_energy
     def _compute_log_mel(self, spec: np.ndarray) -> np.ndarray:
         power = np.square(np.asarray(spec, dtype=np.float32))
@@ -4043,37 +1501,44 @@ class LatencyCalibrationState:
 class LatencyCalibrator:
     def __init__(
         self,
-        input_latency_adapt_ms: float = 2.0,
-        output_latency_adapt_ms: float = 4.0,
         target_shadow_lead_sec: float = 0.15,
-        min_tracking_quality: float = 0.86,
-        min_sync_hits_before_update: int = 5,
-        min_recent_signal_sec: float = 0.90,
-        min_update_interval_sec: float = 1.10,
-        min_error_ms_to_adjust: float = 55.0,
-        max_error_ms_for_observation: float = 1200.0,
-        consistency_tolerance_ms: float = 90.0,
-        max_runtime_output_drift_ms: float = 90.0,
-        max_runtime_input_drift_ms: float = 50.0,
+        min_update_interval_sec: float = 1.0,
+        min_tracking_quality: float = 0.84,
     ) -> None:
-        self.input_latency_adapt_ms = float(input_latency_adapt_ms)
-        self.output_latency_adapt_ms = float(output_latency_adapt_ms)
         self.target_shadow_lead_sec = float(target_shadow_lead_sec)
-        self.min_tracking_quality = float(min_tracking_quality)
-        self.min_sync_hits_before_update = max(2, int(min_sync_hits_before_update))
-        self.min_recent_signal_sec = float(min_recent_signal_sec)
         self.min_update_interval_sec = float(min_update_interval_sec)
-        self.min_error_ms_to_adjust = float(min_error_ms_to_adjust)
-        self.max_error_ms_for_observation = float(max_error_ms_for_observation)
-        self.consistency_tolerance_ms = float(consistency_tolerance_ms)
-        self.max_runtime_output_drift_ms = float(max_runtime_output_drift_ms)
-        self.max_runtime_input_drift_ms = float(max_runtime_input_drift_ms)
+        self.min_tracking_quality = float(min_tracking_quality)
         self._state: LatencyCalibrationState | None = None
         self._last_active_at_sec = 0.0
-        self._reliable_sync_hits = 0
-        self._last_reliable_error_ms: float | None = None
         self._last_update_at_sec = 0.0
-    def reset(self, device_profile: DeviceProfile) -> None:
+        self._obs_error_ema_ms = 0.0
+        self._obs_consistency_run = 0
+        self._max_observation_error_ms = 900.0
+        self._min_error_ms_to_adjust = 32.0
+        self._max_runtime_output_drift_ms = 90.0
+        self._max_runtime_input_drift_ms = 60.0
+        self._bluetooth_mode = False
+        self._bluetooth_long_session_mode = False
+        self._startup_fast_calibration_until_sec = 0.0
+    def reset(
+        self,
+        device_profile: DeviceProfile,
+        bluetooth_mode: bool = False,
+        bluetooth_long_session_mode: bool = False,
+        now_sec: float = 0.0,
+    ) -> None:
+        self._bluetooth_mode = bool(bluetooth_mode)
+        self._bluetooth_long_session_mode = bool(bluetooth_long_session_mode)
+        base_target_lead_sec = 0.15
+        if self._bluetooth_mode:
+            base_target_lead_sec = 0.35 if self._bluetooth_long_session_mode else 0.28
+        self.target_shadow_lead_sec = float(base_target_lead_sec)
+        self.min_update_interval_sec = 0.55 if self._bluetooth_mode else 1.0
+        self.min_tracking_quality = 0.74 if self._bluetooth_mode else 0.84
+        self._min_error_ms_to_adjust = 22.0 if self._bluetooth_mode else 32.0
+        self._max_runtime_output_drift_ms = 180.0 if self._bluetooth_mode else 90.0
+        self._max_runtime_input_drift_ms = 70.0 if self._bluetooth_mode else 60.0
+        self._startup_fast_calibration_until_sec = float(now_sec) + (18.0 if self._bluetooth_mode else 0.0)
         self._state = LatencyCalibrationState(
             estimated_input_latency_ms=float(device_profile.estimated_input_latency_ms),
             estimated_output_latency_ms=float(device_profile.estimated_output_latency_ms),
@@ -4083,68 +1548,14 @@ class LatencyCalibrator:
             calibrated=False,
         )
         self._last_active_at_sec = 0.0
-        self._reliable_sync_hits = 0
-        self._last_reliable_error_ms = None
         self._last_update_at_sec = 0.0
+        self._obs_error_ema_ms = 0.0
+        self._obs_consistency_run = 0
     def observe_signal(self, signal_quality: SignalQuality) -> None:
         if self._state is None:
             return
         if signal_quality.vad_active or signal_quality.speaking_likelihood >= 0.52:
             self._last_active_at_sec = float(signal_quality.observed_at_sec)
-    def observe_sync(
-        self,
-        *,
-        playback_ref_time_sec: float,
-        user_ref_time_sec: float,
-        tracking_quality: float,
-        stable: bool,
-        active_speaking: bool,
-        allow_observation: bool = True,
-    ) -> None:
-        if self._state is None:
-            return
-        now_sec = max(float(playback_ref_time_sec), float(user_ref_time_sec))
-        if not allow_observation:
-            self._soft_reset_observation_run()
-            return
-        if not stable:
-            self._soft_reset_observation_run()
-            return
-        if tracking_quality < self.min_tracking_quality:
-            self._soft_reset_observation_run()
-            return
-        if not active_speaking:
-            self._soft_reset_observation_run()
-            return
-        if self._last_active_at_sec <= 0.0:
-            self._soft_reset_observation_run()
-            return
-        if (now_sec - self._last_active_at_sec) > self.min_recent_signal_sec:
-            self._soft_reset_observation_run()
-            return
-        lead_sec = float(playback_ref_time_sec) - float(user_ref_time_sec)
-        lead_error_ms = (lead_sec - self.target_shadow_lead_sec) * 1000.0
-        if abs(lead_error_ms) > self.max_error_ms_for_observation:
-            self._soft_reset_observation_run()
-            return
-        self._accumulate_reliable_observation(lead_error_ms)
-        if self._reliable_sync_hits < self.min_sync_hits_before_update:
-            self._increase_confidence(0.012, max_conf=0.78)
-            return
-        if self._last_update_at_sec > 0.0 and (now_sec - self._last_update_at_sec) < self.min_update_interval_sec:
-            self._increase_confidence(0.008, max_conf=0.86)
-            return
-        if abs(lead_error_ms) < self.min_error_ms_to_adjust:
-            self._increase_confidence(0.020, max_conf=0.92)
-            self._last_update_at_sec = now_sec
-            self._reliable_sync_hits = max(self.min_sync_hits_before_update - 1, 0)
-            return
-        self._apply_runtime_output_drift(lead_error_ms)
-        self._maybe_apply_runtime_input_drift(lead_error_ms)
-        self._clamp_runtime_drifts()
-        self._increase_confidence(0.028, max_conf=0.95)
-        self._last_update_at_sec = now_sec
-        self._reliable_sync_hits = max(self.min_sync_hits_before_update - 2, 0)
     def snapshot(self) -> LatencyCalibrationState | None:
         return self._state
     def effective_output_latency_ms(self) -> float | None:
@@ -4155,50 +1566,124 @@ class LatencyCalibrator:
         if self._state is None:
             return None
         return float(self._state.estimated_input_latency_ms + self._state.runtime_input_drift_ms)
-    def _accumulate_reliable_observation(self, lead_error_ms: float) -> None:
-        if self._last_reliable_error_ms is not None:
-            if abs(lead_error_ms - self._last_reliable_error_ms) > self.consistency_tolerance_ms:
-                self._reliable_sync_hits = 1
-            else:
-                self._reliable_sync_hits += 1
+    def corrected_playback_ref_time_sec(self, playback_ref_time_sec: float) -> float:
+        input_ms = self.effective_input_latency_ms() or 0.0
+        return float(playback_ref_time_sec) - max(0.0, input_ms / 1000.0)
+    def observe_sync(
+        self,
+        *,
+        playback_ref_time_sec: float,
+        user_ref_time_sec: float,
+        tracking_quality: float,
+        stable: bool,
+        active_speaking: bool,
+        allow_observation: bool = True,
+        source_is_text_dominant: bool = True,
+        source_mode: str | None = None,
+        audio_text_disagreement_sec: float | None = None,
+    ) -> None:
+        if self._state is None:
+            return
+        now_sec = max(float(playback_ref_time_sec), float(user_ref_time_sec))
+        if not allow_observation:
+            self._reset_observation_run(decay_only=True)
+            return
+        if not stable or tracking_quality < self.min_tracking_quality or not active_speaking:
+            self._reset_observation_run(decay_only=True)
+            return
+        if self._last_active_at_sec <= 0.0 or (now_sec - self._last_active_at_sec) > 1.05:
+            self._reset_observation_run(decay_only=True)
+            return
+        mode = str(source_mode or ("text" if source_is_text_dominant else "joint")).strip().lower()
+        if mode not in {"text", "joint", "audio"}:
+            mode = "text"
+        if mode == "audio":
+            source_weight = 0.40
+        elif mode == "joint":
+            source_weight = 0.70
         else:
-            self._reliable_sync_hits = 1
-        self._last_reliable_error_ms = float(lead_error_ms)
+            source_weight = 1.00
+        if mode == "audio" and not self._bluetooth_mode:
+            self._reset_observation_run(decay_only=True)
+            return
+        if audio_text_disagreement_sec is not None:
+            max_allowed = 0.70 if self._bluetooth_mode else 0.55
+            if abs(float(audio_text_disagreement_sec)) > max_allowed:
+                self._reset_observation_run(decay_only=True)
+                return
+        if self._last_update_at_sec > 0.0 and (now_sec - self._last_update_at_sec) < self.min_update_interval_sec:
+            self._increase_confidence(0.006, max_conf=0.86)
+            return
+        corrected_playback_ref = self.corrected_playback_ref_time_sec(playback_ref_time_sec)
+        lead_sec = float(corrected_playback_ref) - float(user_ref_time_sec)
+        error_ms = (lead_sec - self.target_shadow_lead_sec) * 1000.0
+        error_ms *= source_weight
+        if abs(error_ms) > self._max_observation_error_ms:
+            self._reset_observation_run(decay_only=True)
+            return
+        self._accumulate_observation(error_ms)
+        self._increase_confidence(0.012, max_conf=0.80 if self._bluetooth_mode else 0.78)
+        required_consistency = 2 if (self._bluetooth_mode and now_sec <= self._startup_fast_calibration_until_sec) else 3
+        if self._obs_consistency_run < required_consistency:
+            return
+        if abs(self._obs_error_ema_ms) < self._min_error_ms_to_adjust:
+            self._increase_confidence(0.020, max_conf=0.94 if self._bluetooth_mode else 0.92)
+            self._last_update_at_sec = now_sec
+            return
+        self._apply_correction(self._obs_error_ema_ms, now_sec=now_sec)
+        self._last_update_at_sec = now_sec
+        self._increase_confidence(0.030, max_conf=0.97 if self._bluetooth_mode else 0.96)
+    def _accumulate_observation(self, error_ms: float) -> None:
+        error_ms = float(max(-320.0, min(320.0, error_ms)))
+        if self._obs_consistency_run <= 0:
+            self._obs_error_ema_ms = error_ms
+            self._obs_consistency_run = 1
+            return
+        tolerance = 90.0 if self._bluetooth_mode else 70.0
+        if abs(error_ms - self._obs_error_ema_ms) <= tolerance:
+            self._obs_consistency_run += 1
+        else:
+            self._obs_consistency_run = max(1, self._obs_consistency_run - 1)
+        alpha = 0.28 if self._bluetooth_mode else 0.22
+        self._obs_error_ema_ms = (1.0 - alpha) * self._obs_error_ema_ms + alpha * error_ms
+    def _apply_correction(self, error_ms: float, now_sec: float) -> None:
+        assert self._state is not None
+        bounded = float(max(-260.0, min(260.0, error_ms)))
+        magnitude = abs(bounded)
+        sign = 1.0 if bounded > 0.0 else -1.0
+        fast_startup = self._bluetooth_mode and now_sec <= self._startup_fast_calibration_until_sec
+        if self._bluetooth_mode:
+            if fast_startup:
+                output_step = max(4.0, min(14.0, magnitude * 0.080))
+                input_step = max(0.4, min(2.2, magnitude * 0.010))
+            else:
+                output_step = max(3.0, min(12.0, magnitude * 0.055))
+                input_step = max(0.3, min(1.6, magnitude * 0.006))
+        else:
+            output_step = max(1.0, min(5.0, magnitude * 0.040))
+            input_step = max(0.5, min(2.2, magnitude * 0.016))
+        self._state.runtime_output_drift_ms += sign * output_step
+        self._state.runtime_input_drift_ms += sign * input_step
+        self._state.runtime_output_drift_ms = max(
+            -self._max_runtime_output_drift_ms,
+            min(self._max_runtime_output_drift_ms, self._state.runtime_output_drift_ms),
+        )
+        self._state.runtime_input_drift_ms = max(
+            -self._max_runtime_input_drift_ms,
+            min(self._max_runtime_input_drift_ms, self._state.runtime_input_drift_ms),
+        )
+        self._obs_consistency_run = max(1, self._obs_consistency_run - 1)
     def _increase_confidence(self, delta: float, *, max_conf: float) -> None:
         assert self._state is not None
         self._state.confidence = min(float(max_conf), self._state.confidence + float(delta))
         self._state.calibrated = self._state.confidence >= 0.60
-    def _apply_runtime_output_drift(self, lead_error_ms: float) -> None:
-        assert self._state is not None
-        bounded_error_ms = max(-260.0, min(260.0, float(lead_error_ms)))
-        step_ms = min(self.output_latency_adapt_ms, max(1.0, abs(bounded_error_ms) * 0.045))
-        if bounded_error_ms > 0.0:
-            self._state.runtime_output_drift_ms += step_ms
+    def _reset_observation_run(self, *, decay_only: bool) -> None:
+        if decay_only:
+            self._obs_consistency_run = max(0, self._obs_consistency_run - 1)
+            self._obs_error_ema_ms *= 0.84 if self._bluetooth_mode else 0.80
         else:
-            self._state.runtime_output_drift_ms -= step_ms
-    def _maybe_apply_runtime_input_drift(self, lead_error_ms: float) -> None:
-        assert self._state is not None
-        if self._reliable_sync_hits < (self.min_sync_hits_before_update + 4):
-            return
-        if abs(lead_error_ms) < 170.0:
-            return
-        bounded_error_ms = max(-200.0, min(200.0, float(lead_error_ms)))
-        direction = 1.0 if bounded_error_ms > 0.0 else -1.0
-        step_ms = min(self.input_latency_adapt_ms, max(0.6, abs(bounded_error_ms) * 0.018))
-        self._state.runtime_input_drift_ms += direction * step_ms
-    def _clamp_runtime_drifts(self) -> None:
-        assert self._state is not None
-        self._state.runtime_output_drift_ms = max(
-            -self.max_runtime_output_drift_ms,
-            min(self.max_runtime_output_drift_ms, self._state.runtime_output_drift_ms),
-        )
-        self._state.runtime_input_drift_ms = max(
-            -self.max_runtime_input_drift_ms,
-            min(self.max_runtime_input_drift_ms, self._state.runtime_input_drift_ms),
-        )
-    def _soft_reset_observation_run(self) -> None:
-        self._reliable_sync_hits = 0
-        self._last_reliable_error_ms = None
+            self._obs_consistency_run = 0
+            self._obs_error_ema_ms = 0.0
 ```
 
 ---
@@ -4232,20 +1717,17 @@ class LiveAudioMatcher:
         update_interval_sec: float = 0.12,
         min_frames_for_match: int = 20,
         ring_buffer_sec: float = 6.0,
-        stretch_factors: tuple[float, ...] = (0.92, 1.00, 1.08),
-        boundary_bonus_radius_sec: float = 0.22,
-        dtw_top_k: int = 3,
-        dtw_band_ratio: float = 0.18,
     ) -> None:
         self.search_window_sec = float(search_window_sec)
         self.match_window_sec = float(match_window_sec)
         self.update_interval_sec = float(update_interval_sec)
         self.min_frames_for_match = max(8, int(min_frames_for_match))
         self.ring = AudioFeatureRingBuffer(max_duration_sec=ring_buffer_sec)
-        self.stretch_factors = tuple(float(x) for x in stretch_factors if x > 0.0) or (1.0,)
-        self.boundary_bonus_radius_sec = float(boundary_bonus_radius_sec)
-        self.dtw_top_k = max(1, int(dtw_top_k))
-        self.dtw_band_ratio = float(max(0.05, min(0.45, dtw_band_ratio)))
+        self._stretch_factors = (0.94, 1.00, 1.06)
+        self._dtw_top_k = 4
+        self._dtw_band_ratio = 0.20
+        self._recovery_window_sec = max(6.0, self.search_window_sec * 2.2)
+        self._global_anchor_step_sec = 0.9
         self._ref_features: ReferenceAudioFeatures | None = None
         self._ref_times = np.zeros((0,), dtype=np.float32)
         self._ref_env = np.zeros((0,), dtype=np.float32)
@@ -4253,14 +1735,17 @@ class LiveAudioMatcher:
         self._ref_band = np.zeros((0, 0), dtype=np.float32)
         self._ref_embed = np.zeros((0, 0), dtype=np.float32)
         self._boundary_times = np.zeros((0,), dtype=np.float32)
+        self._global_anchor_indices = np.zeros((0,), dtype=np.int32)
         self._last_snapshot: AudioMatchSnapshot | None = None
         self._last_emit_at_sec = 0.0
+        self._low_confidence_run = 0
     def reset(self, ref_features: ReferenceAudioFeatures, ref_map) -> None:
         _ = ref_map
         self._ref_features = ref_features
         self.ring.reset()
         self._last_snapshot = None
         self._last_emit_at_sec = 0.0
+        self._low_confidence_run = 0
         self._ref_times = np.asarray([x.time_sec for x in ref_features.frames], dtype=np.float32)
         self._ref_env = np.asarray([x.envelope for x in ref_features.frames], dtype=np.float32)
         self._ref_onset = np.asarray([x.onset_strength for x in ref_features.frames], dtype=np.float32)
@@ -4273,9 +1758,17 @@ class LiveAudioMatcher:
         else:
             self._ref_embed = np.zeros((len(ref_features.frames), 0), dtype=np.float32)
         self._boundary_times = np.asarray([float(x.time_sec) for x in ref_features.boundaries], dtype=np.float32)
+        self._global_anchor_indices = self._build_global_anchor_indices()
     def feed_features(self, frames: list[AudioFrameFeature]) -> None:
         self.ring.append_many(frames)
-    def snapshot(self, *, now_sec: float, progress_hint_ref_time_sec: float | None, playback_ref_time_sec: float | None, text_tracking_confidence: float) -> AudioMatchSnapshot | None:
+    def snapshot(
+        self,
+        *,
+        now_sec: float,
+        progress_hint_ref_time_sec: float | None,
+        playback_ref_time_sec: float | None,
+        text_tracking_confidence: float,
+    ) -> AudioMatchSnapshot | None:
         if self._ref_features is None or self._ref_env.size == 0:
             return None
         if self._last_snapshot is not None and (now_sec - self._last_emit_at_sec) < self.update_interval_sec:
@@ -4285,37 +1778,86 @@ class LiveAudioMatcher:
             return self._last_snapshot
         live_env = np.asarray([x.envelope for x in live], dtype=np.float32)
         live_onset = np.asarray([x.onset_strength for x in live], dtype=np.float32)
-        live_band = np.asarray([x.band_energy for x in live], dtype=np.float32) if live and live[0].band_energy else np.zeros((len(live), 0), dtype=np.float32)
-        live_embed = np.asarray([x.embedding for x in live], dtype=np.float32) if live and live[0].embedding else np.zeros((len(live), 0), dtype=np.float32)
-        center_time = self._choose_search_center(progress_hint_ref_time_sec=progress_hint_ref_time_sec, playback_ref_time_sec=playback_ref_time_sec, text_tracking_confidence=text_tracking_confidence)
-        candidates = self._search_candidates(live_env=live_env, live_onset=live_onset, live_band=live_band, live_embed=live_embed, center_time_sec=center_time)
+        live_band = (
+            np.asarray([x.band_energy for x in live], dtype=np.float32)
+            if live and live[0].band_energy
+            else np.zeros((len(live), 0), dtype=np.float32)
+        )
+        live_embed = (
+            np.asarray([x.embedding for x in live], dtype=np.float32)
+            if live and live[0].embedding
+            else np.zeros((len(live), 0), dtype=np.float32)
+        )
+        recovery_mode = self._should_enter_recovery(
+            progress_hint_ref_time_sec=progress_hint_ref_time_sec,
+            playback_ref_time_sec=playback_ref_time_sec,
+            text_tracking_confidence=text_tracking_confidence,
+        )
+        centers = self._choose_search_centers(
+            progress_hint_ref_time_sec=progress_hint_ref_time_sec,
+            playback_ref_time_sec=playback_ref_time_sec,
+            text_tracking_confidence=text_tracking_confidence,
+            recovery_mode=recovery_mode,
+        )
+        candidates = self._search_candidates(
+            live_env=live_env,
+            live_onset=live_onset,
+            live_band=live_band,
+            live_embed=live_embed,
+            center_time_secs=centers,
+            recovery_mode=recovery_mode,
+        )
         if not candidates:
             return self._last_snapshot
         best = candidates[0]
-        dtw_score, dtw_cost, dtw_coverage, best_idx = self._refine_with_dtw(live_embed=live_embed, candidates=candidates, live_len=len(live))
-        if best_idx >= 0:
-            best = next((c for c in candidates if c.idx == best_idx), best)
+        dtw_score, dtw_cost, dtw_coverage, best_candidate_idx = self._refine_with_dtw(
+            live_embed=live_embed,
+            candidates=candidates,
+            live_len=len(live),
+        )
+        if best_candidate_idx >= 0:
+            best = next((c for c in candidates if c.idx == best_candidate_idx), best)
         rhythm_score = self._rhythm_consistency(live_onset, best.idx, len(live_onset))
         boundary_bonus = self._boundary_bonus(best.idx, len(live_onset))
         stretch_bonus = self._stretch_bonus(best.stretch_factor)
-        local_similarity = max(0.0, min(1.0, 0.24 * best.env_score + 0.15 * best.onset_score + 0.13 * best.band_score + 0.20 * best.embed_score + 0.14 * rhythm_score + 0.10 * dtw_score + 0.02 * boundary_bonus + 0.02 * stretch_bonus))
-        conf = float(max(0.0, min(1.0, 0.10 + 0.90 * local_similarity)))
+        local_similarity = max(
+            0.0,
+            min(
+                1.0,
+                0.22 * best.env_score
+                + 0.14 * best.onset_score
+                + 0.12 * best.band_score
+                + 0.24 * best.embed_score
+                + 0.14 * rhythm_score
+                + 0.12 * dtw_score
+                + 0.01 * boundary_bonus
+                + 0.01 * stretch_bonus,
+            ),
+        )
+        conf = float(max(0.0, min(1.0, 0.08 + 0.92 * local_similarity)))
         center_ref_idx = min(best.idx + max(0, len(live) // 2 - 1), len(self._ref_times) - 1)
         ref_time = float(self._ref_times[center_ref_idx])
         ref_idx_hint = self._time_to_ref_idx(ref_time)
         repeated_pattern_score = 0.0
         if progress_hint_ref_time_sec is not None:
             delta = float(progress_hint_ref_time_sec) - ref_time
-            if 0.30 <= delta <= 2.40 and local_similarity >= 0.56:
-                repeated_pattern_score = min(1.0, 0.35 * (delta / 2.40) + 0.65 * max(0.0, 1.0 - dtw_coverage))
+            if 0.30 <= delta <= 2.60 and local_similarity >= 0.56:
+                repeated_pattern_score = min(1.0, 0.35 * (delta / 2.60) + 0.65 * max(0.0, 1.0 - dtw_coverage))
         drift_sec = 0.0 if progress_hint_ref_time_sec is None else float(ref_time - progress_hint_ref_time_sec)
         mode = "tracking"
         if text_tracking_confidence < 0.42 and conf >= 0.62:
             mode = "bootstrap"
         if repeated_pattern_score >= 0.55:
             mode = "repeat"
-        if playback_ref_time_sec is not None and abs(ref_time - float(playback_ref_time_sec)) <= 0.55 and text_tracking_confidence < 0.52 and conf >= 0.58:
+        if (
+            playback_ref_time_sec is not None
+            and abs(ref_time - float(playback_ref_time_sec)) <= 0.60
+            and text_tracking_confidence < 0.52
+            and conf >= 0.58
+        ):
             mode = "reentry"
+        if recovery_mode and conf >= 0.60 and abs(drift_sec) >= 1.2:
+            mode = "recovery"
         snap = AudioMatchSnapshot(
             estimated_ref_time_sec=ref_time,
             estimated_ref_idx_hint=int(ref_idx_hint),
@@ -4335,30 +1877,96 @@ class LiveAudioMatcher:
             coarse_candidate_rank=int(best.rank),
             time_offset_sec=float(drift_sec),
         )
+        if conf < 0.56:
+            self._low_confidence_run += 1
+        else:
+            self._low_confidence_run = 0
         self._last_snapshot = snap
         self._last_emit_at_sec = float(now_sec)
         return snap
-    def _choose_search_center(self, *, progress_hint_ref_time_sec: float | None, playback_ref_time_sec: float | None, text_tracking_confidence: float) -> float:
-        if progress_hint_ref_time_sec is not None and text_tracking_confidence >= 0.58:
-            return float(progress_hint_ref_time_sec)
-        if playback_ref_time_sec is not None:
-            return float(playback_ref_time_sec)
+    def _should_enter_recovery(
+        self,
+        *,
+        progress_hint_ref_time_sec: float | None,
+        playback_ref_time_sec: float | None,
+        text_tracking_confidence: float,
+    ) -> bool:
+        if self._last_snapshot is None:
+            return False
+        if self._low_confidence_run >= 2:
+            return True
+        if self._last_snapshot.confidence < 0.54:
+            return True
+        if progress_hint_ref_time_sec is not None:
+            if abs(self._last_snapshot.estimated_ref_time_sec - float(progress_hint_ref_time_sec)) >= 1.10:
+                return True
+        if playback_ref_time_sec is not None and text_tracking_confidence < 0.50:
+            if abs(self._last_snapshot.estimated_ref_time_sec - float(playback_ref_time_sec)) >= 1.40:
+                return True
+        return False
+    def _choose_search_centers(
+        self,
+        *,
+        progress_hint_ref_time_sec: float | None,
+        playback_ref_time_sec: float | None,
+        text_tracking_confidence: float,
+        recovery_mode: bool,
+    ) -> list[float]:
+        centers: list[float] = []
+        def add(x: float | None) -> None:
+            if x is None:
+                return
+            val = float(x)
+            if any(abs(val - old) < 0.25 for old in centers):
+                return
+            centers.append(val)
+        if progress_hint_ref_time_sec is not None:
+            add(progress_hint_ref_time_sec)
         if self._last_snapshot is not None:
-            return float(self._last_snapshot.estimated_ref_time_sec)
-        return 0.0
-    def _search_candidates(self, *, live_env: np.ndarray, live_onset: np.ndarray, live_band: np.ndarray, live_embed: np.ndarray, center_time_sec: float) -> list[_Candidate]:
+            add(self._last_snapshot.estimated_ref_time_sec)
+        if playback_ref_time_sec is not None:
+            add(playback_ref_time_sec)
+        if text_tracking_confidence < 0.48 and playback_ref_time_sec is not None:
+            add(float(playback_ref_time_sec) - 1.2)
+            add(float(playback_ref_time_sec) + 1.0)
+        if recovery_mode and self._ref_times.size > 0 and self._global_anchor_indices.size > 0:
+            for idx in self._global_anchor_indices[: min(16, len(self._global_anchor_indices))]:
+                add(float(self._ref_times[int(idx)]))
+        if not centers:
+            add(0.0)
+        return centers
+    def _search_candidates(
+        self,
+        *,
+        live_env: np.ndarray,
+        live_onset: np.ndarray,
+        live_band: np.ndarray,
+        live_embed: np.ndarray,
+        center_time_secs: list[float],
+        recovery_mode: bool,
+    ) -> list[_Candidate]:
         ref_n = int(self._ref_env.shape[0])
         live_n = int(live_env.shape[0])
         if live_n <= 0 or ref_n < live_n or self._ref_times.size == 0:
             return []
-        center_idx = int(np.searchsorted(self._ref_times, center_time_sec))
-        radius_frames = max(live_n, int(round(self.search_window_sec / max(1e-6, self._ref_features.frame_hop_sec))))
-        start = max(0, center_idx - radius_frames)
-        end = min(ref_n - live_n, center_idx + radius_frames)
-        if end < start:
-            start, end = 0, max(0, ref_n - live_n)
+        assert self._ref_features is not None
+        radius_sec = self._recovery_window_sec if recovery_mode else self.search_window_sec
+        radius_frames = max(live_n, int(round(radius_sec / max(1e-6, self._ref_features.frame_hop_sec))))
+        windows: list[tuple[int, int]] = []
+        for center_time_sec in center_time_secs:
+            center_idx = int(np.searchsorted(self._ref_times, center_time_sec))
+            center_start_idx = max(0, center_idx - live_n // 2)
+            start = max(0, center_start_idx - radius_frames)
+            end = min(ref_n - live_n, center_start_idx + radius_frames)
+            if end >= start:
+                windows.append((start, end))
+        if recovery_mode and ref_n > live_n:
+            step = max(8, int(round(self._global_anchor_step_sec / max(1e-6, self._ref_features.frame_hop_sec))))
+            for anchor in range(0, ref_n - live_n, step):
+                windows.append((anchor, min(ref_n - live_n, anchor + step)))
+        windows = self._merge_windows(windows)
         scores: list[_Candidate] = []
-        for stretch in self.stretch_factors:
+        for stretch in self._stretch_factors:
             warped_env = self._time_warp_1d(live_env, target_len=live_n, stretch_factor=stretch)
             warped_onset = self._time_warp_1d(live_onset, target_len=live_n, stretch_factor=stretch)
             warped_band = self._time_warp_2d(live_band, target_len=live_n, stretch_factor=stretch)
@@ -4367,62 +1975,104 @@ class LiveAudioMatcher:
             live_onset_z = self._zscore(warped_onset)
             live_band_z = self._zscore_rows(warped_band)
             live_embed_z = self._zscore_rows(warped_embed)
-            for idx in range(start, end + 1):
-                ref_env = self._ref_env[idx : idx + live_n]
-                ref_onset = self._ref_onset[idx : idx + live_n]
-                ref_band = self._ref_band[idx : idx + live_n] if self._ref_band.size > 0 else np.zeros((live_n, 0), dtype=np.float32)
-                ref_embed = self._ref_embed[idx : idx + live_n] if self._ref_embed.size > 0 else np.zeros((live_n, 0), dtype=np.float32)
-                env_score = self._corr(live_env_z, self._zscore(ref_env))
-                onset_score = self._corr(live_onset_z, self._zscore(ref_onset))
-                band_score = self._band_similarity(live_band_z, self._zscore_rows(ref_band))
-                embed_score = self._band_similarity(live_embed_z, self._zscore_rows(ref_embed))
-                boundary_bonus = self._boundary_bonus(idx, live_n)
-                total = 0.28 * env_score + 0.12 * onset_score + 0.14 * band_score + 0.38 * embed_score + 0.08 * boundary_bonus
-                scores.append(_Candidate(idx=idx, env_score=float(env_score), onset_score=float(onset_score), band_score=float(band_score), embed_score=float(embed_score), stretch_factor=float(stretch), total_score=float(total)))
+            for start, end in windows:
+                for idx in range(start, end + 1):
+                    ref_env = self._ref_env[idx : idx + live_n]
+                    ref_onset = self._ref_onset[idx : idx + live_n]
+                    ref_band = self._ref_band[idx : idx + live_n] if self._ref_band.size > 0 else np.zeros((live_n, 0), dtype=np.float32)
+                    ref_embed = self._ref_embed[idx : idx + live_n] if self._ref_embed.size > 0 else np.zeros((live_n, 0), dtype=np.float32)
+                    env_score = self._corr(live_env_z, self._zscore(ref_env))
+                    onset_score = self._corr(live_onset_z, self._zscore(ref_onset))
+                    band_score = self._band_similarity(live_band_z, self._zscore_rows(ref_band))
+                    embed_score = self._band_similarity(live_embed_z, self._zscore_rows(ref_embed))
+                    boundary_bonus = self._boundary_bonus(idx, live_n)
+                    total = 0.24 * env_score + 0.12 * onset_score + 0.14 * band_score + 0.42 * embed_score + 0.08 * boundary_bonus
+                    scores.append(
+                        _Candidate(
+                            idx=idx,
+                            env_score=float(env_score),
+                            onset_score=float(onset_score),
+                            band_score=float(band_score),
+                            embed_score=float(embed_score),
+                            stretch_factor=float(stretch),
+                            total_score=float(total),
+                        )
+                    )
         scores.sort(key=lambda x: x.total_score, reverse=True)
         deduped: list[_Candidate] = []
         seen: set[int] = set()
         for cand in scores:
-            bucket = int(cand.idx // max(3, len(live_env) // 4))
+            bucket = int(cand.idx // max(4, live_n // 3))
             if bucket in seen:
                 continue
             seen.add(bucket)
             deduped.append(cand)
-            if len(deduped) >= max(self.dtw_top_k, 5):
+            if len(deduped) >= max(self._dtw_top_k + 2, 8):
                 break
         for i, cand in enumerate(deduped, start=1):
             cand.rank = i
         return deduped
-    def _refine_with_dtw(self, *, live_embed: np.ndarray, candidates: list[_Candidate], live_len: int) -> tuple[float, float, float, int]:
+    def _merge_windows(self, windows: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        if not windows:
+            return []
+        windows.sort()
+        merged = [windows[0]]
+        for s, e in windows[1:]:
+            ls, le = merged[-1]
+            if s <= le + 2:
+                merged[-1] = (ls, max(le, e))
+            else:
+                merged.append((s, e))
+        return merged
+    def _build_global_anchor_indices(self) -> np.ndarray:
+        if self._ref_times.size == 0:
+            return np.zeros((0,), dtype=np.int32)
+        total = float(self._ref_times[-1])
+        step = max(0.6, self._global_anchor_step_sec)
+        anchors: list[int] = []
+        t = 0.0
+        while t <= total:
+            idx = int(np.searchsorted(self._ref_times, t))
+            idx = max(0, min(idx, len(self._ref_times) - 1))
+            anchors.append(idx)
+            t += step
+        return np.asarray(sorted(set(anchors)), dtype=np.int32)
+    def _refine_with_dtw(
+        self,
+        *,
+        live_embed: np.ndarray,
+        candidates: list[_Candidate],
+        live_len: int,
+    ) -> tuple[float, float, float, int]:
         if live_embed.size == 0 or self._ref_embed.size == 0:
             best = candidates[0]
             return max(0.0, min(1.0, best.embed_score)), 0.0, 0.0, int(best.idx)
         best_score = -1.0
         best_cost = 1e9
         best_coverage = 0.0
-        best_idx = -1
-        for cand in candidates[: self.dtw_top_k]:
-            lo = max(0, cand.idx - max(2, live_len // 8))
-            hi = min(self._ref_embed.shape[0], cand.idx + live_len + max(2, live_len // 8))
+        best_candidate_idx = -1
+        for cand in candidates[: self._dtw_top_k]:
+            lo = max(0, cand.idx - max(2, live_len // 6))
+            hi = min(self._ref_embed.shape[0], cand.idx + live_len + max(2, live_len // 6))
             ref_seg = self._ref_embed[lo:hi]
             score, cost, coverage = self._constrained_dtw_similarity(live_embed, ref_seg)
             if score > best_score:
                 best_score = score
                 best_cost = cost
                 best_coverage = coverage
-                best_idx = int(lo)
-        return max(0.0, best_score), float(best_cost), float(best_coverage), best_idx
+                best_candidate_idx = int(cand.idx)
+        return max(0.0, best_score), float(best_cost), float(best_coverage), best_candidate_idx
     def _constrained_dtw_similarity(self, live: np.ndarray, ref: np.ndarray) -> tuple[float, float, float]:
         n = int(live.shape[0])
         m = int(ref.shape[0])
         if n == 0 or m == 0:
             return 0.0, 1e9, 0.0
-        band = max(2, int(round(max(n, m) * self.dtw_band_ratio)))
+        band = max(2, int(round(max(n, m) * self._dtw_band_ratio)))
         dp = np.full((n + 1, m + 1), np.inf, dtype=np.float32)
         dp[0, 0] = 0.0
         for i in range(1, n + 1):
             j0 = max(1, i - band)
-            j1 = min(m, i + band + (m - n if m > n else 0))
+            j1 = min(m, i + band + max(0, m - n))
             for j in range(j0, j1 + 1):
                 cost = 1.0 - self._cosine(live[i - 1], ref[j - 1])
                 dp[i, j] = cost + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1])
@@ -4430,7 +2080,7 @@ class LiveAudioMatcher:
         final_cost = float(dp[n, end_j])
         path_len = float(n + end_j)
         mean_cost = final_cost / max(1.0, path_len)
-        score = max(0.0, min(1.0, 1.0 - mean_cost * 1.6))
+        score = max(0.0, min(1.0, 1.0 - mean_cost * 1.55))
         coverage = max(0.0, min(1.0, end_j / max(1, m)))
         return score, final_cost, coverage
     def _time_to_ref_idx(self, ref_time_sec: float) -> int:
@@ -4463,12 +2113,13 @@ class LiveAudioMatcher:
         center_idx = min(ref_start_idx + max(0, n // 2), len(self._ref_times) - 1)
         center_time = float(self._ref_times[center_idx])
         nearest = np.min(np.abs(self._boundary_times - center_time))
-        if nearest > self.boundary_bonus_radius_sec:
+        radius = 0.24
+        if nearest > radius:
             return 0.0
-        return float(max(0.0, 1.0 - nearest / max(1e-6, self.boundary_bonus_radius_sec)))
+        return float(max(0.0, 1.0 - nearest / radius))
     def _stretch_bonus(self, stretch_factor: float) -> float:
         diff = abs(float(stretch_factor) - 1.0)
-        return float(max(0.0, 1.0 - diff / 0.12))
+        return float(max(0.0, 1.0 - diff / 0.10))
     def _time_warp_1d(self, x: np.ndarray, *, target_len: int, stretch_factor: float) -> np.ndarray:
         if x.size == 0 or target_len <= 0:
             return np.zeros((0,), dtype=np.float32)
@@ -4489,8 +2140,8 @@ class LiveAudioMatcher:
         arr = np.asarray(x, dtype=np.float32)
         if arr.size == 0 or target_len <= 0 or arr.ndim != 2:
             return np.zeros((target_len, 0), dtype=np.float32)
-        pieces = [self._time_warp_1d(arr[:, i], target_len=target_len, stretch_factor=stretch_factor) for i in range(arr.shape[1])]
-        return np.stack(pieces, axis=1).astype(np.float32, copy=False)
+        cols = [self._time_warp_1d(arr[:, i], target_len=target_len, stretch_factor=stretch_factor) for i in range(arr.shape[1])]
+        return np.stack(cols, axis=1).astype(np.float32, copy=False)
     def _corr(self, a: np.ndarray, b: np.ndarray) -> float:
         if a.size == 0 or b.size == 0 or a.size != b.size:
             return 0.0
@@ -4501,8 +2152,8 @@ class LiveAudioMatcher:
     def _band_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         if a.size == 0 or b.size == 0 or a.shape != b.shape:
             return 0.0
-        diff = np.mean(np.abs(a - b))
-        return float(max(0.0, min(1.0, 1.0 - diff)))
+        diff = float(np.mean(np.abs(a - b)))
+        return float(1.0 / (1.0 + diff))
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = float(np.linalg.norm(a) * np.linalg.norm(b))
         if denom <= 1e-8:
@@ -4523,6 +2174,22 @@ class LiveAudioMatcher:
         sigma = np.std(x, axis=0, keepdims=True)
         sigma = np.where(sigma <= 1e-6, 1.0, sigma)
         return (x - mu) / sigma
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/audio/playback_config.py`
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass
+@dataclass(slots=True)
+class PlaybackConfig:
+    sample_rate: int
+    channels: int = 1
+    device: int | str | None = None
+    latency: str | float = "high"
+    blocksize: int = 0
+    bluetooth_output_offset_sec: float = 0.0
 ```
 
 ---
@@ -4723,6 +2390,146 @@ class ReferenceAudioStore:
 ```
 
 ---
+### 文件: `shadowing_app/src/shadowing/audio/sounddevice_player.py`
+
+```python
+from __future__ import annotations
+import queue
+import threading
+from collections.abc import Iterable
+import numpy as np
+import sounddevice as sd
+from shadowing.audio.playback_config import PlaybackConfig
+class SoundDevicePlayer:
+    def __init__(self, config: PlaybackConfig) -> None:
+        self.config = config
+        self._queue: queue.Queue[np.ndarray] = queue.Queue()
+        self._stream: sd.OutputStream | None = None
+        self._started = False
+        self._lock = threading.Lock()
+        self._closed = False
+        self._resolved_device: int | None = None
+    def start(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Player already closed")
+            if self._started:
+                return
+            self._resolved_device = self._resolve_output_device(self.config.device)
+            self._stream = sd.OutputStream(
+                samplerate=int(self.config.sample_rate),
+                channels=int(self.config.channels),
+                dtype="float32",
+                callback=self._callback,
+                blocksize=int(self.config.blocksize),
+                latency=self.config.latency,
+                device=self._resolved_device,
+            )
+            self._stream.start()
+            self._started = True
+    def stop(self) -> None:
+        with self._lock:
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                finally:
+                    self._stream.close()
+                    self._stream = None
+            self._started = False
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.stop()
+        self._closed = True
+    def enqueue(self, audio: np.ndarray) -> None:
+        if audio is None:
+            return
+        arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            return
+        self._queue.put(arr)
+    def enqueue_many(self, audios: Iterable[np.ndarray]) -> None:
+        for audio in audios:
+            self.enqueue(audio)
+    def clear(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+    def _callback(self, outdata, frames, time_info, status) -> None:
+        _ = time_info
+        if status:
+            pass
+        out = np.zeros((frames, int(self.config.channels)), dtype=np.float32)
+        filled = 0
+        while filled < frames:
+            try:
+                chunk = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if chunk.ndim != 1:
+                chunk = chunk.reshape(-1)
+            remain = frames - filled
+            take = min(remain, chunk.shape[0])
+            mono = chunk[:take].astype(np.float32, copy=False)
+            if int(self.config.channels) == 1:
+                out[filled : filled + take, 0] = mono
+            else:
+                out[filled : filled + take, :] = mono[:, None]
+            filled += take
+            leftover = chunk[take:]
+            if leftover.size > 0:
+                self._queue.queue.appendleft(leftover)
+                break
+        outdata[:] = out
+    def _resolve_output_device(self, device: int | str | None) -> int | None:
+        if device is None:
+            default_in, default_out = sd.default.device
+            _ = default_in
+            if default_out is None or int(default_out) < 0:
+                return None
+            return int(default_out)
+        if isinstance(device, int):
+            info = sd.query_devices(device)
+            max_out = int(info["max_output_channels"])
+            if max_out <= 0:
+                raise ValueError(f"Device index {device} is not an output device")
+            return int(device)
+        target = str(device).strip().lower()
+        if not target:
+            default_in, default_out = sd.default.device
+            _ = default_in
+            if default_out is None or int(default_out) < 0:
+                return None
+            return int(default_out)
+        matched_index: int | None = None
+        matched_name: str | None = None
+        devices = sd.query_devices()
+        for idx, dev in enumerate(devices):
+            if int(dev["max_output_channels"]) <= 0:
+                continue
+            name = str(dev["name"])
+            if target in name.lower():
+                matched_index = int(idx)
+                matched_name = name
+                break
+        if matched_index is None:
+            candidates: list[str] = []
+            for idx, dev in enumerate(devices):
+                if int(dev["max_output_channels"]) <= 0:
+                    continue
+                candidates.append(f"[{idx}] {dev['name']}")
+            joined = "\n".join(candidates[:50])
+            raise ValueError(
+                "Output device name not found: "
+                f"{device!r}\nAvailable output devices:\n{joined}"
+            )
+        _ = matched_name
+        return matched_index
+```
+
+---
 ### 文件: `shadowing_app/src/shadowing/bootstrap.py`
 
 ```python
@@ -4772,7 +2579,9 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
             device=playback_cfg.get("device"),
             latency=playback_cfg.get("latency", "low"),
             blocksize=int(playback_cfg.get("blocksize", 0)),
-            bluetooth_output_offset_sec=float(playback_cfg.get("bluetooth_output_offset_sec", 0.0)),
+            bluetooth_output_offset_sec=float(
+                playback_cfg.get("bluetooth_output_offset_sec", 0.0)
+            ),
         )
     )
     capture_backend = str(capture_cfg.get("backend", "sounddevice")).strip().lower()
@@ -4816,16 +2625,9 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
     aligner = IncrementalAligner(
         window_back=int(alignment_cfg.get("window_back", 8)),
         window_ahead=int(alignment_cfg.get("window_ahead", 40)),
-        stable_frames=int(alignment_cfg.get("stable_frames", 2)),
+        stable_hits=int(alignment_cfg.get("stable_hits", alignment_cfg.get("stable_frames", 2))),
         min_confidence=float(alignment_cfg.get("min_confidence", 0.60)),
-        backward_lock_frames=int(alignment_cfg.get("backward_lock_frames", 3)),
-        clause_boundary_bonus=float(alignment_cfg.get("clause_boundary_bonus", 0.15)),
-        cross_clause_backward_extra_penalty=float(alignment_cfg.get("cross_clause_backward_extra_penalty", 0.20)),
         debug=bool(alignment_cfg.get("debug", False)),
-        max_hyp_tokens=int(alignment_cfg.get("max_hyp_tokens", 16)),
-        weak_commit_min_conf=float(alignment_cfg.get("weak_commit_min_conf", 0.82)),
-        weak_commit_min_local_match=float(alignment_cfg.get("weak_commit_min_local_match", 0.80)),
-        weak_commit_min_advance=int(alignment_cfg.get("weak_commit_min_advance", 3)),
     )
     policy = ControlPolicy(**control_cfg)
     controller = StateMachineController(
@@ -4886,6 +2688,69 @@ def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
         ),
     )
     return runtime
+```
+
+---
+### 文件: `shadowing_app/src/shadowing/controller/state_machine_controller.py`
+
+```python
+from __future__ import annotations
+from shadowing.interfaces.controller import Controller
+from shadowing.types import (
+    AudioBehaviorSnapshot,
+    AudioMatchSnapshot,
+    ProgressEstimate,
+    SignalQuality,
+    TrackingSnapshot,
+)
+class StateMachineController(Controller):
+    def __init__(
+        self,
+        *,
+        progress_estimator,
+        control_policy,
+    ) -> None:
+        self._progress_estimator = progress_estimator
+        self._control_policy = control_policy
+        self._running = False
+        self._last_progress: ProgressEstimate | None = None
+        self._last_signal_quality: SignalQuality | None = None
+        self._last_tracking_snapshot: TrackingSnapshot | None = None
+        self._last_audio_match_snapshot: AudioMatchSnapshot | None = None
+        self._last_audio_behavior_snapshot: AudioBehaviorSnapshot | None = None
+    def start(self) -> None:
+        self._running = True
+    def stop(self) -> None:
+        self._running = False
+    def snapshot(self) -> ProgressEstimate | None:
+        return self._last_progress
+    def on_asr_event(self, event) -> None:
+        _ = event
+    def on_signal_quality(self, signal_quality: SignalQuality) -> None:
+        self._last_signal_quality = signal_quality
+    def on_tracking_snapshot(self, snapshot: TrackingSnapshot) -> None:
+        self._last_tracking_snapshot = snapshot
+    def on_audio_match_snapshot(self, snapshot: AudioMatchSnapshot) -> None:
+        self._last_audio_match_snapshot = snapshot
+    def on_audio_behavior_snapshot(self, snapshot: AudioBehaviorSnapshot) -> None:
+        self._last_audio_behavior_snapshot = snapshot
+    def on_playback_generation_changed(self, now_sec: float) -> None:
+        if hasattr(self._progress_estimator, "on_playback_generation_changed"):
+            self._progress_estimator.on_playback_generation_changed(now_sec)
+    def tick(self, now_sec: float) -> ProgressEstimate | None:
+        if not self._running:
+            return self._last_progress
+        progress = self._progress_estimator.update(
+            tracking=self._last_tracking_snapshot,
+            audio_match=self._last_audio_match_snapshot,
+            audio_behavior=self._last_audio_behavior_snapshot,
+            signal_quality=self._last_signal_quality,
+            now_sec=float(now_sec),
+        )
+        self._last_progress = progress
+        if progress is not None and hasattr(self._control_policy, "update"):
+            self._control_policy.update(progress=progress, now_sec=float(now_sec))
+        return progress
 ```
 
 ---
@@ -5157,16 +3022,36 @@ class ASRProvider(ABC):
 
 ```python
 from __future__ import annotations
-from abc import ABC, abstractmethod
-from shadowing.types import ControlDecision, PlaybackStatus, ProgressEstimate, SignalQuality
-class Controller(ABC):
-    @abstractmethod
-    def decide(
-        self,
-        playback: PlaybackStatus,
-        progress: ProgressEstimate | None,
-        signal_quality: SignalQuality | None,
-    ) -> ControlDecision: ...
+from typing import Protocol, runtime_checkable
+from shadowing.types import (
+    AudioBehaviorSnapshot,
+    AudioMatchSnapshot,
+    ProgressEstimate,
+    SignalQuality,
+    TrackingSnapshot,
+)
+@runtime_checkable
+class Controller(Protocol):
+    def start(self) -> None:
+        ...
+    def stop(self) -> None:
+        ...
+    def tick(self, now_sec: float) -> ProgressEstimate | None:
+        ...
+    def snapshot(self) -> ProgressEstimate | None:
+        ...
+    def on_asr_event(self, event) -> None:
+        ...
+    def on_signal_quality(self, signal_quality: SignalQuality) -> None:
+        ...
+    def on_tracking_snapshot(self, snapshot: TrackingSnapshot) -> None:
+        ...
+    def on_audio_match_snapshot(self, snapshot: AudioMatchSnapshot) -> None:
+        ...
+    def on_audio_behavior_snapshot(self, snapshot: AudioBehaviorSnapshot) -> None:
+        ...
+    def on_playback_generation_changed(self, now_sec: float) -> None:
+        ...
 ```
 
 ---
@@ -5944,23 +3829,26 @@ class ReferenceBuilder:
 ```python
 from __future__ import annotations
 from shadowing.progress.behavior_interpreter import BehaviorInterpreter
-from shadowing.types import ProgressEstimate, ReferenceMap, SignalQuality, TrackingMode, TrackingSnapshot, UserReadState
+from shadowing.types import (
+    ProgressEstimate,
+    ReferenceMap,
+    SignalQuality,
+    TrackingMode,
+    TrackingSnapshot,
+    UserReadState,
+)
 class AudioAwareProgressEstimator:
     def __init__(
         self,
         recent_progress_sec: float = 0.90,
         active_speaking_signal_min: float = 0.45,
-        min_tracking_for_follow: float = 0.58,
-        audio_takeover_confidence: float = 0.66,
-        audio_retain_confidence: float = 0.56,
-        max_audio_pull_sec: float = 1.2,
     ) -> None:
         self.recent_progress_sec = float(recent_progress_sec)
         self.active_speaking_signal_min = float(active_speaking_signal_min)
-        self.min_tracking_for_follow = float(min_tracking_for_follow)
-        self.audio_takeover_confidence = float(audio_takeover_confidence)
-        self.audio_retain_confidence = float(audio_retain_confidence)
-        self.max_audio_pull_sec = float(max_audio_pull_sec)
+        self._audio_takeover_conf = 0.68
+        self._audio_assist_conf = 0.58
+        self._max_audio_jump_tokens = 4
+        self._max_disagreement_for_joint = 1.0
         self.behavior_interpreter = BehaviorInterpreter(recent_progress_sec=recent_progress_sec)
         self._ref_map: ReferenceMap | None = None
         self._estimated_idx_f = 0.0
@@ -5986,7 +3874,15 @@ class AudioAwareProgressEstimator:
         self._last_audio_progress_at_sec = 0.0
     def on_playback_generation_changed(self, now_sec: float) -> None:
         self._force_reacquire_until_sec = float(now_sec) + 0.80
-    def update(self, *, tracking: TrackingSnapshot | None, audio_match, audio_behavior, signal_quality: SignalQuality | None, now_sec: float) -> ProgressEstimate | None:
+    def update(
+        self,
+        *,
+        tracking: TrackingSnapshot | None,
+        audio_match,
+        audio_behavior,
+        signal_quality: SignalQuality | None,
+        now_sec: float,
+    ) -> ProgressEstimate | None:
         if self._ref_map is None or not self._ref_map.tokens:
             return None
         if tracking is not None:
@@ -5997,47 +3893,66 @@ class AudioAwareProgressEstimator:
         text_committed_idx = current_idx
         text_quality = 0.0
         text_conf = 0.0
-        text_stable = False
         tracking_mode = TrackingMode.BOOTSTRAP
         if tracking is not None:
             text_candidate_idx = int(tracking.candidate_ref_idx)
             text_committed_idx = int(tracking.committed_ref_idx)
             text_quality = float(tracking.tracking_quality.overall_score)
             text_conf = float(tracking.confidence)
-            text_stable = bool(tracking.stable)
             tracking_mode = tracking.tracking_mode
         audio_idx = current_idx
         audio_conf = 0.0
-        audio_time_sec = None
         repeated = 0.0
         reentry = 0.0
         still_following = 0.0
+        audio_mode = "tracking"
         if audio_match is not None:
             audio_idx = max(0, min(int(getattr(audio_match, "estimated_ref_idx_hint", current_idx)), len(self._ref_map.tokens) - 1))
             audio_conf = float(getattr(audio_match, "confidence", 0.0))
-            audio_time_sec = float(getattr(audio_match, "estimated_ref_time_sec", 0.0))
             repeated = float(getattr(audio_match, "repeated_pattern_score", 0.0))
+            still_following = max(still_following, audio_conf * 0.80)
+            audio_mode = str(getattr(audio_match, "mode", "tracking"))
         if audio_behavior is not None:
             audio_conf = max(audio_conf, float(getattr(audio_behavior, "confidence", 0.0)) * 0.96)
-            still_following = float(getattr(audio_behavior, "still_following_likelihood", 0.0))
+            still_following = max(still_following, float(getattr(audio_behavior, "still_following_likelihood", 0.0)))
             repeated = max(repeated, float(getattr(audio_behavior, "repeated_likelihood", 0.0)))
             reentry = float(getattr(audio_behavior, "reentry_likelihood", 0.0))
         target_idx = float(max(current_idx, text_committed_idx))
         position_source = "text"
         if tracking is not None:
             weight = self._weight_for_tracking(tracking)
-            target_idx = max(target_idx, (1.0 - weight) * self._estimated_idx_f + weight * float(max(text_candidate_idx, text_committed_idx)))
-            if tracking.tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED) and tracking.local_match_ratio >= 0.68 and text_candidate_idx > current_idx:
+            target_idx = max(
+                target_idx,
+                (1.0 - weight) * self._estimated_idx_f + weight * float(max(text_candidate_idx, text_committed_idx)),
+            )
+            if (
+                tracking.tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED)
+                and tracking.local_match_ratio >= 0.68
+                and text_candidate_idx > current_idx
+            ):
                 target_idx = max(target_idx, float(current_idx) + 0.60)
-        audio_can_assist = bool(audio_conf >= self.audio_retain_confidence and still_following >= 0.58 and repeated < 0.82)
-        audio_can_takeover = bool(audio_conf >= self.audio_takeover_confidence and still_following >= 0.64 and (tracking is None or text_quality < 0.56 or tracking_mode in (TrackingMode.REACQUIRING, TrackingMode.LOST)))
-        if audio_can_assist:
-            audio_push = max(0, audio_idx - current_idx)
-            if audio_push > 0:
-                target_idx = max(target_idx, float(current_idx) + min(2.0, 0.45 + 0.35 * min(audio_push, 4)))
-                self._last_audio_progress_at_sec = float(now_sec)
-                position_source = "joint"
-        if audio_can_takeover:
+        audio_push = max(0, audio_idx - current_idx)
+        text_audio_disagreement = abs(audio_idx - max(text_candidate_idx, text_committed_idx))
+        text_weak = tracking is None or text_quality < 0.56 or tracking_mode in (TrackingMode.REACQUIRING, TrackingMode.LOST)
+        audio_can_assist = bool(
+            audio_conf >= self._audio_assist_conf
+            and still_following >= 0.58
+            and repeated < 0.80
+            and text_audio_disagreement <= 8
+        )
+        audio_can_takeover = bool(
+            audio_conf >= self._audio_takeover_conf
+            and still_following >= 0.66
+            and repeated < 0.72
+            and (reentry >= 0.56 or audio_mode in {"reentry", "recovery"} or text_weak)
+            and text_audio_disagreement <= 14
+        )
+        if audio_can_assist and audio_push > 0:
+            push = min(self._max_audio_jump_tokens, audio_push)
+            target_idx = max(target_idx, float(current_idx) + 0.40 + 0.45 * push)
+            self._last_audio_progress_at_sec = float(now_sec)
+            position_source = "joint"
+        if audio_can_takeover and audio_idx >= current_idx:
             target_idx = max(target_idx, float(audio_idx))
             self._last_audio_progress_at_sec = float(now_sec)
             position_source = "audio"
@@ -6050,9 +3965,23 @@ class AudioAwareProgressEstimator:
             self._last_progress_at_sec = float(now_sec)
             self._last_estimated_idx_at_progress = float(estimated_idx)
         self._estimated_idx_f = float(estimated_idx)
-        self._last_snapshot = self._render_snapshot(now_sec=now_sec, signal_quality=signal_quality, audio_conf=audio_conf, still_following=still_following, reentry=reentry, position_source=position_source)
+        self._last_snapshot = self._render_snapshot(
+            now_sec=now_sec,
+            signal_quality=signal_quality,
+            audio_conf=audio_conf,
+            still_following=still_following,
+            reentry=reentry,
+            position_source=position_source,
+        )
         return self._last_snapshot
-    def snapshot(self, *, now_sec: float, signal_quality: SignalQuality | None, audio_match=None, audio_behavior=None) -> ProgressEstimate | None:
+    def snapshot(
+        self,
+        *,
+        now_sec: float,
+        signal_quality: SignalQuality | None,
+        audio_match=None,
+        audio_behavior=None,
+    ) -> ProgressEstimate | None:
         if self._ref_map is None or not self._ref_map.tokens:
             return None
         audio_conf = 0.0
@@ -6061,23 +3990,40 @@ class AudioAwareProgressEstimator:
         position_source = "text"
         if audio_match is not None:
             audio_conf = float(getattr(audio_match, "confidence", 0.0))
+            still_following = max(still_following, audio_conf * 0.80)
         if audio_behavior is not None:
             audio_conf = max(audio_conf, float(getattr(audio_behavior, "confidence", 0.0)) * 0.96)
-            still_following = float(getattr(audio_behavior, "still_following_likelihood", 0.0))
+            still_following = max(still_following, float(getattr(audio_behavior, "still_following_likelihood", 0.0)))
             reentry = float(getattr(audio_behavior, "reentry_likelihood", 0.0))
-            if audio_conf >= self.audio_retain_confidence:
+            if audio_conf >= self._audio_assist_conf:
                 position_source = "joint"
-        self._last_snapshot = self._render_snapshot(now_sec=now_sec, signal_quality=signal_quality, audio_conf=audio_conf, still_following=still_following, reentry=reentry, position_source=position_source)
+        self._last_snapshot = self._render_snapshot(
+            now_sec=now_sec,
+            signal_quality=signal_quality,
+            audio_conf=audio_conf,
+            still_following=still_following,
+            reentry=reentry,
+            position_source=position_source,
+        )
         return self._last_snapshot
     def _weight_for_tracking(self, tracking: TrackingSnapshot) -> float:
         if tracking.tracking_mode == TrackingMode.LOCKED:
             return 0.82 if tracking.stable else 0.68
         if tracking.tracking_mode == TrackingMode.WEAK_LOCKED:
-            return 0.42
+            return 0.40
         if tracking.tracking_mode == TrackingMode.REACQUIRING:
             return 0.16
         return 0.05
-    def _render_snapshot(self, *, now_sec: float, signal_quality: SignalQuality | None, audio_conf: float, still_following: float, reentry: float, position_source: str) -> ProgressEstimate:
+    def _render_snapshot(
+        self,
+        *,
+        now_sec: float,
+        signal_quality: SignalQuality | None,
+        audio_conf: float,
+        still_following: float,
+        reentry: float,
+        position_source: str,
+    ) -> ProgressEstimate:
         assert self._ref_map is not None
         tracking = self._last_tracking
         estimated_idx = max(0, min(int(round(self._estimated_idx_f)), len(self._ref_map.tokens) - 1))
@@ -6085,12 +4031,12 @@ class AudioAwareProgressEstimator:
         progress_age = 9999.0
         if self._last_progress_at_sec > 0.0:
             progress_age = max(0.0, now_sec - self._last_progress_at_sec)
-        if self._last_audio_progress_at_sec > 0.0 and audio_conf >= self.audio_retain_confidence:
+        if self._last_audio_progress_at_sec > 0.0 and audio_conf >= self._audio_assist_conf:
             progress_age = min(progress_age, max(0.0, now_sec - self._last_audio_progress_at_sec))
         recently_progressed = progress_age <= self.recent_progress_sec
         signal_speaking = False
         if signal_quality is not None:
-            signal_speaking = signal_quality.vad_active or signal_quality.speaking_likelihood >= self.active_speaking_signal_min
+            signal_speaking = bool(signal_quality.vad_active or signal_quality.speaking_likelihood >= self.active_speaking_signal_min)
         tracking_mode = TrackingMode.BOOTSTRAP
         tracking_quality = 0.0
         confidence = 0.0
@@ -6115,11 +4061,15 @@ class AudioAwareProgressEstimator:
             active_speaking = True
         elif signal_speaking and tracking_quality >= 0.70:
             active_speaking = True
-        elif audio_conf >= self.audio_retain_confidence and (still_following >= 0.62 or reentry >= 0.58):
+        elif audio_conf >= self._audio_assist_conf and (still_following >= 0.62 or reentry >= 0.58):
             active_speaking = True
-        joint_conf = max(confidence, 0.55 * confidence + 0.45 * audio_conf, 0.52 * tracking_quality + 0.48 * audio_conf)
-        if audio_conf >= self.audio_takeover_confidence and joint_conf < audio_conf:
-            joint_conf = 0.92 * audio_conf
+        joint_conf = max(
+            confidence,
+            0.58 * confidence + 0.42 * audio_conf,
+            0.54 * tracking_quality + 0.46 * audio_conf,
+        )
+        if position_source == "audio":
+            joint_conf = max(joint_conf, audio_conf * 0.90)
         user_state = self.behavior_interpreter.infer(
             progress_age=progress_age,
             signal_quality=signal_quality,
@@ -6129,7 +4079,7 @@ class AudioAwareProgressEstimator:
             candidate_idx=max(source_candidate_ref_idx, estimated_idx),
             estimated_idx=estimated_idx,
         )
-        if audio_conf >= self.audio_takeover_confidence and still_following >= 0.62 and user_state in (UserReadState.NOT_STARTED, UserReadState.PAUSED):
+        if audio_conf >= self._audio_takeover_conf and still_following >= 0.64 and user_state in (UserReadState.NOT_STARTED, UserReadState.PAUSED):
             user_state = UserReadState.FOLLOWING
         return ProgressEstimate(
             estimated_ref_idx=estimated_idx,
@@ -6143,7 +4093,7 @@ class AudioAwareProgressEstimator:
             tracking_mode=tracking_mode,
             tracking_quality=float(max(tracking_quality, audio_conf * 0.72 if position_source != "text" else tracking_quality)),
             stable=bool(stable),
-            confidence=float(max(confidence, audio_conf * 0.80 if position_source == "audio" else confidence)),
+            confidence=float(max(confidence, audio_conf * 0.82 if position_source == "audio" else confidence)),
             active_speaking=bool(active_speaking),
             recently_progressed=bool(recently_progressed),
             user_state=user_state,
@@ -6579,21 +4529,6 @@ def _safe_ratio(a: int, b: int) -> float:
     if b <= 0:
         return 0.0
     return max(0.0, min(1.0, float(a) / float(b)))
-def _lcp_len(a: str, b: str) -> int:
-    n = min(len(a), len(b))
-    i = 0
-    while i < n and a[i] == b[i]:
-        i += 1
-    return i
-def _char_overlap_ratio(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    matched = 0
-    n = min(len(a), len(b))
-    for i in range(n):
-        if a[i] == b[i]:
-            matched += 1
-    return matched / max(1, len(a))
 @dataclass(slots=True)
 class AlignmentResult:
     committed: int
@@ -6621,42 +4556,28 @@ class IncrementalAligner:
         self,
         reference_text: str | Sequence[str] | None = None,
         *,
-        window_back: int = 8,
-        window_ahead: int = 40,
-        stable_frames: int = 2,
-        min_confidence: float = 0.60,
-        backward_lock_frames: int = 3,
-        clause_boundary_bonus: float = 0.15,
-        cross_clause_backward_extra_penalty: float = 0.20,
+        window_back: int = 10,
+        window_ahead: int = 48,
+        stable_hits: int = 2,
+        min_confidence: float = 0.62,
         debug: bool = False,
-        max_hyp_tokens: int = 16,
-        weak_commit_min_conf: float = 0.82,
-        weak_commit_min_local_match: float = 0.80,
-        weak_commit_min_advance: int = 3,
     ) -> None:
-        self.debug = bool(debug)
         self.window_back = int(window_back)
         self.window_ahead = int(window_ahead)
-        self.stable_frames = max(1, int(stable_frames))
+        self.stable_hits = max(1, int(stable_hits))
         self.min_confidence = float(min_confidence)
-        self.backward_lock_frames = int(backward_lock_frames)
-        self.clause_boundary_bonus = float(clause_boundary_bonus)
-        self.cross_clause_backward_extra_penalty = float(cross_clause_backward_extra_penalty)
-        self.max_hyp_tokens = int(max_hyp_tokens)
-        self.weak_commit_min_conf = float(weak_commit_min_conf)
-        self.weak_commit_min_local_match = float(weak_commit_min_local_match)
-        self.weak_commit_min_advance = int(weak_commit_min_advance)
+        self.debug = bool(debug)
         self.reference_text = ""
         self.reference_norm = ""
         self._committed = 0
         self._last_candidate = 0
-        self._same_candidate_repeat = 0
+        self._same_candidate_hits = 0
+        self._same_zone_hits = 0
         self._last_zone_anchor = 0
-        self._same_forward_zone_repeat = 0
         self._forced_center: int | None = None
+        self._forced_budget = 0
         self._forced_window_back: int | None = None
         self._forced_window_ahead: int | None = None
-        self._forced_budget = 0
         if reference_text is not None:
             self.set_reference(reference_text)
     @property
@@ -6671,18 +4592,18 @@ class IncrementalAligner:
         self.reference_norm = _normalize_text(self.reference_text)
         self.reset(committed=0)
     def reset(self, committed: int | None = None) -> None:
-        if committed is not None:
-            self._committed = max(0, min(len(self.reference_norm), int(committed)))
-        else:
+        if committed is None:
             self._committed = 0
+        else:
+            self._committed = max(0, min(int(committed), len(self.reference_norm)))
         self._last_candidate = self._committed
-        self._same_candidate_repeat = 0
-        self._last_zone_anchor = self._committed
-        self._same_forward_zone_repeat = 0
+        self._same_candidate_hits = 0
+        self._same_zone_hits = 0
+        self._last_zone_anchor = (self._committed // 4) * 4
         self._forced_center = None
+        self._forced_budget = 0
         self._forced_window_back = None
         self._forced_window_ahead = None
-        self._forced_budget = 0
     def force_recenter(
         self,
         committed_hint: int,
@@ -6695,8 +4616,8 @@ class IncrementalAligner:
             return
         hint = max(0, min(int(committed_hint), len(self.reference_norm)))
         self._forced_center = hint
-        self._forced_window_back = int(window_back) if window_back is not None else max(self.window_back + 4, 12)
-        self._forced_window_ahead = int(window_ahead) if window_ahead is not None else max(self.window_ahead // 2, 24)
+        self._forced_window_back = int(window_back) if window_back is not None else max(16, self.window_back + 6)
+        self._forced_window_ahead = int(window_ahead) if window_ahead is not None else max(32, self.window_ahead // 2)
         self._forced_budget = max(1, int(budget_events))
         self._committed = min(self._committed, hint)
     def update(self, hypothesis_text: str) -> AlignmentResult:
@@ -6723,7 +4644,7 @@ class IncrementalAligner:
             return AlignmentResult(
                 committed=self._committed,
                 candidate=self._committed,
-                score=-1.5,
+                score=-1.0,
                 conf=0.0,
                 stable=False,
                 backward=False,
@@ -6735,37 +4656,36 @@ class IncrementalAligner:
                 normalized_text=hyp,
             )
         candidate, matched_n, score, conf, backward, mode, window, local_match = self._search_best_candidate(hyp)
-        repeated_candidate = False
-        if candidate == self._last_candidate:
-            self._same_candidate_repeat += 1
-            repeated_candidate = True
+        repeated_candidate = candidate == self._last_candidate
+        if repeated_candidate:
+            self._same_candidate_hits += 1
         else:
-            self._same_candidate_repeat = 0
-        zone_anchor = (candidate // 3) * 3
+            self._same_candidate_hits = 1
+        zone_anchor = (candidate // 4) * 4
         if zone_anchor == self._last_zone_anchor and candidate >= self._committed:
-            self._same_forward_zone_repeat += 1
+            self._same_zone_hits += 1
         else:
-            self._same_forward_zone_repeat = 0
+            self._same_zone_hits = 1
         self._last_zone_anchor = zone_anchor
         advance = candidate - self._committed
-        hard_commit = (
+        strong_accept = (
             not backward
             and advance >= 1
             and conf >= self.min_confidence
-            and local_match >= 0.62
-            and self._same_candidate_repeat >= (self.stable_frames - 1)
+            and local_match >= 0.60
+            and self._same_candidate_hits >= self.stable_hits
         )
         weak_forward = (
             not backward
-            and advance >= self.weak_commit_min_advance
-            and conf >= self.weak_commit_min_conf
-            and local_match >= self.weak_commit_min_local_match
-            and self._same_forward_zone_repeat >= 1
+            and advance >= 3
+            and conf >= max(0.80, self.min_confidence + 0.16)
+            and local_match >= 0.76
+            and self._same_zone_hits >= 2
         )
         accepted = False
         soft_committed = False
         stable = False
-        if hard_commit:
+        if strong_accept:
             self._committed = max(self._committed, candidate)
             accepted = True
             stable = True
@@ -6773,7 +4693,6 @@ class IncrementalAligner:
             self._committed = max(self._committed, candidate)
             accepted = True
             soft_committed = True
-            stable = False
         result = AlignmentResult(
             committed=self._committed,
             candidate=candidate,
@@ -6800,8 +4719,6 @@ class IncrementalAligner:
                 self._forced_center = None
                 self._forced_window_back = None
                 self._forced_window_ahead = None
-        if self.debug:
-            self._print_debug(result)
         return result
     def _search_best_candidate(
         self,
@@ -6809,93 +4726,160 @@ class IncrementalAligner:
     ) -> tuple[int, int, float, float, bool, str, tuple[int, int], float]:
         ref = self.reference_norm
         committed = self._committed
-        if self._forced_center is not None and self._forced_budget > 0:
-            center = max(committed, int(self._forced_center))
-            start = max(0, center - int(self._forced_window_back or self.window_back))
-            end = min(len(ref), center + int(self._forced_window_ahead or self.window_ahead))
-            forced_mode = True
-        else:
-            start = max(0, committed - self.window_back)
-            end = min(len(ref), committed + self.window_ahead)
-            center = committed
-            forced_mode = False
+        start, end, mode = self._build_search_window(hyp)
         best_candidate = committed
-        best_matched = 0
+        best_matched_n = 0
         best_score = -1e9
         best_conf = 0.0
         best_local_match = 0.0
-        best_mode = "normal"
         for cand in range(start, end + 1):
-            max_take = min(len(hyp), len(ref) - cand)
-            if max_take <= 0:
+            seg = ref[cand : min(len(ref), cand + max(len(hyp) + 10, 18))]
+            if not seg:
                 continue
-            ref_seg = ref[cand : cand + max_take]
-            matched = _lcp_len(hyp, ref_seg)
-            local_match = _char_overlap_ratio(
-                hyp[: min(12, len(hyp))],
-                ref_seg[: min(12, len(ref_seg))],
-            )
+            sim, matched_n = self._substring_similarity(hyp, seg)
+            prefix = self._prefix_match_ratio(hyp, seg)
+            suffix = self._suffix_match_ratio(hyp, seg)
+            bigram = self._bigram_overlap(hyp, seg)
+            local_match = 0.45 * sim + 0.25 * prefix + 0.20 * suffix + 0.10 * bigram
             advance = cand - committed
             backward = advance < 0
             score = (
-                matched * 3.2
-                + local_match * 7.0
-                - abs(advance) * 0.30
-                - (2.5 if backward else 0.0)
+                10.0 * sim
+                + 4.2 * prefix
+                + 3.4 * suffix
+                + 2.8 * bigram
+                + 0.12 * matched_n
+                - 0.14 * abs(advance)
+                - (1.8 if backward else 0.0)
             )
+            if not backward and matched_n >= min(4, len(hyp)):
+                score += 0.8
+            if not backward and suffix >= 0.68:
+                score += 0.5
+            if backward and sim < 0.62:
+                score -= 1.2
             conf = max(
                 0.0,
                 min(
                     0.999,
-                    0.58 * _safe_ratio(matched, len(hyp))
-                    + 0.32 * local_match
-                    + 0.10 * (1.0 if not backward else 0.0),
+                    0.55 * sim + 0.18 * prefix + 0.14 * suffix + 0.08 * bigram + 0.05 * (0.0 if backward else 1.0),
                 ),
             )
-            if not backward and matched >= min(3, len(hyp)):
-                score += 1.2
-                conf = min(0.999, conf + 0.04)
-            if not backward and matched <= 2 and local_match >= 0.84:
-                score += 1.3
-                conf = min(0.999, conf + 0.06)
-            if advance > self.window_ahead * 0.7 and matched <= 1 and local_match < 0.55:
-                score -= 2.5
-                conf = max(0.0, conf - 0.10)
-            if forced_mode:
-                dist_from_center = abs(cand - center)
-                score -= 0.08 * dist_from_center
-                if cand >= center - 2 and matched >= 2:
-                    score += 0.8
-                    conf = min(0.999, conf + 0.03)
             if score > best_score:
-                best_candidate = cand + matched
-                if matched <= 2 and not backward and local_match >= 0.84:
-                    best_candidate = max(best_candidate, min(cand + max_take, cand + matched + 2))
-                best_matched = matched
                 best_score = score
                 best_conf = conf
                 best_local_match = local_match
-                best_mode = "forced_recenter" if forced_mode else ("backward" if backward else "normal")
+                best_matched_n = matched_n
+                best_candidate = min(len(ref), cand + max(matched_n, int(round(len(hyp) * max(sim, 0.35)))))
         backward = best_candidate < committed
-        if backward and best_conf <= 0.55:
+        if backward and best_conf < 0.58:
             best_candidate = committed
-            best_mode = "backward"
-            best_score = min(best_score, -1.5)
+            best_score = min(best_score, -0.8)
+            mode = "backward_rejected"
+        elif best_conf < 0.44 and mode == "normal":
+            mode = "low_confidence"
         return (
             best_candidate,
-            best_matched,
-            best_score,
-            best_conf,
-            backward,
-            best_mode,
+            best_matched_n,
+            float(best_score),
+            float(best_conf),
+            bool(backward),
+            mode,
             (start, end),
-            best_local_match,
+            float(best_local_match),
         )
-    def _print_debug(self, result: AlignmentResult) -> None:
-        tag = "[ALIGN]" if result.accepted else "[ALIGN-REJECT]"
-        extra = " soft_commit=True" if result.soft_committed else ""
-        if result.weak_forward and not result.soft_committed:
-            extra += " weak_forward=True"
+    def _build_search_window(self, hyp: str) -> tuple[int, int, str]:
+        ref = self.reference_norm
+        committed = self._committed
+        if self._forced_center is not None and self._forced_budget > 0:
+            center = max(committed, int(self._forced_center))
+            back = int(self._forced_window_back or self.window_back)
+            ahead = int(self._forced_window_ahead or self.window_ahead)
+            return (
+                max(0, center - back),
+                min(len(ref), center + ahead),
+                "forced_recenter",
+            )
+        long_partial = len(hyp) >= 12
+        repeated_zone = self._same_zone_hits >= 3
+        recovery_mode = long_partial or repeated_zone
+        back = self.window_back + (6 if recovery_mode else 0)
+        ahead = self.window_ahead + (10 if recovery_mode else 0)
+        return (
+            max(0, committed - back),
+            min(len(ref), committed + ahead),
+            "recovery" if recovery_mode else "normal",
+        )
+    def _substring_similarity(self, hyp: str, seg: str) -> tuple[float, int]:
+        if not hyp or not seg:
+            return 0.0, 0
+        n = len(hyp)
+        m = len(seg)
+        best_sim = 0.0
+        best_match = 0
+        min_len = max(1, int(round(n * 0.70)))
+        max_len = min(m, n + 6)
+        for take in range(min_len, max_len + 1):
+            ref_sub = seg[:take]
+            dist = self._edit_distance_banded(hyp, ref_sub, band=max(2, abs(len(hyp) - len(ref_sub)) + 3))
+            denom = max(len(hyp), len(ref_sub), 1)
+            sim = max(0.0, 1.0 - dist / denom)
+            matched = max(0, len(hyp) - dist)
+            if sim > best_sim:
+                best_sim = sim
+                best_match = matched
+        return best_sim, best_match
+    def _edit_distance_banded(self, a: str, b: str, band: int) -> int:
+        n = len(a)
+        m = len(b)
+        inf = 10**9
+        prev = [inf] * (m + 1)
+        prev[0] = 0
+        for j in range(1, m + 1):
+            prev[j] = j
+        for i in range(1, n + 1):
+            cur = [inf] * (m + 1)
+            lo = max(1, i - band)
+            hi = min(m, i + band)
+            if lo == 1:
+                cur[0] = i
+            for j in range(lo, hi + 1):
+                cost = 0 if a[i - 1] == b[j - 1] else 1
+                cur[j] = min(
+                    prev[j] + 1,
+                    cur[j - 1] + 1,
+                    prev[j - 1] + cost,
+                )
+            prev = cur
+        return int(prev[m])
+    def _prefix_match_ratio(self, a: str, b: str) -> float:
+        n = min(len(a), len(b))
+        if n <= 0:
+            return 0.0
+        hit = 0
+        for i in range(n):
+            if a[i] != b[i]:
+                break
+            hit += 1
+        return _safe_ratio(hit, min(len(a), 10))
+    def _suffix_match_ratio(self, a: str, b: str) -> float:
+        n = min(len(a), len(b))
+        if n <= 0:
+            return 0.0
+        hit = 0
+        for i in range(1, n + 1):
+            if a[-i] != b[-i]:
+                break
+            hit += 1
+        return _safe_ratio(hit, min(len(a), 10))
+    def _bigram_overlap(self, a: str, b: str) -> float:
+        if len(a) < 2 or len(b) < 2:
+            return 0.0
+        aset = {a[i : i + 2] for i in range(len(a) - 1)}
+        bset = {b[i : i + 2] for i in range(len(b) - 1)}
+        if not aset:
+            return 0.0
+        return _safe_ratio(len(aset & bset), len(aset))
 ```
 
 ---
@@ -7612,7 +5596,10 @@ def get_default_input_device_index() -> int | None:
     if default_input is None or int(default_input) < 0:
         return None
     return int(default_input)
-def choose_input_device(preferred_index: int | None = None, preferred_name_substring: str | None = None) -> int | None:
+def choose_input_device(
+    preferred_index: int | None = None,
+    preferred_name_substring: str | None = None,
+) -> int | None:
     devices = list_input_devices()
     if not devices:
         return None
@@ -7629,22 +5616,51 @@ def choose_input_device(preferred_index: int | None = None, preferred_name_subst
     if default_idx is not None:
         return default_idx
     return devices[0].index
-def check_input_settings(device: int | None, samplerate: int, channels: int = 1, dtype: str = "float32") -> bool:
+def check_input_settings(
+    device: int | None,
+    samplerate: int,
+    channels: int = 1,
+    dtype: str = "float32",
+) -> bool:
     try:
-        sd.check_input_settings(device=device, samplerate=int(samplerate), channels=int(channels), dtype=str(dtype))
+        sd.check_input_settings(
+            device=device,
+            samplerate=int(samplerate),
+            channels=int(channels),
+            dtype=str(dtype),
+        )
         return True
     except Exception:
         return False
-def pick_working_input_config(preferred_device: int | None = None, preferred_name_substring: str | None = None, preferred_rates: list[int] | None = None, channels: int = 1, dtype: str = "float32") -> dict[str, Any] | None:
+def pick_working_input_config(
+    preferred_device: int | None = None,
+    preferred_name_substring: str | None = None,
+    preferred_rates: list[int] | None = None,
+    channels: int = 1,
+    dtype: str = "float32",
+) -> dict[str, Any] | None:
     preferred_rates = preferred_rates or [48000, 44100, 16000]
-    device = choose_input_device(preferred_index=preferred_device, preferred_name_substring=preferred_name_substring)
+    device = choose_input_device(
+        preferred_index=preferred_device,
+        preferred_name_substring=preferred_name_substring,
+    )
     if device is None:
         return None
     for sr in preferred_rates:
         if int(sr) <= 0:
             continue
-        if check_input_settings(device=device, samplerate=int(sr), channels=int(channels), dtype=str(dtype)):
-            return {"device": int(device), "samplerate": int(sr), "channels": int(channels), "dtype": str(dtype)}
+        if check_input_settings(
+            device=device,
+            samplerate=int(sr),
+            channels=int(channels),
+            dtype=str(dtype),
+        ):
+            return {
+                "device": int(device),
+                "samplerate": int(sr),
+                "channels": int(channels),
+                "dtype": str(dtype),
+            }
     return None
 ```
 
@@ -7970,6 +5986,19 @@ class ControlPolicy:
     resume_from_hold_speaking_lead_slack_sec: float = 0.45
     reacquire_soft_duck_sec: float = 2.00
     disable_seek: bool = False
+    bluetooth_long_session_target_lead_sec: float = 0.35
+    bluetooth_long_session_hold_if_lead_sec: float = 1.20
+    bluetooth_long_session_resume_if_lead_sec: float = 0.22
+    bluetooth_long_session_seek_if_lag_sec: float = -2.80
+    bluetooth_long_session_seek_cooldown_sec: float = 2.60
+    bluetooth_long_session_progress_stale_sec: float = 1.45
+    bluetooth_long_session_hold_trend_sec: float = 1.00
+    bluetooth_long_session_tracking_quality_hold_min: float = 0.64
+    bluetooth_long_session_tracking_quality_seek_min: float = 0.82
+    bluetooth_long_session_resume_from_hold_speaking_lead_slack_sec: float = 0.62
+    bluetooth_long_session_gain_following: float = 0.52
+    bluetooth_long_session_gain_transition: float = 0.72
+    bluetooth_long_session_gain_soft_duck: float = 0.36
 ```
 
 ---
@@ -8041,7 +6070,7 @@ class StateMachineController:
                 return ControlDecision(
                     action=ControlAction.NOOP,
                     reason="no_progress",
-                    target_gain=self._gain_for_state(playback.state, following=False),
+                    target_gain=self._gain_for_state(playback.state, following=False, bluetooth_long_session_mode=False),
                     confidence=0.0,
                 )
             effective_idx = int(getattr(fusion_evidence, "estimated_ref_idx_hint", 0))
@@ -8065,29 +6094,76 @@ class StateMachineController:
             self._last_voice_like_at = now
         if effective_idx > self._last_effective_idx:
             self._last_effective_idx = effective_idx
-        in_startup_grace = (now - self._started_at) < self.policy.startup_grace_sec
-        in_resume_cooldown = (now - self._last_resume_at) < 0.35
-        in_seek_cooldown = (now - self._last_seek_at) < self.policy.seek_cooldown_sec
-        in_soft_duck_cooldown = (now - self._last_soft_duck_at) < 0.25
-        speaking_recent = (now - self._last_voice_like_at) <= self.policy.speaking_recent_sec
-        progress_stale = progress_age_sec >= self.policy.progress_stale_sec
-        playback_ref = float(playback.t_ref_heard_content_sec)
-        if fusion_evidence is not None and fusion_evidence.fused_confidence >= 0.58 and tracking_quality < 0.55:
-            user_ref = float(fusion_evidence.estimated_ref_time_sec)
-        else:
-            user_ref = float(estimated_ref_time_sec)
-        lead_sec = playback_ref - user_ref
         speech_conf = 0.0
         tracking_state = TrackingState.NONE
         sync_state = SyncState.BOOTSTRAP
         allow_seek = False
         bluetooth_mode = False
+        bluetooth_long_session_mode = False
         if sync_evidence is not None:
             speech_conf = float(sync_evidence.speech_confidence)
             tracking_state = sync_evidence.tracking_state
             sync_state = sync_evidence.sync_state
             allow_seek = bool(sync_evidence.allow_seek)
             bluetooth_mode = bool(sync_evidence.bluetooth_mode)
+            bluetooth_long_session_mode = bool(sync_evidence.bluetooth_long_session_mode)
+        target_lead_sec = (
+            self.policy.bluetooth_long_session_target_lead_sec
+            if bluetooth_long_session_mode
+            else self.policy.target_lead_sec
+        )
+        hold_if_lead_sec = (
+            self.policy.bluetooth_long_session_hold_if_lead_sec
+            if bluetooth_long_session_mode
+            else self.policy.hold_if_lead_sec
+        )
+        resume_if_lead_sec = (
+            self.policy.bluetooth_long_session_resume_if_lead_sec
+            if bluetooth_long_session_mode
+            else self.policy.resume_if_lead_sec
+        )
+        seek_if_lag_sec = (
+            self.policy.bluetooth_long_session_seek_if_lag_sec
+            if bluetooth_long_session_mode
+            else self.policy.seek_if_lag_sec
+        )
+        seek_cooldown_sec = (
+            self.policy.bluetooth_long_session_seek_cooldown_sec
+            if bluetooth_long_session_mode
+            else self.policy.seek_cooldown_sec
+        )
+        progress_stale_threshold = (
+            self.policy.bluetooth_long_session_progress_stale_sec
+            if bluetooth_long_session_mode
+            else self.policy.progress_stale_sec
+        )
+        tracking_quality_hold_min = (
+            self.policy.bluetooth_long_session_tracking_quality_hold_min
+            if bluetooth_long_session_mode
+            else self.policy.tracking_quality_hold_min
+        )
+        tracking_quality_seek_min = (
+            self.policy.bluetooth_long_session_tracking_quality_seek_min
+            if bluetooth_long_session_mode
+            else self.policy.tracking_quality_seek_min
+        )
+        resume_from_hold_speaking_lead_slack_sec = (
+            self.policy.bluetooth_long_session_resume_from_hold_speaking_lead_slack_sec
+            if bluetooth_long_session_mode
+            else self.policy.resume_from_hold_speaking_lead_slack_sec
+        )
+        in_startup_grace = (now - self._started_at) < (self.policy.startup_grace_sec + (1.0 if bluetooth_long_session_mode else 0.0))
+        in_resume_cooldown = (now - self._last_resume_at) < (0.55 if bluetooth_long_session_mode else 0.35)
+        in_seek_cooldown = (now - self._last_seek_at) < seek_cooldown_sec
+        in_soft_duck_cooldown = (now - self._last_soft_duck_at) < (0.35 if bluetooth_long_session_mode else 0.25)
+        speaking_recent = (now - self._last_voice_like_at) <= (self.policy.speaking_recent_sec + (0.25 if bluetooth_long_session_mode else 0.0))
+        progress_stale = progress_age_sec >= progress_stale_threshold
+        playback_ref = float(playback.t_ref_heard_content_sec)
+        if fusion_evidence is not None and fusion_evidence.fused_confidence >= 0.58 and tracking_quality < 0.55:
+            user_ref = float(fusion_evidence.estimated_ref_time_sec)
+        else:
+            user_ref = float(estimated_ref_time_sec)
+        lead_sec = playback_ref - user_ref
         dt = max(0.01, now - self._pressure.last_tick_at)
         self._pressure.last_tick_at = now
         self._update_emas(
@@ -8102,14 +6178,21 @@ class StateMachineController:
                 or fusion_reentry >= 0.60
                 or fusion_still_following >= 0.72
             )
-            and tracking_quality >= self.policy.tracking_quality_hold_min - 0.05
-            and confidence >= max(0.56, self.policy.min_confidence - 0.16)
+            and tracking_quality >= tracking_quality_hold_min - 0.06
+            and confidence >= max(0.54, self.policy.min_confidence - 0.18)
             and speaking_recent
+            and lead_sec >= -resume_from_hold_speaking_lead_slack_sec
         )
         strong_resume_ok = bool(
-            (recently_progressed or active_speaking or fusion_reentry >= 0.65 or fusion_still_following >= 0.76)
-            and tracking_quality >= self.policy.tracking_quality_hold_min
-            and confidence >= self.policy.min_confidence - (0.08 if fusion_still_following >= 0.72 else 0.0)
+            (
+                recently_progressed
+                or active_speaking
+                or fusion_reentry >= 0.65
+                or fusion_still_following >= 0.76
+            )
+            and tracking_quality >= tracking_quality_hold_min
+            and confidence >= self.policy.min_confidence - (0.10 if fusion_still_following >= 0.72 else 0.0)
+            and lead_sec >= -resume_from_hold_speaking_lead_slack_sec
         )
         following = (
             strong_resume_ok
@@ -8135,6 +6218,11 @@ class StateMachineController:
             tracking_state=tracking_state,
             sync_state=sync_state,
             bluetooth_mode=bluetooth_mode,
+            bluetooth_long_session_mode=bluetooth_long_session_mode,
+            hold_if_lead_sec=hold_if_lead_sec,
+            seek_if_lag_sec=seek_if_lag_sec,
+            tracking_quality_hold_min=tracking_quality_hold_min,
+            tracking_quality_seek_min=tracking_quality_seek_min,
             fusion_evidence=fusion_evidence,
         )
         if fusion_evidence is not None:
@@ -8146,7 +6234,10 @@ class StateMachineController:
             if playback.state == PlaybackState.HOLDING and (
                 fusion_still_following >= 0.74 or fusion_reentry >= 0.60
             ):
-                self._pressure.resume_pressure = max(self._pressure.resume_pressure, 1.04)
+                self._pressure.resume_pressure = max(
+                    self._pressure.resume_pressure,
+                    1.06 if bluetooth_long_session_mode else 1.04,
+                )
         if playback.state == PlaybackState.HOLDING and self._pressure.resume_pressure >= 1.0:
             self._last_resume_at = now
             self._pressure.hold_pressure *= 0.25
@@ -8155,18 +6246,27 @@ class StateMachineController:
                 action=ControlAction.RESUME,
                 reason="resume_pressure",
                 lead_sec=lead_sec,
-                target_gain=self.policy.gain_following,
+                target_gain=self._gain_for_state(
+                    PlaybackState.PLAYING,
+                    following=True,
+                    bluetooth_long_session_mode=bluetooth_long_session_mode,
+                ),
                 confidence=max(confidence, fusion_still_following * 0.88, fusion_fused_conf * 0.82),
-                aggressiveness="medium",
+                aggressiveness="low" if bluetooth_long_session_mode else "medium",
             )
         if playback.state == PlaybackState.PLAYING and self._pressure.hold_pressure >= 1.0:
+            self._last_hold_at = now
             return ControlDecision(
                 action=ControlAction.HOLD,
                 reason="hold_pressure",
                 lead_sec=lead_sec,
-                target_gain=self.policy.gain_soft_duck,
+                target_gain=self._gain_for_state(
+                    PlaybackState.HOLDING,
+                    following=False,
+                    bluetooth_long_session_mode=bluetooth_long_session_mode,
+                ),
                 confidence=confidence,
-                aggressiveness="medium",
+                aggressiveness="low" if bluetooth_long_session_mode else "medium",
             )
         if (
             playback.state in (PlaybackState.PLAYING, PlaybackState.HOLDING)
@@ -8179,19 +6279,23 @@ class StateMachineController:
             self._last_seek_at = now
             self._pressure.seek_pressure = 0.0
             self._pressure.hold_pressure *= 0.3
-            target_time_sec = max(0.0, user_ref - self.policy.target_lead_sec)
+            target_time_sec = max(0.0, user_ref - target_lead_sec)
             return ControlDecision(
                 action=ControlAction.SEEK,
                 reason="seek_pressure",
                 target_time_sec=target_time_sec,
                 lead_sec=lead_sec,
-                target_gain=self.policy.gain_transition,
+                target_gain=self._gain_for_state(
+                    PlaybackState.PLAYING,
+                    following=False,
+                    bluetooth_long_session_mode=bluetooth_long_session_mode,
+                ),
                 confidence=max(confidence, 0.35 + 0.45 * fusion_still_following),
-                aggressiveness="low" if bluetooth_mode else "medium",
+                aggressiveness="low" if (bluetooth_mode or bluetooth_long_session_mode) else "medium",
             )
         if (
             playback.state == PlaybackState.PLAYING
-            and self._pressure.soft_duck_pressure >= 0.65
+            and self._pressure.soft_duck_pressure >= (0.58 if bluetooth_long_session_mode else 0.65)
             and not in_soft_duck_cooldown
         ):
             self._last_soft_duck_at = now
@@ -8199,7 +6303,11 @@ class StateMachineController:
                 action=ControlAction.SOFT_DUCK,
                 reason="soft_duck_pressure",
                 lead_sec=lead_sec,
-                target_gain=self.policy.gain_soft_duck,
+                target_gain=self._gain_for_state(
+                    PlaybackState.HOLDING,
+                    following=False,
+                    bluetooth_long_session_mode=bluetooth_long_session_mode,
+                ),
                 confidence=max(confidence, fusion_still_following * 0.62),
                 aggressiveness="low",
             )
@@ -8207,7 +6315,11 @@ class StateMachineController:
             action=ControlAction.NOOP,
             reason="no_state_change",
             lead_sec=lead_sec,
-            target_gain=self._gain_for_state(playback.state, following=following),
+            target_gain=self._gain_for_state(
+                playback.state,
+                following=following,
+                bluetooth_long_session_mode=bluetooth_long_session_mode,
+            ),
             confidence=max(confidence, fusion_still_following * 0.58, fusion_fused_conf * 0.52),
             aggressiveness="low",
         )
@@ -8250,9 +6362,14 @@ class StateMachineController:
         tracking_state: TrackingState,
         sync_state: SyncState,
         bluetooth_mode: bool,
+        bluetooth_long_session_mode: bool,
+        hold_if_lead_sec: float,
+        seek_if_lag_sec: float,
+        tracking_quality_hold_min: float,
+        tracking_quality_seek_min: float,
         fusion_evidence: FusionEvidence | None,
     ) -> None:
-        decay = 0.82 ** max(1.0, dt * 15.0)
+        decay = (0.86 if bluetooth_long_session_mode else 0.82) ** max(1.0, dt * 15.0)
         self._pressure.hold_pressure *= decay
         self._pressure.resume_pressure *= decay
         self._pressure.seek_pressure *= decay
@@ -8261,24 +6378,28 @@ class StateMachineController:
         fusion_repeated = 0.0 if fusion_evidence is None else float(fusion_evidence.repeated_likelihood)
         fusion_reentry = 0.0 if fusion_evidence is None else float(fusion_evidence.reentry_likelihood)
         if playback_state == PlaybackState.PLAYING:
-            hold_scale = 0.45 if fusion_still_following >= 0.65 or fusion_reentry >= 0.58 else 1.0
+            hold_scale = 0.40 if (fusion_still_following >= 0.65 or fusion_reentry >= 0.58) else 1.0
             if not in_startup_grace and progress_stale and not speaking_recent:
-                self._pressure.hold_pressure += 0.42 * hold_scale
-            if not in_startup_grace and progress_stale and tracking_quality < self.policy.tracking_quality_hold_min:
-                self._pressure.hold_pressure += 0.36 * hold_scale
-            if lead_sec >= self.policy.hold_if_lead_sec:
-                self._pressure.hold_pressure += 0.30 * hold_scale
+                self._pressure.hold_pressure += (0.28 if bluetooth_long_session_mode else 0.42) * hold_scale
+            if (
+                not in_startup_grace
+                and progress_stale
+                and tracking_quality < tracking_quality_hold_min
+            ):
+                self._pressure.hold_pressure += (0.22 if bluetooth_long_session_mode else 0.36) * hold_scale
+            if lead_sec >= hold_if_lead_sec:
+                self._pressure.hold_pressure += 0.22 if bluetooth_long_session_mode else 0.30
             if tracking_state == TrackingState.WEAK or sync_state == SyncState.DEGRADED:
-                self._pressure.soft_duck_pressure += 0.22
+                self._pressure.soft_duck_pressure += 0.22 if not bluetooth_long_session_mode else 0.28
             if confidence < max(0.55, self.policy.min_confidence - 0.15):
                 self._pressure.soft_duck_pressure += 0.10
             if stable and tracking_quality >= 0.76:
                 self._pressure.hold_pressure *= 0.94
         if playback_state == PlaybackState.HOLDING and not in_resume_cooldown:
             if strong_resume_ok:
-                self._pressure.resume_pressure += 0.48
+                self._pressure.resume_pressure += 0.42 if bluetooth_long_session_mode else 0.48
             elif weak_resume_ok:
-                self._pressure.resume_pressure += 0.28
+                self._pressure.resume_pressure += 0.24 if bluetooth_long_session_mode else 0.28
             if fusion_reentry >= 0.62:
                 self._pressure.resume_pressure += 0.24
             elif fusion_still_following >= 0.74:
@@ -8287,8 +6408,8 @@ class StateMachineController:
             allow_seek
             and not in_seek_cooldown
             and playback_state == PlaybackState.PLAYING
-            and lead_sec <= self.policy.seek_if_lag_sec
-            and tracking_quality >= self.policy.tracking_quality_seek_min
+            and lead_sec <= seek_if_lag_sec
+            and tracking_quality >= tracking_quality_seek_min
             and confidence >= max(0.70, self.policy.min_confidence)
             and tracking_state == TrackingState.LOCKED
             and sync_state == SyncState.STABLE
@@ -8296,12 +6417,18 @@ class StateMachineController:
             and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
         )
         if seek_trigger:
-            self._pressure.seek_pressure += 0.24 if bluetooth_mode else 0.34
+            self._pressure.seek_pressure += 0.18 if (bluetooth_mode or bluetooth_long_session_mode) else 0.34
         self._pressure.hold_pressure = max(0.0, min(1.4, self._pressure.hold_pressure))
         self._pressure.resume_pressure = max(0.0, min(1.4, self._pressure.resume_pressure))
         self._pressure.seek_pressure = max(0.0, min(1.4, self._pressure.seek_pressure))
         self._pressure.soft_duck_pressure = max(0.0, min(1.2, self._pressure.soft_duck_pressure))
-    def _gain_for_state(self, state, *, following: bool) -> float:
+    def _gain_for_state(self, state, *, following: bool, bluetooth_long_session_mode: bool) -> float:
+        if bluetooth_long_session_mode:
+            if state == PlaybackState.HOLDING:
+                return self.policy.bluetooth_long_session_gain_soft_duck
+            if following:
+                return self.policy.bluetooth_long_session_gain_following
+            return self.policy.bluetooth_long_session_gain_transition
         if state == PlaybackState.HOLDING:
             return self.policy.gain_soft_duck
         if following:
@@ -8388,7 +6515,9 @@ class ShadowingOrchestrator:
         self.live_audio_matcher = live_audio_matcher
         self.audio_behavior_classifier = audio_behavior_classifier
         self.evidence_fuser = evidence_fuser
-        self.audio_queue: queue.Queue[tuple[float, bytes]] = queue.Queue(maxsize=max(16, int(audio_queue_maxsize)))
+        self.audio_queue: queue.Queue[tuple[float, bytes]] = queue.Queue(
+            maxsize=max(16, int(audio_queue_maxsize))
+        )
         self.loop_interval_sec = float(loop_interval_sec)
         self.debug = bool(debug)
         self.normalizer = TextNormalizer()
@@ -8426,6 +6555,9 @@ class ShadowingOrchestrator:
         self._latest_audio_behavior = None
         self._latest_fusion_evidence = None
         self._last_audio_recentering_at_sec = 0.0
+        self._bluetooth_long_session_mode = False
+        self._stable_lead_samples: list[float] = []
+        self._last_stable_lead_rebaseline_at_sec = 0.0
         target_sr = 16000
         try:
             target_sr = int(getattr(self.asr, "sample_rate", 16000))
@@ -8472,10 +6604,22 @@ class ShadowingOrchestrator:
         self._latest_audio_behavior = None
         self._latest_fusion_evidence = None
         self._last_audio_recentering_at_sec = 0.0
+        self._stable_lead_samples = []
+        self._last_stable_lead_rebaseline_at_sec = self._session_started_at_sec
         output_sr = chunks[0].sample_rate if chunks else 44100
         self._device_profile = self._build_initial_device_profile(output_sr)
         bluetooth_mode = self._is_bluetooth_mode()
-        self.latency_calibrator.reset(self._device_profile)
+        total_duration_sec = float(getattr(self._ref_map, "total_duration_sec", 0.0))
+        manual_long_session_flag = bool(self.device_context.get("bluetooth_long_session_mode", False))
+        self._bluetooth_long_session_mode = bool(
+            bluetooth_mode and (manual_long_session_flag or total_duration_sec >= 1800.0)
+        )
+        self.latency_calibrator.reset(
+            self._device_profile,
+            bluetooth_mode=bluetooth_mode,
+            bluetooth_long_session_mode=self._bluetooth_long_session_mode,
+            now_sec=self._session_started_at_sec,
+        )
         self.auto_tuner.reset(self._device_profile.reliability_tier, bluetooth_mode=bluetooth_mode)
         if self.profile_store is not None and self._device_profile is not None:
             self._warm_start = self.profile_store.load_warm_start(
@@ -8487,7 +6631,12 @@ class ShadowingOrchestrator:
                 reliability_tier=self._device_profile.reliability_tier,
                 bluetooth_mode=bluetooth_mode,
             )
-            self.auto_tuner.apply_warm_start(controller_policy=self.controller.policy, player=self.player, signal_monitor=self.signal_monitor, warm_start=self._warm_start)
+            self.auto_tuner.apply_warm_start(
+                controller_policy=self.controller.policy,
+                player=self.player,
+                signal_monitor=self.signal_monitor,
+                warm_start=self._warm_start,
+            )
         if self.reference_audio_store is not None and self.live_audio_matcher is not None:
             try:
                 self._reference_audio_features = self.reference_audio_store.load(lesson_id)
@@ -8591,27 +6740,85 @@ class ShadowingOrchestrator:
                 )
         audio_match = None
         if self.live_audio_matcher is not None:
-            progress_hint = None if self.progress_estimator._last_snapshot is None else float(self.progress_estimator._last_snapshot.estimated_ref_time_sec)
-            text_conf = 0.0 if self.progress_estimator._last_snapshot is None else float(self.progress_estimator._last_snapshot.tracking_quality)
-            audio_match = self.live_audio_matcher.snapshot(now_sec=now_sec, progress_hint_ref_time_sec=progress_hint, playback_ref_time_sec=float(playback_status.t_ref_heard_content_sec), text_tracking_confidence=text_conf)
+            progress_hint = (
+                None
+                if self.progress_estimator._last_snapshot is None
+                else float(self.progress_estimator._last_snapshot.estimated_ref_time_sec)
+            )
+            text_conf = (
+                0.0
+                if self.progress_estimator._last_snapshot is None
+                else float(self.progress_estimator._last_snapshot.tracking_quality)
+            )
+            audio_match = self.live_audio_matcher.snapshot(
+                now_sec=now_sec,
+                progress_hint_ref_time_sec=progress_hint,
+                playback_ref_time_sec=float(playback_status.t_ref_heard_content_sec),
+                text_tracking_confidence=text_conf,
+            )
             self._latest_audio_match = audio_match
         audio_behavior = None
         if self.audio_behavior_classifier is not None:
-            audio_behavior = self.audio_behavior_classifier.update(audio_match=audio_match, signal_quality=signal_snapshot, progress=self.progress_estimator._last_snapshot, playback_status=playback_status)
+            audio_behavior = self.audio_behavior_classifier.update(
+                audio_match=audio_match,
+                signal_quality=signal_snapshot,
+                progress=self.progress_estimator._last_snapshot,
+                playback_status=playback_status,
+            )
             self._latest_audio_behavior = audio_behavior
-        progress = self.progress_estimator.update(tracking=last_tracking, audio_match=audio_match, audio_behavior=audio_behavior, signal_quality=signal_snapshot, now_sec=now_sec)
+        progress = self.progress_estimator.update(
+            tracking=last_tracking,
+            audio_match=audio_match,
+            audio_behavior=audio_behavior,
+            signal_quality=signal_snapshot,
+            now_sec=now_sec,
+        )
         if progress is None:
-            progress = self.progress_estimator.snapshot(now_sec=now_sec, signal_quality=signal_snapshot, audio_match=audio_match, audio_behavior=audio_behavior)
+            progress = self.progress_estimator.snapshot(
+                now_sec=now_sec,
+                signal_quality=signal_snapshot,
+                audio_match=audio_match,
+                audio_behavior=audio_behavior,
+            )
         if progress is not None:
-            is_reliable = bool(progress.joint_confidence >= self.controller.policy.min_confidence and progress.tracking_quality >= self.controller.policy.tracking_quality_hold_min)
-            self.metrics.observe_progress(now_sec=now_sec, tracking_quality=progress.tracking_quality, is_reliable=is_reliable)
+            is_reliable = bool(
+                progress.joint_confidence >= self.controller.policy.min_confidence
+                and progress.tracking_quality >= self.controller.policy.tracking_quality_hold_min
+            )
+            self.metrics.observe_progress(
+                now_sec=now_sec,
+                tracking_quality=progress.tracking_quality,
+                is_reliable=is_reliable,
+            )
         fusion_evidence = None
         if self.evidence_fuser is not None:
-            fusion_evidence = self.evidence_fuser.fuse(now_sec=now_sec, tracking=last_tracking, progress=progress, audio_match=audio_match, audio_behavior=audio_behavior, signal_quality=signal_snapshot, playback_status=playback_status)
+            fusion_evidence = self.evidence_fuser.fuse(
+                now_sec=now_sec,
+                tracking=last_tracking,
+                progress=progress,
+                audio_match=audio_match,
+                audio_behavior=audio_behavior,
+                signal_quality=signal_snapshot,
+                playback_status=playback_status,
+            )
             self._latest_fusion_evidence = fusion_evidence
         self._maybe_recenter_from_audio(now_sec=now_sec, fusion_evidence=fusion_evidence)
-        sync_evidence = self.sync_builder.build(now_sec=now_sec, signal_quality=signal_snapshot, progress=progress, fusion_evidence=fusion_evidence, bluetooth_mode=self._is_bluetooth_mode())
+        sync_evidence = self.sync_builder.build(
+            now_sec=now_sec,
+            signal_quality=signal_snapshot,
+            progress=progress,
+            fusion_evidence=fusion_evidence,
+            bluetooth_mode=self._is_bluetooth_mode(),
+            bluetooth_long_session_mode=self._is_bluetooth_long_session_mode(),
+        )
         if progress is not None:
+            source_mode = str(getattr(progress, "position_source", "text"))
+            source_is_text_dominant = source_mode == "text"
+            audio_text_disagreement_sec = None
+            if audio_match is not None:
+                audio_text_disagreement_sec = float(
+                    audio_match.estimated_ref_time_sec - progress.estimated_ref_time_sec
+                )
             self.latency_calibrator.observe_sync(
                 playback_ref_time_sec=playback_status.t_ref_heard_content_sec,
                 user_ref_time_sec=progress.estimated_ref_time_sec,
@@ -8619,40 +6826,115 @@ class ShadowingOrchestrator:
                 stable=progress.stable,
                 active_speaking=progress.active_speaking,
                 allow_observation=sync_evidence.allow_latency_observation,
+                source_is_text_dominant=source_is_text_dominant,
+                source_mode=source_mode,
+                audio_text_disagreement_sec=audio_text_disagreement_sec,
             )
+        self._collect_stable_lead_samples(
+            now_sec=now_sec,
+            playback_status=playback_status,
+            progress=progress,
+            sync_evidence=sync_evidence,
+        )
+        self._maybe_rebaseline_output_offset(now_sec=now_sec)
         playback_status = self.player.get_status()
-        decision = self.controller.decide(playback=playback_status, progress=progress, signal_quality=signal_snapshot, sync_evidence=sync_evidence, fusion_evidence=fusion_evidence)
+        decision = self.controller.decide(
+            playback=playback_status,
+            progress=progress,
+            signal_quality=signal_snapshot,
+            sync_evidence=sync_evidence,
+            fusion_evidence=fusion_evidence,
+        )
         self._apply_decision(decision, playback_status)
         self._run_auto_tuning(now_sec=now_sec, progress=progress, signal_snapshot=signal_snapshot)
-        self._log_event(progress=progress, signal_snapshot=signal_snapshot, decision=decision, sync_evidence=sync_evidence, audio_match=audio_match, audio_behavior=audio_behavior, fusion_evidence=fusion_evidence)
+        self._log_event(
+            progress=progress,
+            signal_snapshot=signal_snapshot,
+            decision=decision,
+            sync_evidence=sync_evidence,
+            audio_match=audio_match,
+            audio_behavior=audio_behavior,
+            fusion_evidence=fusion_evidence,
+        )
+    def _collect_stable_lead_samples(self, *, now_sec: float, playback_status, progress, sync_evidence) -> None:
+        if not self._bluetooth_long_session_mode or progress is None:
+            return
+        if not sync_evidence.allow_latency_observation:
+            return
+        if not progress.active_speaking:
+            return
+        if progress.tracking_quality < 0.72:
+            return
+        lead_sec = float(playback_status.t_ref_heard_content_sec) - float(progress.estimated_ref_time_sec)
+        if abs(lead_sec) > 2.2:
+            return
+        self._stable_lead_samples.append(float(lead_sec))
+        if len(self._stable_lead_samples) > 180:
+            self._stable_lead_samples = self._stable_lead_samples[-180:]
+    def _maybe_rebaseline_output_offset(self, *, now_sec: float) -> None:
+        if not self._bluetooth_long_session_mode:
+            return
+        if (now_sec - self._last_stable_lead_rebaseline_at_sec) < 180.0:
+            return
+        if len(self._stable_lead_samples) < 24:
+            return
+        vals = sorted(self._stable_lead_samples)
+        mid = vals[len(vals) // 2]
+        desired = 0.35
+        error_sec = float(mid - desired)
+        if abs(error_sec) < 0.040:
+            self._last_stable_lead_rebaseline_at_sec = now_sec
+            self._stable_lead_samples.clear()
+            return
+        snap = self.latency_calibrator.snapshot()
+        if snap is None:
+            return
+        new_output_offset_sec = max(
+            0.0,
+            (snap.estimated_output_latency_ms + snap.runtime_output_drift_ms - error_sec * 1000.0) / 1000.0,
+        )
+        if hasattr(self.player, "set_output_offset_sec"):
+            self.player.set_output_offset_sec(new_output_offset_sec)
+        self._last_stable_lead_rebaseline_at_sec = now_sec
+        self._stable_lead_samples.clear()
     def _maybe_recenter_from_audio(self, *, now_sec: float, fusion_evidence) -> None:
         if fusion_evidence is None:
             return
         if (now_sec - self._last_audio_recentering_at_sec) < 0.45:
             return
-        if not (fusion_evidence.should_recenter_aligner_window or fusion_evidence.should_widen_reacquire_window):
+        if not (
+            fusion_evidence.should_recenter_aligner_window
+            or fusion_evidence.should_widen_reacquire_window
+        ):
             return
         ref_idx_hint = int(getattr(fusion_evidence, "estimated_ref_idx_hint", 0))
         if fusion_evidence.should_widen_reacquire_window:
-            back = 16
-            ahead = 36
-            budget = 8
+            back, ahead, budget = 18, 40, 8
         else:
-            back = 10
-            ahead = 24
-            budget = 6
-        self.tracking_engine.recenter_from_audio(ref_idx_hint=ref_idx_hint, search_back=back, search_ahead=ahead, budget_events=budget)
+            back, ahead, budget = 10, 24, 6
+        self.tracking_engine.recenter_from_audio(
+            ref_idx_hint=ref_idx_hint,
+            search_back=back,
+            search_ahead=ahead,
+            budget_events=budget,
+        )
         self._last_audio_recentering_at_sec = float(now_sec)
         if self.event_logger is not None:
             self.event_logger.log(
                 "audio_recentering",
                 {
                     "estimated_ref_idx_hint": ref_idx_hint,
-                    "estimated_ref_time_sec": float(getattr(fusion_evidence, "estimated_ref_time_sec", 0.0)),
+                    "estimated_ref_time_sec": float(
+                        getattr(fusion_evidence, "estimated_ref_time_sec", 0.0)
+                    ),
                     "audio_confidence": float(getattr(fusion_evidence, "audio_confidence", 0.0)),
                     "fused_confidence": float(getattr(fusion_evidence, "fused_confidence", 0.0)),
-                    "should_recenter_aligner_window": bool(getattr(fusion_evidence, "should_recenter_aligner_window", False)),
-                    "should_widen_reacquire_window": bool(getattr(fusion_evidence, "should_widen_reacquire_window", False)),
+                    "should_recenter_aligner_window": bool(
+                        getattr(fusion_evidence, "should_recenter_aligner_window", False)
+                    ),
+                    "should_widen_reacquire_window": bool(
+                        getattr(fusion_evidence, "should_widen_reacquire_window", False)
+                    ),
                 },
                 ts_monotonic_sec=now_sec,
                 session_tick=self.stats.ticks,
@@ -8662,7 +6944,10 @@ class ShadowingOrchestrator:
         try:
             self.audio_queue.put_nowait(item)
             self.stats.audio_enqueued += 1
-            self.stats.audio_q_high_watermark = max(self.stats.audio_q_high_watermark, self.audio_queue.qsize())
+            self.stats.audio_q_high_watermark = max(
+                self.stats.audio_q_high_watermark,
+                self.audio_queue.qsize(),
+            )
         except queue.Full:
             try:
                 _ = self.audio_queue.get_nowait()
@@ -8683,31 +6968,67 @@ class ShadowingOrchestrator:
             signal_snapshot = self.signal_monitor.snapshot(observed_at_sec)
             self.latency_calibrator.observe_signal(signal_snapshot)
             if self.live_audio_matcher is not None:
-                feat_frames = self._audio_feature_extractor.process_pcm16(pcm_bytes, observed_at_sec=observed_at_sec)
+                feat_frames = self._audio_feature_extractor.process_pcm16(
+                    pcm_bytes,
+                    observed_at_sec=observed_at_sec,
+                )
                 self.live_audio_matcher.feed_features(feat_frames)
             bootstrap_mode = (observed_at_sec - self._session_started_at_sec) <= 3.0
             bluetooth_mode = self._is_bluetooth_mode()
-            should_feed_asr = self._should_feed_asr(signal_snapshot=signal_snapshot, now_sec=observed_at_sec, bootstrap_mode=bootstrap_mode, bluetooth_mode=bluetooth_mode)
+            should_feed_asr = self._should_feed_asr(
+                signal_snapshot=signal_snapshot,
+                now_sec=observed_at_sec,
+                bootstrap_mode=bootstrap_mode,
+                bluetooth_mode=bluetooth_mode,
+            )
             if should_feed_asr:
                 self.asr.feed_pcm16(pcm_bytes)
                 self.stats.asr_frames_fed += 1
             else:
                 self.stats.asr_frames_skipped += 1
-                self._maybe_reset_asr_for_silence(signal_snapshot=signal_snapshot, now_sec=observed_at_sec, bootstrap_mode=bootstrap_mode, bluetooth_mode=bluetooth_mode)
-    def _should_feed_asr(self, *, signal_snapshot, now_sec: float, bootstrap_mode: bool, bluetooth_mode: bool) -> bool:
+                self._maybe_reset_asr_for_silence(
+                    signal_snapshot=signal_snapshot,
+                    now_sec=observed_at_sec,
+                    bootstrap_mode=bootstrap_mode,
+                    bluetooth_mode=bluetooth_mode,
+                )
+    def _should_feed_asr(
+        self,
+        *,
+        signal_snapshot,
+        now_sec: float,
+        bootstrap_mode: bool,
+        bluetooth_mode: bool,
+    ) -> bool:
         open_rms = 0.0085 if bootstrap_mode else self._speech_open_rms
         open_peak = 0.022 if bootstrap_mode else self._speech_open_peak
         open_likelihood = 0.48 if bootstrap_mode else self._speech_open_likelihood
-        strong_voice = bool(signal_snapshot.vad_active and signal_snapshot.rms >= open_rms and signal_snapshot.peak >= open_peak)
-        likely_voice = bool(signal_snapshot.speaking_likelihood >= open_likelihood and signal_snapshot.rms >= self._speech_keep_rms)
-        keep_voice = bool(signal_snapshot.vad_active and signal_snapshot.rms >= self._speech_keep_rms and signal_snapshot.peak >= self._speech_keep_peak) or bool(signal_snapshot.speaking_likelihood >= self._speech_keep_likelihood and signal_snapshot.peak >= self._speech_keep_peak)
+        strong_voice = bool(
+            signal_snapshot.vad_active
+            and signal_snapshot.rms >= open_rms
+            and signal_snapshot.peak >= open_peak
+        )
+        likely_voice = bool(
+            signal_snapshot.speaking_likelihood >= open_likelihood
+            and signal_snapshot.rms >= self._speech_keep_rms
+        )
+        keep_voice = bool(
+            signal_snapshot.vad_active
+            and signal_snapshot.rms >= self._speech_keep_rms
+            and signal_snapshot.peak >= self._speech_keep_peak
+        ) or bool(
+            signal_snapshot.speaking_likelihood >= self._speech_keep_likelihood
+            and signal_snapshot.peak >= self._speech_keep_peak
+        )
         if strong_voice or likely_voice:
             self._last_human_voice_like_at_sec = float(now_sec)
         gate_should_open = strong_voice or likely_voice
-        gate_tail_sec = 0.85 if bluetooth_mode else (0.60 if bootstrap_mode else self._speech_tail_hold_sec)
+        gate_tail_sec = 0.95 if bluetooth_mode else (0.60 if bootstrap_mode else self._speech_tail_hold_sec)
         gate_should_keep = False
         if self._asr_gate_open and self._last_human_voice_like_at_sec > 0.0:
-            gate_should_keep = keep_voice or ((now_sec - self._last_human_voice_like_at_sec) <= gate_tail_sec)
+            gate_should_keep = keep_voice or (
+                (now_sec - self._last_human_voice_like_at_sec) <= gate_tail_sec
+            )
         new_gate_state = gate_should_open or gate_should_keep
         if new_gate_state and not self._asr_gate_open:
             self._asr_gate_open = True
@@ -8718,16 +7039,33 @@ class ShadowingOrchestrator:
             self._asr_gate_last_close_at_sec = float(now_sec)
             self.stats.asr_gate_close_count += 1
         return self._asr_gate_open
-    def _maybe_reset_asr_for_silence(self, *, signal_snapshot, now_sec: float, bootstrap_mode: bool, bluetooth_mode: bool) -> None:
+    def _maybe_reset_asr_for_silence(
+        self,
+        *,
+        signal_snapshot,
+        now_sec: float,
+        bootstrap_mode: bool,
+        bluetooth_mode: bool,
+    ) -> None:
         if self._asr_gate_open or bootstrap_mode or bluetooth_mode:
             return
-        recently_had_voice = self._last_human_voice_like_at_sec > 0.0 and (now_sec - self._last_human_voice_like_at_sec) <= self._asr_reset_after_silence_sec
+        recently_had_voice = (
+            self._last_human_voice_like_at_sec > 0.0
+            and (now_sec - self._last_human_voice_like_at_sec) <= self._asr_reset_after_silence_sec
+        )
         if recently_had_voice:
             return
-        recently_reset = self._last_asr_reset_at_sec > 0.0 and (now_sec - self._last_asr_reset_at_sec) <= self._asr_reset_cooldown_sec
+        recently_reset = (
+            self._last_asr_reset_at_sec > 0.0
+            and (now_sec - self._last_asr_reset_at_sec) <= self._asr_reset_cooldown_sec
+        )
         if recently_reset:
             return
-        very_quiet = bool(signal_snapshot.rms <= self._speech_keep_rms and signal_snapshot.peak <= self._speech_keep_peak and signal_snapshot.speaking_likelihood <= 0.24)
+        very_quiet = bool(
+            signal_snapshot.rms <= self._speech_keep_rms
+            and signal_snapshot.peak <= self._speech_keep_peak
+            and signal_snapshot.speaking_likelihood <= 0.24
+        )
         if not very_quiet:
             return
         try:
@@ -8742,16 +7080,26 @@ class ShadowingOrchestrator:
         self._last_control_action_key = action_key
         if decision.action.value == "hold":
             if playback_status.state != PlaybackState.HOLDING:
-                self.player.submit_command(PlayerCommand(cmd=PlayerCommandType.HOLD, reason=decision.reason))
+                self.player.submit_command(
+                    PlayerCommand(cmd=PlayerCommandType.HOLD, reason=decision.reason)
+                )
                 if should_count:
                     self.metrics.observe_action("hold", decision.reason, time.monotonic())
         elif decision.action.value == "resume":
             if playback_status.state == PlaybackState.HOLDING:
-                self.player.submit_command(PlayerCommand(cmd=PlayerCommandType.RESUME, reason=decision.reason))
+                self.player.submit_command(
+                    PlayerCommand(cmd=PlayerCommandType.RESUME, reason=decision.reason)
+                )
                 if should_count:
                     self.metrics.observe_action("resume", decision.reason, time.monotonic())
         elif decision.action.value == "seek" and decision.target_time_sec is not None:
-            self.player.submit_command(PlayerCommand(cmd=PlayerCommandType.SEEK, target_time_sec=float(decision.target_time_sec), reason=decision.reason))
+            self.player.submit_command(
+                PlayerCommand(
+                    cmd=PlayerCommandType.SEEK,
+                    target_time_sec=float(decision.target_time_sec),
+                    reason=decision.reason,
+                )
+            )
             if should_count:
                 self.metrics.observe_action("seek", decision.reason, time.monotonic())
         elif decision.action.value == "soft_duck" and should_count:
@@ -8759,7 +7107,13 @@ class ShadowingOrchestrator:
         desired_gain = decision.target_gain
         if desired_gain is not None:
             if self._last_gain_sent is None or abs(float(desired_gain) - float(self._last_gain_sent)) >= 0.01:
-                self.player.submit_command(PlayerCommand(cmd=PlayerCommandType.SET_GAIN, gain=float(desired_gain), reason=decision.reason))
+                self.player.submit_command(
+                    PlayerCommand(
+                        cmd=PlayerCommandType.SET_GAIN,
+                        gain=float(desired_gain),
+                        reason=decision.reason,
+                    )
+                )
                 self._last_gain_sent = float(desired_gain)
     def _run_auto_tuning(self, *, now_sec: float, progress, signal_snapshot) -> None:
         metrics_summary = self.metrics.summary_dict()
@@ -8788,14 +7142,18 @@ class ShadowingOrchestrator:
             bluetooth_mode=self._is_bluetooth_mode(),
             device_profile=asdict(self._device_profile),
             metrics=self.metrics.summary_dict(),
-            latency_calibration=(None if latency_snapshot is None else {
-                "estimated_input_latency_ms": latency_snapshot.estimated_input_latency_ms,
-                "estimated_output_latency_ms": latency_snapshot.estimated_output_latency_ms,
-                "runtime_input_drift_ms": latency_snapshot.runtime_input_drift_ms,
-                "runtime_output_drift_ms": latency_snapshot.runtime_output_drift_ms,
-                "confidence": latency_snapshot.confidence,
-                "calibrated": latency_snapshot.calibrated,
-            }),
+            latency_calibration=(
+                None
+                if latency_snapshot is None
+                else {
+                    "estimated_input_latency_ms": latency_snapshot.estimated_input_latency_ms,
+                    "estimated_output_latency_ms": latency_snapshot.estimated_output_latency_ms,
+                    "runtime_input_drift_ms": latency_snapshot.runtime_input_drift_ms,
+                    "runtime_output_drift_ms": latency_snapshot.runtime_output_drift_ms,
+                    "confidence": latency_snapshot.confidence,
+                    "calibrated": latency_snapshot.calibrated,
+                }
+            ),
         )
     def _persist_summary(self) -> None:
         raw_session_dir = str(self.device_context.get("session_dir", "")).strip()
@@ -8809,27 +7167,62 @@ class ShadowingOrchestrator:
             "metrics": self.metrics.summary_dict(),
             "stats": asdict(self.stats),
             "device_profile": None if self._device_profile is None else asdict(self._device_profile),
-            "latency_calibration": (None if latency_snapshot is None else {
-                "estimated_input_latency_ms": latency_snapshot.estimated_input_latency_ms,
-                "estimated_output_latency_ms": latency_snapshot.estimated_output_latency_ms,
-                "runtime_input_drift_ms": latency_snapshot.runtime_input_drift_ms,
-                "runtime_output_drift_ms": latency_snapshot.runtime_output_drift_ms,
-                "confidence": latency_snapshot.confidence,
-                "calibrated": latency_snapshot.calibrated,
-            }),
+            "latency_calibration": (
+                None
+                if latency_snapshot is None
+                else {
+                    "estimated_input_latency_ms": latency_snapshot.estimated_input_latency_ms,
+                    "estimated_output_latency_ms": latency_snapshot.estimated_output_latency_ms,
+                    "runtime_input_drift_ms": latency_snapshot.runtime_input_drift_ms,
+                    "runtime_output_drift_ms": latency_snapshot.runtime_output_drift_ms,
+                    "confidence": latency_snapshot.confidence,
+                    "calibrated": latency_snapshot.calibrated,
+                }
+            ),
             "controller_policy": asdict(self.controller.policy),
             "latest_audio_match": None if self._latest_audio_match is None else asdict(self._latest_audio_match),
             "latest_audio_behavior": None if self._latest_audio_behavior is None else asdict(self._latest_audio_behavior),
             "latest_fusion_evidence": None if self._latest_fusion_evidence is None else asdict(self._latest_fusion_evidence),
+            "bluetooth_long_session_mode": self._bluetooth_long_session_mode,
         }
-        (session_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        (session_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         if self.event_logger is not None:
-            self.event_logger.log("session_summary", summary, ts_monotonic_sec=time.monotonic(), session_tick=self.stats.ticks)
-    def _log_event(self, *, progress, signal_snapshot, decision, sync_evidence, audio_match, audio_behavior, fusion_evidence) -> None:
+            self.event_logger.log(
+                "session_summary",
+                summary,
+                ts_monotonic_sec=time.monotonic(),
+                session_tick=self.stats.ticks,
+            )
+    def _log_event(
+        self,
+        *,
+        progress,
+        signal_snapshot,
+        decision,
+        sync_evidence,
+        audio_match,
+        audio_behavior,
+        fusion_evidence,
+    ) -> None:
         if self.event_logger is None:
             return
         now_sec = time.monotonic()
-        self.event_logger.log("signal_snapshot", {"rms": signal_snapshot.rms, "peak": signal_snapshot.peak, "vad_active": signal_snapshot.vad_active, "speaking_likelihood": signal_snapshot.speaking_likelihood, "quality_score": signal_snapshot.quality_score, "dropout_detected": signal_snapshot.dropout_detected}, ts_monotonic_sec=now_sec, session_tick=self.stats.ticks)
+        self.event_logger.log(
+            "signal_snapshot",
+            {
+                "rms": signal_snapshot.rms,
+                "peak": signal_snapshot.peak,
+                "vad_active": signal_snapshot.vad_active,
+                "speaking_likelihood": signal_snapshot.speaking_likelihood,
+                "quality_score": signal_snapshot.quality_score,
+                "dropout_detected": signal_snapshot.dropout_detected,
+            },
+            ts_monotonic_sec=now_sec,
+            session_tick=self.stats.ticks,
+        )
         if progress is not None:
             self.event_logger.log(
                 "progress_snapshot",
@@ -8863,6 +7256,7 @@ class ShadowingOrchestrator:
                 "allow_seek": sync_evidence.allow_seek,
                 "startup_mode": sync_evidence.startup_mode,
                 "bluetooth_mode": sync_evidence.bluetooth_mode,
+                "bluetooth_long_session_mode": sync_evidence.bluetooth_long_session_mode,
                 "audio_confidence": sync_evidence.audio_confidence,
                 "still_following_likelihood": sync_evidence.still_following_likelihood,
                 "reentry_likelihood": sync_evidence.reentry_likelihood,
@@ -8872,11 +7266,26 @@ class ShadowingOrchestrator:
             session_tick=self.stats.ticks,
         )
         if audio_match is not None:
-            self.event_logger.log("audio_match_snapshot", asdict(audio_match), ts_monotonic_sec=now_sec, session_tick=self.stats.ticks)
+            self.event_logger.log(
+                "audio_match_snapshot",
+                asdict(audio_match),
+                ts_monotonic_sec=now_sec,
+                session_tick=self.stats.ticks,
+            )
         if audio_behavior is not None:
-            self.event_logger.log("audio_behavior_snapshot", asdict(audio_behavior), ts_monotonic_sec=now_sec, session_tick=self.stats.ticks)
+            self.event_logger.log(
+                "audio_behavior_snapshot",
+                asdict(audio_behavior),
+                ts_monotonic_sec=now_sec,
+                session_tick=self.stats.ticks,
+            )
         if fusion_evidence is not None:
-            self.event_logger.log("fusion_evidence", asdict(fusion_evidence), ts_monotonic_sec=now_sec, session_tick=self.stats.ticks)
+            self.event_logger.log(
+                "fusion_evidence",
+                asdict(fusion_evidence),
+                ts_monotonic_sec=now_sec,
+                session_tick=self.stats.ticks,
+            )
         self.event_logger.log(
             "control_decision",
             {
@@ -8903,7 +7312,12 @@ class ShadowingOrchestrator:
         profile = self._device_profile
         if profile is None:
             return False
-        return bool(profile.input_kind == "bluetooth_headset" or profile.output_kind == "bluetooth_headset")
+        return bool(
+            profile.input_kind == "bluetooth_headset"
+            or profile.output_kind == "bluetooth_headset"
+        )
+    def _is_bluetooth_long_session_mode(self) -> bool:
+        return bool(self._bluetooth_long_session_mode)
     def _safe_close_startup_resources(self) -> None:
         try:
             self.recorder.stop()
@@ -9071,6 +7485,9 @@ class PlaybackClockSnapshot:
 class PlaybackClock:
     def __init__(self, bluetooth_output_offset_sec: float = 0.0) -> None:
         self.bluetooth_output_offset_sec = max(0.0, float(bluetooth_output_offset_sec))
+        self._last_emitted_content_sec = 0.0
+        self._last_heard_content_sec = 0.0
+        self._last_host_output_sec = 0.0
     def set_output_offset_sec(self, offset_sec: float) -> None:
         self.bluetooth_output_offset_sec = max(0.0, float(offset_sec))
     def compute(
@@ -9079,14 +7496,24 @@ class PlaybackClock:
         block_start_content_sec: float,
         block_end_content_sec: float,
     ) -> PlaybackClockSnapshot:
-        emitted = float(block_start_content_sec)
-        heard = float(emitted + self.bluetooth_output_offset_sec)
+        start_sec = float(block_start_content_sec)
+        end_sec = float(block_end_content_sec)
+        if end_sec < start_sec:
+            end_sec = start_sec
+        emitted_mid_sec = (start_sec + end_sec) * 0.5
+        heard_mid_sec = emitted_mid_sec + self.bluetooth_output_offset_sec
+        if output_buffer_dac_time_sec >= self._last_host_output_sec:
+            emitted_mid_sec = max(emitted_mid_sec, self._last_emitted_content_sec)
+            heard_mid_sec = max(heard_mid_sec, self._last_heard_content_sec)
+        self._last_host_output_sec = float(output_buffer_dac_time_sec)
+        self._last_emitted_content_sec = float(emitted_mid_sec)
+        self._last_heard_content_sec = float(heard_mid_sec)
         return PlaybackClockSnapshot(
             t_host_output_sec=float(output_buffer_dac_time_sec),
-            t_ref_block_start_content_sec=float(block_start_content_sec),
-            t_ref_block_end_content_sec=float(block_end_content_sec),
-            t_ref_emitted_content_sec=emitted,
-            t_ref_heard_content_sec=heard,
+            t_ref_block_start_content_sec=start_sec,
+            t_ref_block_end_content_sec=end_sec,
+            t_ref_emitted_content_sec=float(emitted_mid_sec),
+            t_ref_heard_content_sec=float(heard_mid_sec),
         )
 ```
 
@@ -9104,12 +7531,18 @@ from shadowing.interfaces.player import Player
 from shadowing.realtime.playback.chunk_queue import ChunkQueue
 from shadowing.realtime.playback.command_queue import PlayerCommandQueue
 from shadowing.realtime.playback.playback_clock import PlaybackClock
-from shadowing.types import AudioChunk, PlaybackState, PlaybackStatus, PlayerCommand, PlayerCommandType
+from shadowing.types import (
+    AudioChunk,
+    PlaybackState,
+    PlaybackStatus,
+    PlayerCommand,
+    PlayerCommandType,
+)
 @dataclass(slots=True)
 class PlaybackConfig:
     sample_rate: int
     channels: int
-    device: int | None = None
+    device: int | str | None = None
     latency: str | float = "low"
     blocksize: int = 0
     bluetooth_output_offset_sec: float = 0.0
@@ -9129,7 +7562,10 @@ class _OutputResampler:
         channels = arr.shape[1]
         pieces: list[np.ndarray] = []
         for ch in range(channels):
-            y = resample_poly(arr[:, ch], self.up, self.down).astype(np.float32, copy=False)
+            y = resample_poly(arr[:, ch], self.up, self.down).astype(
+                np.float32,
+                copy=False,
+            )
             pieces.append(y)
         min_len = min(piece.shape[0] for piece in pieces)
         if min_len <= 0:
@@ -9169,7 +7605,9 @@ class SoundDevicePlayer(Player):
         self.clock.set_output_offset_sec(offset_sec)
     def load_chunks(self, chunks: list[AudioChunk]) -> None:
         if chunks and any(c.sample_rate != self.config.sample_rate for c in chunks):
-            raise ValueError("Chunk sample rate does not match player config sample rate.")
+            raise ValueError(
+                "Chunk sample rate does not match player config sample rate."
+            )
         self.queue.load(chunks)
         self._content_sample_rate = int(self.config.sample_rate)
     def start(self) -> None:
@@ -9214,7 +7652,9 @@ class SoundDevicePlayer(Player):
     def get_status(self) -> PlaybackStatus:
         return self._status_snapshot
     def stop(self) -> None:
-        self.submit_command(PlayerCommand(cmd=PlayerCommandType.STOP, reason="external_stop"))
+        self.submit_command(
+            PlayerCommand(cmd=PlayerCommandType.STOP, reason="external_stop")
+        )
     def close(self) -> None:
         if self._stream is not None:
             self._stream.abort()
@@ -9247,19 +7687,30 @@ class SoundDevicePlayer(Player):
         elif hold_after_seek:
             self._state = PlaybackState.HOLDING
     def _audio_callback(self, outdata, frames, time_info, status) -> None:
+        _ = status
         self._callback_count += 1
         self._apply_merged_commands()
         block_start = self.queue.get_content_time_sec()
-        if self._state in (PlaybackState.STOPPED, PlaybackState.HOLDING, PlaybackState.FINISHED):
+        if self._state in (
+            PlaybackState.STOPPED,
+            PlaybackState.HOLDING,
+            PlaybackState.FINISHED,
+        ):
             outdata.fill(0.0)
             self._silent_branch_logged = True
         else:
             self._silent_branch_logged = False
             if self._output_resampler is None:
-                block = self.queue.read_frames(frames=frames, channels=self.config.channels)
+                block = self.queue.read_frames(
+                    frames=frames,
+                    channels=self.config.channels,
+                )
             else:
                 src_frames = self._estimate_source_frames(frames)
-                source_block = self.queue.read_frames(frames=src_frames, channels=self.config.channels)
+                source_block = self.queue.read_frames(
+                    frames=src_frames,
+                    channels=self.config.channels,
+                )
                 block = self._output_resampler.process(source_block)
                 if block.shape[0] < frames:
                     padded = np.zeros((frames, self.config.channels), dtype=np.float32)
@@ -9273,7 +7724,7 @@ class SoundDevicePlayer(Player):
                 self._state = PlaybackState.FINISHED
         block_end = self.queue.get_content_time_sec()
         snapshot = self.clock.compute(
-            output_buffer_dac_time_sec=time_info.outputBufferDacTime,
+            output_buffer_dac_time_sec=float(time_info.outputBufferDacTime),
             block_start_content_sec=block_start,
             block_end_content_sec=block_end,
         )
@@ -9289,8 +7740,8 @@ class SoundDevicePlayer(Player):
             t_ref_emitted_content_sec=snapshot.t_ref_emitted_content_sec,
             t_ref_heard_content_sec=snapshot.t_ref_heard_content_sec,
         )
-    def _resolve_output_device(self, requested_device: int | None) -> int:
-        if requested_device is not None:
+    def _resolve_output_device(self, requested_device: int | str | None) -> int:
+        if isinstance(requested_device, int):
             dev_info = sd.query_devices(requested_device)
             if int(dev_info["max_output_channels"]) <= 0:
                 raise ValueError(
@@ -9298,6 +7749,25 @@ class SoundDevicePlayer(Player):
                     f"device={requested_device}, name={dev_info['name']}"
                 )
             return int(requested_device)
+        if isinstance(requested_device, str):
+            target = requested_device.strip().lower()
+            if target:
+                devices = sd.query_devices()
+                for idx, dev in enumerate(devices):
+                    if int(dev["max_output_channels"]) <= 0:
+                        continue
+                    if target in str(dev["name"]).lower():
+                        return int(idx)
+                candidates = [
+                    f"[{idx}] {dev['name']}"
+                    for idx, dev in enumerate(devices)
+                    if int(dev["max_output_channels"]) > 0
+                ]
+                joined = "\n".join(candidates[:50])
+                raise ValueError(
+                    "Output device name not found: "
+                    f"{requested_device!r}\nAvailable output devices:\n{joined}"
+                )
         default_in, default_out = sd.default.device
         candidates: list[int] = []
         if default_out is not None and int(default_out) >= 0:
@@ -9427,6 +7897,7 @@ class SyncEvidence:
     allow_seek: bool
     startup_mode: bool
     bluetooth_mode: bool
+    bluetooth_long_session_mode: bool
     audio_confidence: float = 0.0
     still_following_likelihood: float = 0.0
     reentry_likelihood: float = 0.0
@@ -9455,10 +7926,12 @@ class SyncEvidenceBuilder:
         progress: ProgressEstimate | None,
         fusion_evidence: FusionEvidence | None,
         bluetooth_mode: bool,
+        bluetooth_long_session_mode: bool = False,
     ) -> SyncEvidence:
-        startup_mode = (now_sec - self._session_started_at_sec) <= self.startup_window_sec
+        startup_window = self.startup_window_sec + (1.5 if bluetooth_mode else 0.0)
+        startup_mode = (now_sec - self._session_started_at_sec) <= startup_window
         speech_conf = self._speech_confidence(signal_quality)
-        if speech_conf >= 0.44:
+        if speech_conf >= 0.40:
             self._last_speech_like_at_sec = float(now_sec)
         speech_state = self._speech_state(
             now_sec=now_sec,
@@ -9471,7 +7944,10 @@ class SyncEvidenceBuilder:
         still_following = 0.0 if fusion_evidence is None else float(fusion_evidence.still_following_likelihood)
         reentry = 0.0 if fusion_evidence is None else float(fusion_evidence.reentry_likelihood)
         repeated = 0.0 if fusion_evidence is None else float(fusion_evidence.repeated_likelihood)
-        sync_conf = max(0.0, min(1.0, 0.40 * speech_conf + 0.40 * tracking_conf + 0.20 * max(audio_conf, still_following)))
+        sync_conf = max(
+            0.0,
+            min(1.0, 0.36 * speech_conf + 0.40 * tracking_conf + 0.24 * max(audio_conf, still_following)),
+        )
         sync_state = self._sync_state(
             startup_mode=startup_mode,
             speech_state=speech_state,
@@ -9479,26 +7955,35 @@ class SyncEvidenceBuilder:
             sync_confidence=sync_conf,
             fusion_evidence=fusion_evidence,
         )
-        should_open_asr_gate = speech_state in (SpeechState.POSSIBLE, SpeechState.ACTIVE, SpeechState.SUSTAINED)
+        should_open_asr_gate = speech_state in (
+            SpeechState.POSSIBLE,
+            SpeechState.ACTIVE,
+            SpeechState.SUSTAINED,
+        )
         should_keep_asr_gate = should_open_asr_gate or (
             self._last_speech_like_at_sec > 0.0
-            and (now_sec - self._last_speech_like_at_sec) <= (0.70 if bluetooth_mode else 0.45)
+            and (now_sec - self._last_speech_like_at_sec) <= (0.90 if bluetooth_mode else 0.45)
         )
         allow_latency_observation = bool(
             speech_state in (SpeechState.ACTIVE, SpeechState.SUSTAINED)
             and tracking_state in (TrackingState.RELIABLE, TrackingState.LOCKED)
             and sync_state in (SyncState.CONVERGING, SyncState.STABLE)
-            and (fusion_evidence is None or fusion_evidence.fused_confidence >= 0.58)
+            and (
+                fusion_evidence is None
+                or fusion_evidence.fused_confidence >= (0.54 if bluetooth_mode else 0.58)
+            )
         )
-        allow_seek = bool(
-            (now_sec - self._session_started_at_sec) >= self.seek_enable_after_sec
-            and tracking_state == TrackingState.LOCKED
-            and sync_state == SyncState.STABLE
-            and not startup_mode
-            and not bluetooth_mode
-            and repeated < 0.55
-            and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
-        )
+        if bluetooth_mode:
+            allow_seek = False
+        else:
+            allow_seek = bool(
+                (now_sec - self._session_started_at_sec) >= self.seek_enable_after_sec
+                and tracking_state == TrackingState.LOCKED
+                and sync_state == SyncState.STABLE
+                and not startup_mode
+                and repeated < 0.55
+                and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
+            )
         return SyncEvidence(
             speech_state=speech_state,
             tracking_state=tracking_state,
@@ -9512,6 +7997,7 @@ class SyncEvidenceBuilder:
             allow_seek=allow_seek,
             startup_mode=startup_mode,
             bluetooth_mode=bluetooth_mode,
+            bluetooth_long_session_mode=bool(bluetooth_long_session_mode),
             audio_confidence=audio_conf,
             still_following_likelihood=still_following,
             reentry_likelihood=reentry,
@@ -9544,10 +8030,16 @@ class SyncEvidenceBuilder:
             return SpeechState.NONE
         if speech_confidence < 0.42:
             return SpeechState.POSSIBLE
-        if self._last_speech_like_at_sec > 0.0 and (now_sec - self._last_speech_like_at_sec) <= self.sustained_speaking_sec:
+        if self._last_speech_like_at_sec > 0.0 and (
+            now_sec - self._last_speech_like_at_sec
+        ) <= self.sustained_speaking_sec:
             return SpeechState.SUSTAINED
         return SpeechState.ACTIVE
-    def _tracking_confidence(self, progress: ProgressEstimate | None, fusion_evidence: FusionEvidence | None) -> float:
+    def _tracking_confidence(
+        self,
+        progress: ProgressEstimate | None,
+        fusion_evidence: FusionEvidence | None,
+    ) -> float:
         score = 0.0
         if progress is not None:
             score += min(0.45, float(progress.tracking_quality) * 0.50)
@@ -9562,7 +8054,11 @@ class SyncEvidenceBuilder:
             score += min(0.16, float(fusion_evidence.audio_confidence) * 0.20)
             score += min(0.14, float(fusion_evidence.still_following_likelihood) * 0.18)
         return max(0.0, min(1.0, score))
-    def _tracking_state(self, progress: ProgressEstimate | None, tracking_confidence: float) -> TrackingState:
+    def _tracking_state(
+        self,
+        progress: ProgressEstimate | None,
+        tracking_confidence: float,
+    ) -> TrackingState:
         if progress is None:
             return TrackingState.NONE
         mode = progress.tracking_mode
@@ -9584,7 +8080,11 @@ class SyncEvidenceBuilder:
     ) -> SyncState:
         if startup_mode:
             return SyncState.BOOTSTRAP
-        if speech_state in (SpeechState.ACTIVE, SpeechState.SUSTAINED) and tracking_state == TrackingState.LOCKED and sync_confidence >= 0.72:
+        if (
+            speech_state in (SpeechState.ACTIVE, SpeechState.SUSTAINED)
+            and tracking_state == TrackingState.LOCKED
+            and sync_confidence >= 0.72
+        ):
             return SyncState.STABLE
         if fusion_evidence is not None and fusion_evidence.still_following_likelihood >= 0.68 and sync_confidence >= 0.56:
             return SyncState.CONVERGING
@@ -10777,7 +9277,9 @@ from shadowing.audio.reference_audio_analyzer import ReferenceAudioAnalyzer
 from shadowing.audio.reference_audio_store import ReferenceAudioStore
 from shadowing.infrastructure.lesson_repo import FileLessonRepository
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build reference audio features for a lesson")
+    parser = argparse.ArgumentParser(
+        description="Build reference audio features for a lesson"
+    )
     parser.add_argument("--lesson-id", type=str, required=True)
     parser.add_argument("--lesson-base-dir", type=str, default="assets/lessons")
     parser.add_argument("--frame-size-sec", type=float, default=0.025)
@@ -10820,13 +9322,20 @@ def main() -> None:
     parser.add_argument("--summary-file", type=str, default=None)
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
-    evaluator = SessionEvaluator(events_file=args.events_file, summary_file=args.summary_file)
+    evaluator = SessionEvaluator(
+        events_file=args.events_file,
+        summary_file=args.summary_file,
+    )
     result = evaluator.evaluate()
     payload = result.to_dict()
     if args.output_json:
         out_path = Path(args.output_json).expanduser().resolve()
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        out_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    else:
 if __name__ == "__main__":
     main()
 ```
@@ -10841,7 +9350,9 @@ import argparse
 from collections import Counter
 from shadowing.telemetry.replay_loader import ReplayLoader
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Replay and summarize a recorded runtime session events.jsonl")
+    parser = argparse.ArgumentParser(
+        description="Replay and summarize a recorded runtime session events.jsonl"
+    )
     parser.add_argument("--events-file", type=str, required=True)
     args = parser.parse_args()
     loader = ReplayLoader(args.events_file)
@@ -10872,7 +9383,10 @@ def main() -> None:
         elif ev.event_type == "progress_snapshot":
             last_user_state = ev.payload.get("user_state")
         elif ev.event_type == "signal_snapshot":
-            max_signal = max(max_signal, float(ev.payload.get("speaking_likelihood", 0.0)))
+            max_signal = max(
+                max_signal,
+                float(ev.payload.get("speaking_likelihood", 0.0)),
+            )
     for k in sorted(counts):
 if __name__ == "__main__":
     main()
@@ -10913,7 +9427,9 @@ def validate_lesson_assets(lesson_dir: Path) -> None:
         if not p.exists():
             missing.append(str(p))
     if missing:
-        raise FileNotFoundError("Lesson assets not found. Please run preprocess first.\n" + "\n".join(missing))
+        raise FileNotFoundError(
+            "Lesson assets not found. Please run preprocess first.\n" + "\n".join(missing)
+        )
 def load_manifest(lesson_dir: Path) -> dict:
     return json.loads((lesson_dir / "lesson_manifest.json").read_text(encoding="utf-8"))
 def collect_sherpa_paths() -> dict:
@@ -10926,7 +9442,12 @@ def collect_sherpa_paths() -> dict:
 def validate_sherpa_paths(paths: dict) -> None:
     missing_keys: list[str] = []
     missing_files: list[str] = []
-    env_map = {"tokens": "SHERPA_TOKENS", "encoder": "SHERPA_ENCODER", "decoder": "SHERPA_DECODER", "joiner": "SHERPA_JOINER"}
+    env_map = {
+        "tokens": "SHERPA_TOKENS",
+        "encoder": "SHERPA_ENCODER",
+        "decoder": "SHERPA_DECODER",
+        "joiner": "SHERPA_JOINER",
+    }
     for key in ("tokens", "encoder", "decoder", "joiner"):
         value = (paths.get(key) or "").strip()
         if not value:
@@ -10950,16 +9471,26 @@ def _parse_input_device_arg(raw_value: str | None) -> int | str | None:
     if raw.isdigit():
         return int(raw)
     return raw
+def _parse_output_device_arg(raw_value: str | None) -> int | str | None:
+    if raw_value is None:
+        return None
+    raw = str(raw_value).strip()
+    if raw == "":
+        return None
+    if raw.isdigit():
+        return int(raw)
+    return raw
 def _resolve_output_device_name(device_value: int | str | None) -> str:
+    devices = sd.query_devices()
     if device_value is None:
         _, default_out = sd.default.device
         if default_out is None or int(default_out) < 0:
             return "unknown"
         return str(sd.query_devices(int(default_out))["name"])
     if isinstance(device_value, int):
-        return str(sd.query_devices(device_value)["name"])
+        return str(sd.query_devices(int(device_value))["name"])
     target = str(device_value).strip().lower()
-    for _, dev in enumerate(sd.query_devices()):
+    for dev in devices:
         if int(dev["max_output_channels"]) <= 0:
             continue
         if target in str(dev["name"]).lower():
@@ -10980,13 +9511,32 @@ def _resolve_input_device_name(device_value: int | str | None) -> str:
         if target in str(dev["name"]).lower():
             return str(dev["name"])
     return str(device_value)
-def _run_bluetooth_preflight_or_fail(*, input_device: int | str | None, output_device: int | str | None, input_samplerate: int, playback_sample_rate: int, preflight_duration_sec: float, skip_bluetooth_preflight: bool) -> tuple[int | str | None, int | str | None]:
+def _run_bluetooth_preflight_or_fail(
+    *,
+    input_device: int | str | None,
+    output_device: int | str | None,
+    input_samplerate: int,
+    playback_sample_rate: int,
+    preflight_duration_sec: float,
+    skip_bluetooth_preflight: bool,
+) -> tuple[int | str | None, int | str | None]:
     if skip_bluetooth_preflight:
         return input_device, output_device
-    should_run = should_run_bluetooth_preflight(input_device=input_device, output_device=output_device)
+    should_run = should_run_bluetooth_preflight(
+        input_device=input_device,
+        output_device=output_device,
+    )
     if not should_run:
         return input_device, output_device
-    result = run_bluetooth_duplex_preflight(BluetoothPreflightConfig(input_device=input_device, output_device=output_device, preferred_input_samplerate=int(input_samplerate), preferred_output_samplerate=int(playback_sample_rate), duration_sec=float(preflight_duration_sec)))
+    result = run_bluetooth_duplex_preflight(
+        BluetoothPreflightConfig(
+            input_device=input_device,
+            output_device=output_device,
+            preferred_input_samplerate=int(input_samplerate),
+            preferred_output_samplerate=int(playback_sample_rate),
+            duration_sec=float(preflight_duration_sec),
+        )
+    )
     if not result.passed:
         notes = "\n".join(f"- {x}" for x in result.notes) if result.notes else ""
         raise RuntimeError(
@@ -11054,7 +9604,11 @@ def _dedupe_by_containment(terms: list[str], max_terms: int) -> list[str]:
         if len(kept) >= max_terms:
             break
     return kept
-def _build_hotwords_from_lesson_text_local(lesson_text: str, *, max_terms: int = 20) -> list[str]:
+def _build_hotwords_from_lesson_text_local(
+    lesson_text: str,
+    *,
+    max_terms: int = 20,
+) -> list[str]:
     normalized_full = _normalize_for_hotwords(lesson_text)
     if not normalized_full:
         return []
@@ -11083,7 +9637,12 @@ def _build_hotwords_from_lesson_text_local(lesson_text: str, *, max_terms: int =
     ranked_terms = [k for k, _ in ranked]
     ranked_terms = _dedupe_by_containment(ranked_terms, max_terms=max_terms)
     return ranked_terms[:max_terms]
-def _merge_hotwords(auto_terms: list[str], user_terms_raw: str, *, max_terms: int = 32) -> list[str]:
+def _merge_hotwords(
+    auto_terms: list[str],
+    user_terms_raw: str,
+    *,
+    max_terms: int = 32,
+) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
     def add(term: str) -> None:
@@ -11105,32 +9664,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-file", type=str, required=True)
     parser.add_argument("--lesson-base-dir", type=str, default="assets/lessons")
     parser.add_argument("--asr", type=str, default="sherpa", choices=["fake", "sherpa"])
-    parser.add_argument("--output-device", type=int, default=None)
+    parser.add_argument("--output-device", type=str, default=None)
     parser.add_argument("--input-device", type=str, default=None)
     parser.add_argument("--input-samplerate", type=int, default=None)
-    parser.add_argument("--capture-backend", type=str, default="sounddevice", choices=["sounddevice", "soundcard"])
-    parser.add_argument("--bluetooth-offset-sec", type=float, default=0.18)
-    parser.add_argument("--playback-latency", type=str, default="high")
-    parser.add_argument("--playback-blocksize", type=int, default=4096)
+    parser.add_argument(
+        "--capture-backend",
+        type=str,
+        default="sounddevice",
+        choices=["sounddevice", "soundcard"],
+    )
+    parser.add_argument("--bluetooth-offset-sec", type=float, default=0.28)
+    parser.add_argument("--playback-latency", type=str, default="low")
+    parser.add_argument("--playback-blocksize", type=int, default=512)
     parser.add_argument("--aligner-debug", action="store_true")
     parser.add_argument("--asr-debug-feed", action="store_true")
     parser.add_argument("--asr-debug-feed-every", type=int, default=20)
     parser.add_argument("--skip-bluetooth-preflight", action="store_true")
-    parser.add_argument("--preflight-duration-sec", type=float, default=3.5)
-    parser.add_argument("--tick-sleep-sec", type=float, default=0.03)
+    parser.add_argument("--preflight-duration-sec", type=float, default=6.0)
+    parser.add_argument("--tick-sleep-sec", type=float, default=0.02)
     parser.add_argument("--profile-path", type=str, default="runtime/device_profiles.json")
     parser.add_argument("--session-dir", type=str, default="runtime/latest_session")
     parser.add_argument("--event-logging", action="store_true")
-    parser.add_argument("--startup-grace-sec", type=float, default=2.0)
-    parser.add_argument("--low-confidence-hold-sec", type=float, default=1.5)
+    parser.add_argument("--startup-grace-sec", type=float, default=2.8)
+    parser.add_argument("--low-confidence-hold-sec", type=float, default=1.8)
     parser.add_argument("--hotwords", type=str, default="")
     parser.add_argument("--hotwords-score", type=float, default=1.8)
     parser.add_argument("--disable-auto-hotwords", action="store_true")
     parser.add_argument("--print-hotwords", action="store_true")
-    parser.add_argument("--hotwords-source", type=str, default="qwen", choices=["qwen", "local", "none"], help="热词来源：qwen / local / none")
-    parser.add_argument("--qwen-api-key", type=str, default=os.getenv("DASHSCOPE_API_KEY", ""), help="DashScope API Key，默认读环境变量 DASHSCOPE_API_KEY")
-    parser.add_argument("--qwen-model", type=str, default=os.getenv("QWEN_CHAT_MODEL", "qwen-plus"), help="Qwen 模型名，默认 qwen-plus")
+    parser.add_argument(
+        "--hotwords-source",
+        type=str,
+        default="qwen",
+        choices=["qwen", "local", "none"],
+        help="热词来源：qwen / local / none",
+    )
+    parser.add_argument(
+        "--qwen-api-key",
+        type=str,
+        default=os.getenv("DASHSCOPE_API_KEY", ""),
+        help="DashScope API Key，默认读环境变量 DASHSCOPE_API_KEY",
+    )
+    parser.add_argument(
+        "--qwen-model",
+        type=str,
+        default=os.getenv("QWEN_CHAT_MODEL", "qwen-plus"),
+        help="Qwen 模型名，默认 qwen-plus",
+    )
     parser.add_argument("--qwen-max-hotwords", type=int, default=24, help="Qwen 提取热词最大数量")
+    parser.add_argument("--force-bluetooth-long-session-mode", action="store_true")
     return parser
 def main() -> None:
     parser = build_arg_parser()
@@ -11148,7 +9729,19 @@ def main() -> None:
     manifest = load_manifest(lesson_dir)
     playback_sample_rate = int(manifest["sample_rate_out"])
     parsed_input_device = _parse_input_device_arg(args.input_device)
-    rec_cfg = pick_working_input_config(preferred_device=parsed_input_device if isinstance(parsed_input_device, int) else None, preferred_name_substring=parsed_input_device if isinstance(parsed_input_device, str) else None, preferred_rates=([args.input_samplerate, 48000, 44100, 16000] if args.input_samplerate is not None else [48000, 44100, 16000])) or {"device": parsed_input_device, "samplerate": args.input_samplerate or 48000}
+    parsed_output_device = _parse_output_device_arg(args.output_device)
+    rec_cfg = pick_working_input_config(
+        preferred_device=parsed_input_device if isinstance(parsed_input_device, int) else None,
+        preferred_name_substring=parsed_input_device if isinstance(parsed_input_device, str) else None,
+        preferred_rates=(
+            [args.input_samplerate, 48000, 44100, 16000]
+            if args.input_samplerate is not None
+            else [48000, 44100, 16000]
+        ),
+    ) or {
+        "device": parsed_input_device,
+        "samplerate": args.input_samplerate or 48000,
+    }
     if args.input_samplerate is not None:
         rec_cfg["samplerate"] = args.input_samplerate
     effective_input_device = rec_cfg["device"]
@@ -11156,41 +9749,167 @@ def main() -> None:
     sherpa_paths = collect_sherpa_paths()
     if args.asr == "sherpa":
         validate_sherpa_paths(sherpa_paths)
-    effective_input_device, effective_output_device = _run_bluetooth_preflight_or_fail(input_device=effective_input_device, output_device=args.output_device, input_samplerate=effective_input_samplerate, playback_sample_rate=playback_sample_rate, preflight_duration_sec=float(args.preflight_duration_sec), skip_bluetooth_preflight=bool(args.skip_bluetooth_preflight))
+    effective_input_device, effective_output_device = _run_bluetooth_preflight_or_fail(
+        input_device=effective_input_device,
+        output_device=parsed_output_device,
+        input_samplerate=effective_input_samplerate,
+        playback_sample_rate=playback_sample_rate,
+        preflight_duration_sec=float(args.preflight_duration_sec),
+        skip_bluetooth_preflight=bool(args.skip_bluetooth_preflight),
+    )
     input_device_name = _resolve_input_device_name(effective_input_device)
     output_device_name = _resolve_output_device_name(effective_output_device)
     auto_hotwords: list[str] = []
     if not args.disable_auto_hotwords and args.hotwords_source != "none":
         if args.hotwords_source == "qwen":
             if args.qwen_api_key.strip():
-                auto_hotwords = extract_hotwords_with_qwen(lesson_text=lesson_text, api_key=args.qwen_api_key.strip(), model=args.qwen_model.strip(), max_terms=int(args.qwen_max_hotwords))
+                auto_hotwords = extract_hotwords_with_qwen(
+                    lesson_text=lesson_text,
+                    api_key=args.qwen_api_key.strip(),
+                    model=args.qwen_model.strip(),
+                    max_terms=int(args.qwen_max_hotwords),
+                )
                 if not auto_hotwords:
-                    auto_hotwords = _build_hotwords_from_lesson_text_local(lesson_text, max_terms=min(20, int(args.qwen_max_hotwords)))
+                    auto_hotwords = _build_hotwords_from_lesson_text_local(
+                        lesson_text,
+                        max_terms=min(20, int(args.qwen_max_hotwords)),
+                    )
             else:
-                auto_hotwords = _build_hotwords_from_lesson_text_local(lesson_text, max_terms=min(20, int(args.qwen_max_hotwords)))
+                auto_hotwords = _build_hotwords_from_lesson_text_local(
+                    lesson_text,
+                    max_terms=min(20, int(args.qwen_max_hotwords)),
+                )
         elif args.hotwords_source == "local":
-            auto_hotwords = _build_hotwords_from_lesson_text_local(lesson_text, max_terms=min(20, int(args.qwen_max_hotwords)))
-    merged_hotwords = _merge_hotwords(auto_hotwords, str(args.hotwords or ""), max_terms=max(16, min(32, int(args.qwen_max_hotwords))))
+            auto_hotwords = _build_hotwords_from_lesson_text_local(
+                lesson_text,
+                max_terms=min(20, int(args.qwen_max_hotwords)),
+            )
+    merged_hotwords = _merge_hotwords(
+        auto_terms=auto_hotwords,
+        user_terms_raw=str(args.hotwords or ""),
+        max_terms=max(16, min(32, int(args.qwen_max_hotwords))),
+    )
     hotwords_str = "\n".join(merged_hotwords)
-    if merged_hotwords:
-        preview = merged_hotwords[:20]
-    else:
     if args.print_hotwords and merged_hotwords:
         for term in merged_hotwords:
     runtime = build_runtime(
         {
             "lesson_base_dir": str(lesson_base_dir),
-            "playback": {"sample_rate": playback_sample_rate, "channels": 1, "device": effective_output_device if isinstance(effective_output_device, int) else args.output_device, "latency": args.playback_latency, "blocksize": int(args.playback_blocksize), "bluetooth_output_offset_sec": float(args.bluetooth_offset_sec)},
-            "capture": {"backend": str(args.capture_backend), "device_sample_rate": effective_input_samplerate, "target_sample_rate": 16000, "channels": 1, "device": effective_input_device, "dtype": "float32", "blocksize": 0, "latency": "low"},
-            "asr": {"mode": args.asr, "tokens": sherpa_paths.get("tokens", ""), "encoder": sherpa_paths.get("encoder", ""), "decoder": sherpa_paths.get("decoder", ""), "joiner": sherpa_paths.get("joiner", ""), "sample_rate": 16000, "emit_partial_interval_sec": 0.08, "enable_endpoint": True, "debug_feed": bool(args.asr_debug_feed), "debug_feed_every_n_chunks": int(args.asr_debug_feed_every), "num_threads": 2, "provider": "cpu", "feature_dim": 80, "decoding_method": "greedy_search", "rule1_min_trailing_silence": 1.2, "rule2_min_trailing_silence": 0.8, "rule3_min_utterance_length": 12.0, "hotwords": hotwords_str, "hotwords_score": float(args.hotwords_score), "min_meaningful_text_len": 2, "endpoint_min_interval_sec": 0.35, "reset_on_empty_endpoint": False, "preserve_stream_on_partial_only": True, "force_reset_after_empty_endpoints": 999999999, "info_logging": True, "log_hotwords_on_start": True, "log_hotwords_preview_on_start": True, "hotwords_preview_limit": 12},
-            "alignment": {"window_back": 8, "window_ahead": 40, "stable_frames": 2, "min_confidence": 0.60, "backward_lock_frames": 3, "clause_boundary_bonus": 0.15, "cross_clause_backward_extra_penalty": 0.20, "debug": bool(args.aligner_debug), "max_hyp_tokens": 16, "weak_commit_min_conf": 0.82, "weak_commit_min_local_match": 0.80, "weak_commit_min_advance": 3},
-            "control": {"target_lead_sec": 0.15, "hold_if_lead_sec": 0.90, "resume_if_lead_sec": 0.28, "seek_if_lag_sec": -1.80, "min_confidence": 0.72, "seek_cooldown_sec": 1.20, "gain_following": 0.55, "gain_transition": 0.80, "gain_soft_duck": 0.42, "startup_grace_sec": float(args.startup_grace_sec), "low_confidence_hold_sec": float(args.low_confidence_hold_sec), "guide_play_sec": 2.20, "no_progress_hold_min_play_sec": 4.00, "progress_stale_sec": 1.10, "hold_trend_sec": 0.75, "tracking_quality_hold_min": 0.56, "tracking_quality_seek_min": 0.68, "resume_from_hold_speaking_lead_slack_sec": 0.45, "disable_seek": False},
-            "runtime": {"audio_queue_maxsize": 150, "asr_event_queue_maxsize": 64, "loop_interval_sec": float(args.tick_sleep_sec)},
-            "signal": {"min_vad_rms": 0.006, "vad_noise_multiplier": 2.8},
-            "adaptation": {"profile_path": str(Path(args.profile_path).expanduser().resolve())},
-            "session": {"session_dir": str(Path(args.session_dir).expanduser().resolve()), "event_logging": bool(args.event_logging)},
-            "device_context": {"input_device_name": input_device_name, "output_device_name": output_device_name, "input_sample_rate": effective_input_samplerate, "noise_floor_rms": 0.0025},
-            "debug": {"enabled": False},
+            "playback": {
+                "sample_rate": playback_sample_rate,
+                "channels": 1,
+                "device": effective_output_device,
+                "latency": args.playback_latency,
+                "blocksize": int(args.playback_blocksize),
+                "bluetooth_output_offset_sec": float(args.bluetooth_offset_sec),
+            },
+            "capture": {
+                "backend": str(args.capture_backend),
+                "device_sample_rate": effective_input_samplerate,
+                "target_sample_rate": 16000,
+                "channels": 1,
+                "device": effective_input_device,
+                "dtype": "float32",
+                "blocksize": 0,
+                "latency": "low",
+            },
+            "asr": {
+                "mode": args.asr,
+                "tokens": sherpa_paths.get("tokens", ""),
+                "encoder": sherpa_paths.get("encoder", ""),
+                "decoder": sherpa_paths.get("decoder", ""),
+                "joiner": sherpa_paths.get("joiner", ""),
+                "sample_rate": 16000,
+                "emit_partial_interval_sec": 0.08,
+                "enable_endpoint": True,
+                "debug_feed": bool(args.asr_debug_feed),
+                "debug_feed_every_n_chunks": int(args.asr_debug_feed_every),
+                "num_threads": 2,
+                "provider": "cpu",
+                "feature_dim": 80,
+                "decoding_method": "greedy_search",
+                "rule1_min_trailing_silence": 1.2,
+                "rule2_min_trailing_silence": 0.8,
+                "rule3_min_utterance_length": 12.0,
+                "hotwords": hotwords_str,
+                "hotwords_score": float(args.hotwords_score),
+                "min_meaningful_text_len": 2,
+                "endpoint_min_interval_sec": 0.35,
+                "reset_on_empty_endpoint": False,
+                "preserve_stream_on_partial_only": True,
+                "force_reset_after_empty_endpoints": 999999999,
+                "info_logging": True,
+                "log_hotwords_on_start": True,
+                "log_hotwords_preview_on_start": True,
+                "hotwords_preview_limit": 12,
+            },
+            "alignment": {
+                "window_back": 8,
+                "window_ahead": 40,
+                "stable_hits": 2,
+                "min_confidence": 0.60,
+                "debug": bool(args.aligner_debug),
+            },
+            "control": {
+                "target_lead_sec": 0.15,
+                "hold_if_lead_sec": 0.90,
+                "resume_if_lead_sec": 0.28,
+                "seek_if_lag_sec": -1.80,
+                "min_confidence": 0.72,
+                "seek_cooldown_sec": 1.20,
+                "gain_following": 0.55,
+                "gain_transition": 0.80,
+                "gain_soft_duck": 0.42,
+                "startup_grace_sec": float(args.startup_grace_sec),
+                "low_confidence_hold_sec": float(args.low_confidence_hold_sec),
+                "guide_play_sec": 3.00,
+                "no_progress_hold_min_play_sec": 5.20,
+                "progress_stale_sec": 1.35,
+                "hold_trend_sec": 0.95,
+                "tracking_quality_hold_min": 0.62,
+                "tracking_quality_seek_min": 0.80,
+                "resume_from_hold_speaking_lead_slack_sec": 0.62,
+                "disable_seek": False,
+                "bluetooth_long_session_target_lead_sec": 0.35,
+                "bluetooth_long_session_hold_if_lead_sec": 1.20,
+                "bluetooth_long_session_resume_if_lead_sec": 0.22,
+                "bluetooth_long_session_seek_if_lag_sec": -2.80,
+                "bluetooth_long_session_seek_cooldown_sec": 2.60,
+                "bluetooth_long_session_progress_stale_sec": 1.45,
+                "bluetooth_long_session_hold_trend_sec": 1.00,
+                "bluetooth_long_session_tracking_quality_hold_min": 0.64,
+                "bluetooth_long_session_tracking_quality_seek_min": 0.82,
+                "bluetooth_long_session_resume_from_hold_speaking_lead_slack_sec": 0.62,
+                "bluetooth_long_session_gain_following": 0.52,
+                "bluetooth_long_session_gain_transition": 0.72,
+                "bluetooth_long_session_gain_soft_duck": 0.36,
+            },
+            "runtime": {
+                "audio_queue_maxsize": 150,
+                "asr_event_queue_maxsize": 64,
+                "loop_interval_sec": float(args.tick_sleep_sec),
+            },
+            "signal": {
+                "min_vad_rms": 0.006,
+                "vad_noise_multiplier": 2.8,
+            },
+            "adaptation": {
+                "profile_path": str(Path(args.profile_path).expanduser().resolve()),
+            },
+            "session": {
+                "session_dir": str(Path(args.session_dir).expanduser().resolve()),
+                "event_logging": bool(args.event_logging),
+            },
+            "device_context": {
+                "input_device_name": input_device_name,
+                "output_device_name": output_device_name,
+                "input_sample_rate": effective_input_samplerate,
+                "noise_floor_rms": 0.0025,
+                "bluetooth_long_session_mode": bool(args.force_bluetooth_long_session_mode),
+            },
+            "debug": {
+                "enabled": False,
+            },
         }
     )
     runtime.run(lesson_id)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import _bootstrap  # noqa: F401
-
+import _bootstrap
 import sounddevice as sd
 
 
@@ -13,7 +12,6 @@ def main() -> None:
         if int(dev["max_input_channels"]) > 0
     ]
 
-    print("=== Input device probe ===")
     if not input_devices:
         print("No input devices found.")
         return
@@ -22,7 +20,6 @@ def main() -> None:
         name = str(dev["name"])
         max_in = int(dev["max_input_channels"])
         default_sr = int(float(dev["default_samplerate"]))
-        print(f"\n[{ordinal}] raw={raw_idx} name={name!r} max_in={max_in} default_sr={default_sr}")
 
         candidate_sample_rates: list[int] = []
         for sr in [48000, 44100, default_sr, 16000]:
@@ -35,6 +32,8 @@ def main() -> None:
                 candidate_channels.append(ch)
 
         opened = False
+        print(f"=== Input Device #{ordinal} raw_idx={raw_idx} name={name!r} max_in={max_in} ===")
+
         for sr in candidate_sample_rates:
             for ch in candidate_channels:
                 try:
@@ -49,13 +48,15 @@ def main() -> None:
                     stream.start()
                     stream.stop()
                     stream.close()
-                    print(f"  OK   samplerate={sr} channels={ch}")
+                    print(f"  OK  samplerate={sr} channels={ch}")
                     opened = True
                 except Exception as e:
-                    print(f"  FAIL samplerate={sr} channels={ch} -> {e}")
+                    print(f"  FAIL samplerate={sr} channels={ch} error={e}")
 
         if not opened:
-            print("  No working combination found for this device.")
+            print("  No tested configuration could be opened for this input device.")
+
+        print()
 
 
 if __name__ == "__main__":
