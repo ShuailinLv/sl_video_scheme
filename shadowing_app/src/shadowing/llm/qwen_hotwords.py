@@ -12,20 +12,6 @@ import dashscope
 
 logger = logging.getLogger(__name__)
 
-# ==============================================================================
-# 本地固定配置：代理 + DashScope Key
-# 说明：
-# 1. 代理用于你本机网络环境（例如 Clash Verge）
-# 2. DashScope 走直连白名单，不走代理
-# 3. 如果调用 extract_hotwords_with_qwen() 时没有传 api_key，
-#    就自动使用这里写死的 default key
-# ==============================================================================
-
-os.environ["HTTP_PROXY"] = "http://127.0.0.1:7897"
-os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7897"
-os.environ["NO_PROXY"] = "aliyuncs.com,dashscope.aliyuncs.com,localhost,127.0.0.1"
-
-_DEFAULT_DASHSCOPE_API_KEY = "sk-f918f0ebc05e4e6283ea3e04ef40b1bd"
 _DEFAULT_QWEN_MODEL = "qwen-plus"
 
 
@@ -64,7 +50,7 @@ def _resolve_api_key(api_key: str | None) -> str:
     if env_key:
         return env_key
 
-    return _DEFAULT_DASHSCOPE_API_KEY
+    return ""
 
 
 def _chat_once(
@@ -158,23 +144,18 @@ def _normalize_hotword(term: str) -> str:
 def _is_good_hotword(term: str) -> bool:
     if not term:
         return False
-
     n = len(term)
     if n < 4 or n > 24:
         return False
-
     if term[0] in "的了在和与及并就也又把被将呢啊吗呀":
         return False
     if term[-1] in "的了在和与及并就也又呢啊吗呀":
         return False
-
     if re.fullmatch(r"[A-Za-z]+", term):
         return False
-
     if re.search(r"[A-Za-z]", term):
         if not re.fullmatch(r"[A-Za-z0-9一-龥]+", term):
             return False
-
     return True
 
 
@@ -227,7 +208,6 @@ def extract_hotwords_with_qwen(
 
     user_prompt = f"""
 请从下面这段中文演讲稿中，提取适合“语音识别热词注入”的短语。
-
 目标：
 1. 只保留高质量短语
 2. 优先保留专有名词、术语、固定表达、业务短语、容易识别错的实体词
@@ -243,7 +223,6 @@ def extract_hotwords_with_qwen(
     "短语2"
   ]
 }}
-
 演讲稿如下：
 \"\"\"
 {clipped_text}
@@ -265,8 +244,8 @@ def extract_hotwords_with_qwen(
             hotwords = data.get("hotwords", [])
             if not isinstance(hotwords, list):
                 hotwords = []
-            result = _dedupe_hotwords([str(x) for x in hotwords], max_terms=max_terms)
-            return result
+
+            return _dedupe_hotwords([str(x) for x in hotwords], max_terms=max_terms)
         except Exception as e:
             last_error = e
             logger.warning(

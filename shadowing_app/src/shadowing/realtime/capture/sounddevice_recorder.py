@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import sounddevice as sd
@@ -36,6 +37,7 @@ class SoundDeviceRecorder(Recorder):
     def start(self, on_audio_frame: Callable[[bytes], None]) -> None:
         if self._stream is not None:
             return
+
         self._callback = on_audio_frame
         device = self._resolve_input_device(self.device)
         dev_info = sd.query_devices(device, "input")
@@ -45,6 +47,7 @@ class SoundDeviceRecorder(Recorder):
 
         opened_channels = max(1, min(self.channels, max_in))
         sr = self._pick_openable_samplerate(device, dev_info, opened_channels)
+
         self._opened_samplerate = sr
         self._opened_channels = opened_channels
         self._resampler = AudioResampler(src_rate=sr, dst_rate=self.target_sample_rate)
@@ -74,15 +77,16 @@ class SoundDeviceRecorder(Recorder):
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         if self._callback is None:
             return
-        if status:
-            print(f"[REC] callback status: {status}")
+
         audio = np.asarray(indata, dtype=np.float32)
         if audio.ndim == 1:
             mono = audio
         else:
             mono = np.mean(audio, axis=1).astype(np.float32, copy=False)
+
         if self._resampler is None:
             raise RuntimeError("Recorder resampler is not initialized.")
+
         self._callback(self._resampler.process_float_mono(mono))
 
     def _resolve_input_device(self, device: int | str | None) -> int | str | None:
@@ -90,6 +94,7 @@ class SoundDeviceRecorder(Recorder):
             return None
         if isinstance(device, int):
             return device
+
         target = str(device).strip().lower()
         for idx, dev in enumerate(sd.query_devices()):
             if int(dev["max_input_channels"]) > 0 and target in str(dev["name"]).lower():
@@ -101,10 +106,17 @@ class SoundDeviceRecorder(Recorder):
         for sr in [self.sample_rate_in, int(float(dev_info["default_samplerate"])), 48000, 44100, 16000]:
             if sr > 0 and sr not in candidates:
                 candidates.append(sr)
+
         for sr in candidates:
             try:
-                sd.check_input_settings(device=device, samplerate=sr, channels=opened_channels, dtype=self.dtype)
+                sd.check_input_settings(
+                    device=device,
+                    samplerate=sr,
+                    channels=opened_channels,
+                    dtype=self.dtype,
+                )
                 return sr
             except Exception:
                 continue
+
         raise RuntimeError(f"Failed to find openable samplerate for input device: {dev_info}")

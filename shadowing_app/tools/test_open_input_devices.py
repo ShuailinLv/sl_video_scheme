@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import _bootstrap  # noqa: F401
 
 import sounddevice as sd
@@ -13,18 +14,22 @@ def main() -> None:
     ]
 
     print("=== Input device probe ===")
+    if not input_devices:
+        print("No input devices found.")
+        return
+
     for ordinal, (raw_idx, dev) in enumerate(input_devices):
         name = str(dev["name"])
         max_in = int(dev["max_input_channels"])
         default_sr = int(float(dev["default_samplerate"]))
-        print(f"\\n[{ordinal}] raw={raw_idx} name={name!r} max_in={max_in} default_sr={default_sr}")
+        print(f"\n[{ordinal}] raw={raw_idx} name={name!r} max_in={max_in} default_sr={default_sr}")
 
-        candidate_sample_rates = []
-        for sr in [48000, 44100, default_sr]:
+        candidate_sample_rates: list[int] = []
+        for sr in [48000, 44100, default_sr, 16000]:
             if sr > 0 and sr not in candidate_sample_rates:
                 candidate_sample_rates.append(sr)
 
-        candidate_channels = []
+        candidate_channels: list[int] = []
         for ch in [1, 2, max_in]:
             if ch > 0 and ch <= max_in and ch not in candidate_channels:
                 candidate_channels.append(ch)

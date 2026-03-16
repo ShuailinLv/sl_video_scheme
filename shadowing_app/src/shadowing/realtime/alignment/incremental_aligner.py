@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 from typing import Sequence
 
 
@@ -90,7 +90,6 @@ class IncrementalAligner:
         self.clause_boundary_bonus = float(clause_boundary_bonus)
         self.cross_clause_backward_extra_penalty = float(cross_clause_backward_extra_penalty)
         self.max_hyp_tokens = int(max_hyp_tokens)
-
         self.weak_commit_min_conf = float(weak_commit_min_conf)
         self.weak_commit_min_local_match = float(weak_commit_min_local_match)
         self.weak_commit_min_advance = int(weak_commit_min_advance)
@@ -103,6 +102,11 @@ class IncrementalAligner:
         self._same_candidate_repeat = 0
         self._last_zone_anchor = 0
         self._same_forward_zone_repeat = 0
+
+        self._forced_center: int | None = None
+        self._forced_window_back: int | None = None
+        self._forced_window_ahead: int | None = None
+        self._forced_budget = 0
 
         if reference_text is not None:
             self.set_reference(reference_text)
@@ -130,6 +134,27 @@ class IncrementalAligner:
         self._same_candidate_repeat = 0
         self._last_zone_anchor = self._committed
         self._same_forward_zone_repeat = 0
+        self._forced_center = None
+        self._forced_window_back = None
+        self._forced_window_ahead = None
+        self._forced_budget = 0
+
+    def force_recenter(
+        self,
+        committed_hint: int,
+        *,
+        window_back: int | None = None,
+        window_ahead: int | None = None,
+        budget_events: int = 6,
+    ) -> None:
+        if not self.reference_norm:
+            return
+        hint = max(0, min(int(committed_hint), len(self.reference_norm)))
+        self._forced_center = hint
+        self._forced_window_back = int(window_back) if window_back is not None else max(self.window_back + 4, 12)
+        self._forced_window_ahead = int(window_ahead) if window_ahead is not None else max(self.window_ahead // 2, 24)
+        self._forced_budget = max(1, int(budget_events))
+        self._committed = min(self._committed, hint)
 
     def update(self, hypothesis_text: str) -> AlignmentResult:
         return self.align(hypothesis_text)
@@ -187,7 +212,6 @@ class IncrementalAligner:
         self._last_zone_anchor = zone_anchor
 
         advance = candidate - self._committed
-
         hard_commit = (
             not backward
             and advance >= 1
@@ -195,7 +219,6 @@ class IncrementalAligner:
             and local_match >= 0.62
             and self._same_candidate_repeat >= (self.stable_frames - 1)
         )
-
         weak_forward = (
             not backward
             and advance >= self.weak_commit_min_advance
@@ -237,12 +260,17 @@ class IncrementalAligner:
             repeated_candidate=repeated_candidate,
             weak_forward=weak_forward,
         )
-
         self._last_candidate = candidate
+
+        if self._forced_budget > 0:
+            self._forced_budget -= 1
+            if self._forced_budget <= 0:
+                self._forced_center = None
+                self._forced_window_back = None
+                self._forced_window_ahead = None
 
         if self.debug:
             self._print_debug(result)
-
         return result
 
     def _search_best_candidate(
@@ -252,8 +280,16 @@ class IncrementalAligner:
         ref = self.reference_norm
         committed = self._committed
 
-        start = max(0, committed - self.window_back)
-        end = min(len(ref), committed + self.window_ahead)
+        if self._forced_center is not None and self._forced_budget > 0:
+            center = max(committed, int(self._forced_center))
+            start = max(0, center - int(self._forced_window_back or self.window_back))
+            end = min(len(ref), center + int(self._forced_window_ahead or self.window_ahead))
+            forced_mode = True
+        else:
+            start = max(0, committed - self.window_back)
+            end = min(len(ref), committed + self.window_ahead)
+            center = committed
+            forced_mode = False
 
         best_candidate = committed
         best_matched = 0
@@ -269,7 +305,6 @@ class IncrementalAligner:
 
             ref_seg = ref[cand : cand + max_take]
             matched = _lcp_len(hyp, ref_seg)
-
             local_match = _char_overlap_ratio(
                 hyp[: min(12, len(hyp))],
                 ref_seg[: min(12, len(ref_seg))],
@@ -307,6 +342,13 @@ class IncrementalAligner:
                 score -= 2.5
                 conf = max(0.0, conf - 0.10)
 
+            if forced_mode:
+                dist_from_center = abs(cand - center)
+                score -= 0.08 * dist_from_center
+                if cand >= center - 2 and matched >= 2:
+                    score += 0.8
+                    conf = min(0.999, conf + 0.03)
+
             if score > best_score:
                 best_candidate = cand + matched
                 if matched <= 2 and not backward and local_match >= 0.84:
@@ -315,7 +357,7 @@ class IncrementalAligner:
                 best_score = score
                 best_conf = conf
                 best_local_match = local_match
-                best_mode = "backward" if backward else "normal"
+                best_mode = "forced_recenter" if forced_mode else ("backward" if backward else "normal")
 
         backward = best_candidate < committed
         if backward and best_conf <= 0.55:
@@ -339,18 +381,8 @@ class IncrementalAligner:
         extra = " soft_commit=True" if result.soft_committed else ""
         if result.weak_forward and not result.soft_committed:
             extra += " weak_forward=True"
-
         print(
-            f"{tag} committed={self._committed} "
-            f"candidate={result.candidate} "
-            f"score={result.score:.3f} "
-            f"conf={result.conf:.3f} "
-            f"stable={result.stable} "
-            f"backward={result.backward} "
-            f"matched_n={result.matched_n} "
-            f"hyp_n={result.hyp_n} "
-            f"mode={result.mode} "
-            f"window=({result.window[0]},{result.window[1]}) "
-            f"local_match={result.local_match:.3f}"
-            f"{extra}"
+            f"{tag} committed={result.committed} candidate={result.candidate} "
+            f"conf={result.conf:.3f} local={result.local_match:.3f} "
+            f"matched={result.matched_n}/{result.hyp_n} mode={result.mode}{extra}"
         )

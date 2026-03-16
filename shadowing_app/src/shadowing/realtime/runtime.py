@@ -29,7 +29,7 @@ class ShadowingRuntime:
                 self.orchestrator.tick()
                 time.sleep(self.config.tick_sleep_sec)
         except KeyboardInterrupt:
-            print("\nStopped by user.")
+            pass
         finally:
             self._running = False
             self.orchestrator.stop_session()

@@ -1,232 +1,173 @@
 from __future__ import annotations
 
-import time
+from pathlib import Path
+from typing import Any
 
+from shadowing.adaptation.profile_store import ProfileStore
+from shadowing.adaptation.runtime_auto_tuner import RuntimeAutoTuner
+from shadowing.audio.audio_behavior_classifier import AudioBehaviorClassifier
+from shadowing.audio.latency_calibrator import LatencyCalibrator
+from shadowing.audio.live_audio_matcher import LiveAudioMatcher
+from shadowing.audio.reference_audio_store import ReferenceAudioStore
+from shadowing.fusion.evidence_fuser import EvidenceFuser
+from shadowing.infrastructure.lesson_repo import FileLessonRepository
+from shadowing.observation.signal_quality import SignalQualityMonitor
+from shadowing.realtime.alignment.incremental_aligner import IncrementalAligner
+from shadowing.realtime.asr.fake_asr_provider import FakeASRProvider, FakeAsrConfig
+from shadowing.realtime.asr.sherpa_streaming_provider import SherpaStreamingProvider
 from shadowing.realtime.control.policy import ControlPolicy
-from shadowing.types import ControlAction, ControlDecision, PlaybackState
+from shadowing.realtime.control.state_machine_controller import StateMachineController
+from shadowing.realtime.orchestrator import ShadowingOrchestrator
+from shadowing.realtime.playback.sounddevice_player import PlaybackConfig, SoundDevicePlayer
+from shadowing.realtime.runtime import RealtimeRuntimeConfig, ShadowingRuntime
+from shadowing.telemetry.event_logger import EventLogger
 
 
-class StateMachineController:
-    def __init__(
-        self,
-        *,
-        policy: ControlPolicy,
-        disable_seek: bool = False,
-        debug: bool = False,
-    ) -> None:
-        self.policy = policy
-        self.disable_seek = bool(disable_seek)
-        self.debug = bool(debug)
+def build_runtime(config: dict[str, Any]) -> ShadowingRuntime:
+    lesson_base_dir = str(config.get("lesson_base_dir", "assets/lessons"))
+    playback_cfg = dict(config.get("playback", {}))
+    capture_cfg = dict(config.get("capture", {}))
+    asr_cfg = dict(config.get("asr", {}))
+    alignment_cfg = dict(config.get("alignment", {}))
+    control_cfg = dict(config.get("control", {}))
+    runtime_cfg = dict(config.get("runtime", {}))
+    signal_cfg = dict(config.get("signal", {}))
+    adaptation_cfg = dict(config.get("adaptation", {}))
+    session_cfg = dict(config.get("session", {}))
+    device_context = dict(config.get("device_context", {}))
+    debug_cfg = dict(config.get("debug", {}))
+    audio_match_cfg = dict(config.get("audio_match", {}))
 
-        self._started_at = time.monotonic()
-        self._last_resume_at = self._started_at
-        self._last_hold_at = 0.0
-        self._last_seek_at = 0.0
-        self._last_voice_like_at = self._started_at
-        self._last_progress_at = self._started_at
-        self._last_effective_idx = 0
+    session_dir = str(session_cfg.get("session_dir", "runtime/latest_session"))
+    event_logging = bool(session_cfg.get("event_logging", False))
+    debug_enabled = bool(debug_cfg.get("enabled", False))
+    repo = FileLessonRepository(lesson_base_dir)
 
-    def reset(self) -> None:
-        now = time.monotonic()
-        self._started_at = now
-        self._last_resume_at = now
-        self._last_hold_at = 0.0
-        self._last_seek_at = 0.0
-        self._last_voice_like_at = now
-        self._last_progress_at = now
-        self._last_effective_idx = 0
-
-    def decide(self, playback, progress, signal_quality) -> ControlDecision:
-        now = time.monotonic()
-
-        if progress is None:
-            return ControlDecision(
-                action=ControlAction.NOOP,
-                reason="no_progress",
-                target_gain=self._gain_for_state(playback.state, following=False),
-                confidence=0.0,
-            )
-
-        effective_idx = int(getattr(progress, "estimated_ref_idx", 0))
-        tracking_quality = float(getattr(progress, "tracking_quality", 0.0))
-        confidence = float(getattr(progress, "confidence", 0.0))
-        active_speaking = bool(getattr(progress, "active_speaking", False))
-        recently_progressed = bool(getattr(progress, "recently_progressed", False))
-        progress_age_sec = float(getattr(progress, "progress_age_sec", 9999.0))
-        estimated_ref_time_sec = float(getattr(progress, "estimated_ref_time_sec", 0.0))
-        tracking_mode = getattr(progress, "tracking_mode", None)
-
-        if active_speaking or recently_progressed:
-            self._last_voice_like_at = now
-
-        if effective_idx > self._last_effective_idx:
-            self._last_progress_at = now
-            self._last_effective_idx = effective_idx
-
-        in_startup_grace = (now - self._started_at) < self.policy.startup_grace_sec
-        in_resume_cooldown = (now - self._last_resume_at) < 0.25
-        in_seek_cooldown = (now - self._last_seek_at) < self.policy.seek_cooldown_sec
-
-        speaking_recent = (now - self._last_voice_like_at) <= self.policy.speaking_recent_sec
-        progress_stale = progress_age_sec >= self.policy.progress_stale_sec
-
-        playback_ref = float(playback.t_ref_heard_content_sec)
-        user_ref = float(estimated_ref_time_sec)
-        lead_sec = playback_ref - user_ref
-
-        weak_resume_ok = bool(
-            active_speaking
-            and tracking_quality >= self.policy.tracking_quality_hold_min
-            and confidence >= max(0.62, self.policy.min_confidence - 0.12)
-            and speaking_recent
+    player = SoundDevicePlayer(
+        PlaybackConfig(
+            sample_rate=int(playback_cfg.get("sample_rate", 44100)),
+            channels=int(playback_cfg.get("channels", 1)),
+            device=playback_cfg.get("device"),
+            latency=playback_cfg.get("latency", "low"),
+            blocksize=int(playback_cfg.get("blocksize", 0)),
+            bluetooth_output_offset_sec=float(playback_cfg.get("bluetooth_output_offset_sec", 0.0)),
         )
+    )
 
-        strong_resume_ok = bool(
-            (recently_progressed or active_speaking)
-            and tracking_quality >= self.policy.tracking_quality_hold_min
-            and confidence >= self.policy.min_confidence
+    capture_backend = str(capture_cfg.get("backend", "sounddevice")).strip().lower()
+    if capture_backend == "soundcard":
+        from shadowing.realtime.capture.soundcard_recorder import SoundCardRecorder
+        recorder = SoundCardRecorder(
+            sample_rate_in=int(capture_cfg.get("device_sample_rate", 48000)),
+            target_sample_rate=int(capture_cfg.get("target_sample_rate", 16000)),
+            channels=int(capture_cfg.get("channels", 1)),
+            device=capture_cfg.get("device"),
+            block_frames=int(capture_cfg.get("blocksize", 1440) or 1440),
         )
-
-        following = strong_resume_ok or weak_resume_ok
-
-        if (
-            not in_startup_grace
-            and not speaking_recent
-            and playback.state == PlaybackState.PLAYING
-            and progress_stale
-        ):
-            return self._hold(
-                reason="silence_hold",
-                lead_sec=lead_sec,
-                gain=self.policy.gain_soft_duck,
-                confidence=confidence,
-            )
-
-        if (
-            not in_startup_grace
-            and playback.state == PlaybackState.PLAYING
-            and progress_stale
-            and tracking_quality < self.policy.tracking_quality_hold_min
-        ):
-            return self._hold(
-                reason="progress_stale",
-                lead_sec=lead_sec,
-                gain=self.policy.gain_soft_duck,
-                confidence=confidence,
-            )
-
-        if playback.state == PlaybackState.PLAYING and lead_sec >= self.policy.hold_if_lead_sec:
-            return self._hold(
-                reason="reference_too_far_ahead",
-                lead_sec=lead_sec,
-                gain=self.policy.gain_soft_duck,
-                confidence=confidence,
-            )
-
-        if (
-            not self.disable_seek
-            and playback.state in (PlaybackState.PLAYING, PlaybackState.HOLDING)
-            and lead_sec <= self.policy.seek_if_lag_sec
-            and tracking_quality >= self.policy.tracking_quality_seek_min
-            and confidence >= max(0.66, self.policy.min_confidence - 0.06)
-            and not in_seek_cooldown
-        ):
-            self._last_seek_at = now
-            target_time_sec = max(0.0, user_ref - self.policy.target_lead_sec)
-            action = ControlAction.SEEK
-            reason = "seek_to_user_progress"
-            if self.debug:
-                print(
-                    "[CTRL] "
-                    f"action=seek reason={reason} lead_sec={lead_sec:.3f} "
-                    f"target_time_sec={target_time_sec:.3f} tq={tracking_quality:.3f} conf={confidence:.3f}"
-                )
-            return ControlDecision(
-                action=action,
-                reason=reason,
-                target_time_sec=target_time_sec,
-                lead_sec=lead_sec,
-                target_gain=self.policy.gain_transition,
-                confidence=confidence,
-                aggressiveness="medium",
-            )
-
-        if playback.state == PlaybackState.HOLDING:
-            if strong_resume_ok and lead_sec <= (self.policy.resume_if_lead_sec + self.policy.resume_from_hold_speaking_lead_slack_sec) and not in_resume_cooldown:
-                self._last_resume_at = now
-                if self.debug:
-                    print(
-                        "[CTRL] "
-                        f"action=resume reason=strong_resume lead_sec={lead_sec:.3f} "
-                        f"tq={tracking_quality:.3f} conf={confidence:.3f}"
-                    )
-                return ControlDecision(
-                    action=ControlAction.RESUME,
-                    reason="resume_strong_progress",
-                    lead_sec=lead_sec,
-                    target_gain=self.policy.gain_following,
-                    confidence=confidence,
-                    aggressiveness="medium",
-                )
-
-            if weak_resume_ok and lead_sec <= (self.policy.resume_if_lead_sec + self.policy.resume_from_hold_speaking_lead_slack_sec) and not in_resume_cooldown:
-                self._last_resume_at = now
-                if self.debug:
-                    mode_value = tracking_mode.value if tracking_mode is not None else "unknown"
-                    print(
-                        "[CTRL] "
-                        f"action=resume reason=weak_resume lead_sec={lead_sec:.3f} "
-                        f"mode={mode_value} tq={tracking_quality:.3f} conf={confidence:.3f}"
-                    )
-                return ControlDecision(
-                    action=ControlAction.RESUME,
-                    reason="resume_weak_progress",
-                    lead_sec=lead_sec,
-                    target_gain=self.policy.gain_following,
-                    confidence=confidence,
-                    aggressiveness="low",
-                )
-
-        gain = self._gain_for_state(playback.state, following=following)
-
-        if tracking_mode is not None and tracking_mode.value == "reacquiring" and playback.state == PlaybackState.PLAYING:
-            return ControlDecision(
-                action=ControlAction.SOFT_DUCK,
-                reason="reacquiring_soft_duck",
-                lead_sec=lead_sec,
-                target_gain=self.policy.gain_soft_duck,
-                confidence=confidence,
-                aggressiveness="low",
-            )
-
-        return ControlDecision(
-            action=ControlAction.NOOP,
-            reason="no_state_change",
-            lead_sec=lead_sec,
-            target_gain=gain,
-            confidence=confidence,
-            aggressiveness="low",
+    elif capture_backend == "sounddevice":
+        from shadowing.realtime.capture.sounddevice_recorder import SoundDeviceRecorder
+        recorder = SoundDeviceRecorder(
+            sample_rate_in=int(capture_cfg.get("device_sample_rate", 48000)),
+            target_sample_rate=int(capture_cfg.get("target_sample_rate", 16000)),
+            channels=int(capture_cfg.get("channels", 1)),
+            device=capture_cfg.get("device"),
+            dtype=str(capture_cfg.get("dtype", "float32")),
+            blocksize=int(capture_cfg.get("blocksize", 0)),
+            latency=capture_cfg.get("latency", "low"),
         )
+    else:
+        raise ValueError(f"Unsupported capture backend: {capture_backend!r}")
 
-    def _hold(self, *, reason: str, lead_sec: float, gain: float, confidence: float) -> ControlDecision:
-        self._last_hold_at = time.monotonic()
-        if self.debug:
-            print(
-                "[CTRL] "
-                f"action=hold reason={reason} lead_sec={lead_sec:.3f} confidence={confidence:.3f}"
-            )
-        return ControlDecision(
-            action=ControlAction.HOLD,
-            reason=reason,
-            lead_sec=lead_sec,
-            target_gain=gain,
-            confidence=confidence,
-            aggressiveness="medium",
+    asr_mode = str(asr_cfg.get("mode", "sherpa")).strip().lower()
+    if asr_mode == "fake":
+        asr = FakeASRProvider(FakeAsrConfig())
+    elif asr_mode == "sherpa":
+        asr = SherpaStreamingProvider(
+            model_config=asr_cfg,
+            hotwords=str(asr_cfg.get("hotwords", "")),
+            sample_rate=int(asr_cfg.get("sample_rate", 16000)),
+            emit_partial_interval_sec=float(asr_cfg.get("emit_partial_interval_sec", 0.08)),
+            enable_endpoint=bool(asr_cfg.get("enable_endpoint", True)),
+            debug_feed=bool(asr_cfg.get("debug_feed", False)),
+            debug_feed_every_n_chunks=int(asr_cfg.get("debug_feed_every_n_chunks", 20)),
         )
+    else:
+        raise ValueError(f"Unsupported ASR mode: {asr_mode!r}")
 
-    def _gain_for_state(self, state, *, following: bool) -> float:
-        if state == PlaybackState.HOLDING:
-            return self.policy.gain_soft_duck
-        if following:
-            return self.policy.gain_following
-        return self.policy.gain_transition
+    aligner = IncrementalAligner(
+        window_back=int(alignment_cfg.get("window_back", 8)),
+        window_ahead=int(alignment_cfg.get("window_ahead", 40)),
+        stable_frames=int(alignment_cfg.get("stable_frames", 2)),
+        min_confidence=float(alignment_cfg.get("min_confidence", 0.60)),
+        backward_lock_frames=int(alignment_cfg.get("backward_lock_frames", 3)),
+        clause_boundary_bonus=float(alignment_cfg.get("clause_boundary_bonus", 0.15)),
+        cross_clause_backward_extra_penalty=float(alignment_cfg.get("cross_clause_backward_extra_penalty", 0.20)),
+        debug=bool(alignment_cfg.get("debug", False)),
+        max_hyp_tokens=int(alignment_cfg.get("max_hyp_tokens", 16)),
+        weak_commit_min_conf=float(alignment_cfg.get("weak_commit_min_conf", 0.82)),
+        weak_commit_min_local_match=float(alignment_cfg.get("weak_commit_min_local_match", 0.80)),
+        weak_commit_min_advance=int(alignment_cfg.get("weak_commit_min_advance", 3)),
+    )
+    policy = ControlPolicy(**control_cfg)
+    controller = StateMachineController(
+        policy=policy,
+        disable_seek=bool(control_cfg.get("disable_seek", False)),
+        debug=debug_enabled,
+    )
+    signal_monitor = SignalQualityMonitor(
+        min_vad_rms=float(signal_cfg.get("min_vad_rms", 0.006)),
+        vad_noise_multiplier=float(signal_cfg.get("vad_noise_multiplier", 2.8)),
+    )
+    latency_calibrator = LatencyCalibrator()
+    auto_tuner = RuntimeAutoTuner()
+
+    profile_path = str(adaptation_cfg.get("profile_path", "runtime/device_profiles.json"))
+    profile_store = ProfileStore(profile_path)
+    event_logger = EventLogger(session_dir=session_dir, enabled=event_logging)
+
+    reference_audio_store = ReferenceAudioStore(lesson_base_dir)
+    live_audio_matcher = LiveAudioMatcher(
+        search_window_sec=float(audio_match_cfg.get("search_window_sec", 3.0)),
+        match_window_sec=float(audio_match_cfg.get("match_window_sec", 1.8)),
+        update_interval_sec=float(audio_match_cfg.get("update_interval_sec", 0.12)),
+        min_frames_for_match=int(audio_match_cfg.get("min_frames_for_match", 20)),
+        ring_buffer_sec=float(audio_match_cfg.get("ring_buffer_sec", 6.0)),
+    )
+    audio_behavior_classifier = AudioBehaviorClassifier()
+    evidence_fuser = EvidenceFuser(
+        text_priority_threshold=float(audio_match_cfg.get("text_priority_threshold", 0.72)),
+        audio_takeover_threshold=float(audio_match_cfg.get("audio_takeover_threshold", 0.62)),
+    )
+
+    enriched_device_context = dict(device_context)
+    enriched_device_context["capture_backend"] = capture_backend
+    enriched_device_context["session_dir"] = str(Path(session_dir).expanduser().resolve())
+
+    orchestrator = ShadowingOrchestrator(
+        repo=repo,
+        player=player,
+        recorder=recorder,
+        asr=asr,
+        aligner=aligner,
+        controller=controller,
+        device_context=enriched_device_context,
+        signal_monitor=signal_monitor,
+        latency_calibrator=latency_calibrator,
+        auto_tuner=auto_tuner,
+        profile_store=profile_store,
+        event_logger=event_logger,
+        reference_audio_store=reference_audio_store,
+        live_audio_matcher=live_audio_matcher,
+        audio_behavior_classifier=audio_behavior_classifier,
+        evidence_fuser=evidence_fuser,
+        audio_queue_maxsize=int(runtime_cfg.get("audio_queue_maxsize", 150)),
+        loop_interval_sec=float(runtime_cfg.get("loop_interval_sec", 0.03)),
+        debug=debug_enabled,
+    )
+    runtime = ShadowingRuntime(
+        orchestrator=orchestrator,
+        config=RealtimeRuntimeConfig(
+            tick_sleep_sec=float(runtime_cfg.get("loop_interval_sec", 0.03))
+        ),
+    )
+    return runtime

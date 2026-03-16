@@ -1,55 +1,39 @@
 from __future__ import annotations
-
-from shadowing.tracking.anchor_manager import AnchorManager
-from shadowing.types import TrackingMode, TrackingSnapshot
+from shadowing.types import ReferenceMap, TrackingMode, TrackingSnapshot
 
 
 class Reacquirer:
-    def __init__(
-        self,
-        max_reanchor_distance: int = 18,
-        min_quality_for_reanchor: float = 0.66,
-    ) -> None:
-        self.max_reanchor_distance = int(max_reanchor_distance)
-        self.min_quality_for_reanchor = float(min_quality_for_reanchor)
+    def __init__(self, max_anchor_jump: int = 24, min_anchor_score: float = 0.52) -> None:
+        self.max_anchor_jump = int(max_anchor_jump)
+        self.min_anchor_score = float(min_anchor_score)
 
-    def maybe_reanchor(
-        self,
-        snapshot: TrackingSnapshot,
-        anchor_manager: AnchorManager,
-    ) -> TrackingSnapshot:
-        if snapshot.tracking_mode not in (TrackingMode.REACQUIRING, TrackingMode.LOST):
-            return snapshot
-
-        strong = anchor_manager.strong_anchor()
-        weak = anchor_manager.weak_anchor()
-        anchor = strong if strong is not None else weak
+    def maybe_reanchor(self, *, snapshot: TrackingSnapshot, anchor_manager, ref_map: ReferenceMap) -> TrackingSnapshot:
+        _ = ref_map
+        anchor = anchor_manager.strong_anchor() or anchor_manager.weak_anchor()
         if anchor is None:
             return snapshot
-
-        if snapshot.tracking_quality.overall_score < self.min_quality_for_reanchor:
+        if snapshot.tracking_mode not in (TrackingMode.REACQUIRING, TrackingMode.LOST):
             return snapshot
-
-        if abs(snapshot.candidate_ref_idx - anchor.ref_idx) > self.max_reanchor_distance:
+        if snapshot.tracking_quality.anchor_score < self.min_anchor_score:
             return snapshot
-
-        repaired_mode = TrackingMode.WEAK_LOCKED
-        repaired_quality = snapshot.tracking_quality
-        repaired_quality.mode = repaired_mode
-        repaired_quality.is_reliable = repaired_quality.overall_score >= 0.60
-
+        anchor_idx = int(anchor.ref_idx)
+        cur_idx = int(snapshot.candidate_ref_idx)
+        if abs(cur_idx - anchor_idx) > self.max_anchor_jump:
+            return snapshot
+        if snapshot.anchor_consistency < self.min_anchor_score:
+            return snapshot
         return TrackingSnapshot(
-            candidate_ref_idx=int(snapshot.candidate_ref_idx),
-            committed_ref_idx=max(int(snapshot.committed_ref_idx), int(anchor.ref_idx)),
+            candidate_ref_idx=max(cur_idx, anchor_idx),
+            committed_ref_idx=max(int(snapshot.committed_ref_idx), anchor_idx),
             candidate_ref_time_sec=float(snapshot.candidate_ref_time_sec),
-            confidence=float(snapshot.confidence),
+            confidence=float(max(snapshot.confidence, min(0.88, anchor.quality_score))),
             stable=bool(snapshot.stable),
             local_match_ratio=float(snapshot.local_match_ratio),
             repeat_penalty=float(snapshot.repeat_penalty),
             monotonic_consistency=float(snapshot.monotonic_consistency),
-            anchor_consistency=float(snapshot.anchor_consistency),
+            anchor_consistency=float(max(snapshot.anchor_consistency, 0.72)),
             emitted_at_sec=float(snapshot.emitted_at_sec),
-            tracking_mode=repaired_mode,
-            tracking_quality=repaired_quality,
+            tracking_mode=TrackingMode.REACQUIRING,
+            tracking_quality=snapshot.tracking_quality,
             matched_text=snapshot.matched_text,
         )

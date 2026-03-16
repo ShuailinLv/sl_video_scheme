@@ -9,7 +9,7 @@ import tokenize
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Set, Tuple, Optional
+from typing import List, Set, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,7 +83,6 @@ def strip_python_comments(source: str) -> Tuple[str, int]:
         tokens = tokenize.generate_tokens(io.StringIO(source).readline)
         for tok in tokens:
             tok_type = tok.type
-            tok_str = tok.string
 
             if tok_type == tokenize.COMMENT:
                 removed += 1
@@ -258,11 +257,22 @@ def main():
         "docs", "site-packages", "assets",
         "gpt-related-ci", "gpt-related-scheme",
         "sherpa-onnx-streaming-zipformer-en-20m-2023-02-17",
-        "sherpa-onnx-streaming-zipformer-zh-14m",
+        "sherpa-onnx-streaming-zipformer-zh-14m", '.ruff_cache'
     }
 
     hard_exclude_files = {
-        "project_snapshot.md", ".ds_store", "create_snapshot.py", "clean_code.py"
+        "project_snapshot.md", ".ds_store", "create_snapshot.py", "clean_code.py",
+        "ab_compare_sessions.py",
+        "batch_session_report.py",
+        "list_playback_devices.py",
+        "preprocess_lesson.py",
+        "replay_session.py"
+        "test_open_input_devices.py",
+        "test_soundcard_mic.py",
+        "test_sounddevice_input_level.py",
+        "list_recording_devices.py",
+        "replay_session",
+        'shadowing_app/tools/test_open_input_devices.py'
     }
 
     hard_exclude_suffixes = {
@@ -271,7 +281,7 @@ def main():
         ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".bmp", ".tif",
         ".zip", ".rar", ".7z", ".gz", ".tar", ".bz2",
         ".pdf", ".doc", ".docx", ".xls", ".ppt", ".pptx",
-        ".db", ".sqlite", ".sqlite3", ".exe", ".dll", ".so", ".a", ".lib", ".o",
+        ".db", ".sqlite", ".sqlite3", ".exe", ".dll", ".so", ".a", ".lib", ".o", ".ruff",
         ".ttf", ".woff", ".woff2", ".eot", ".dat", ".cache", ".img", ".iso", ".md", ".txt", ".json"
     }
 

@@ -1,22 +1,28 @@
+from __future__ import annotations
+
 import time
+
 import numpy as np
 import pythoncom
 import soundcard as sc
 
 
-def main():
+def main() -> None:
     pythoncom.CoInitialize()
     try:
         mics = list(sc.all_microphones(include_loopback=False))
+        if not mics:
+            raise RuntimeError("No microphones found via soundcard.")
+
         print("available microphones:")
         for i, mic in enumerate(mics):
             print(f"  [{i}] {mic.name!r}")
 
         mic = mics[0]
-        print(f"\\nusing: {mic.name!r}")
+        print(f"\nusing: {mic.name!r}")
+        print("start recording... speak now")
 
         with mic.recorder(samplerate=48000, channels=1) as rec:
-            print("start recording... speak now")
             for i in range(20):
                 data = rec.record(numframes=1024)
                 audio = np.asarray(data, dtype=np.float32).reshape(-1)

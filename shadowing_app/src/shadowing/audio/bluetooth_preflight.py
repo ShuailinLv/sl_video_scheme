@@ -120,12 +120,23 @@ def _device_family_key(name: str | None) -> str:
         if token in normalized:
             return token
 
-    return normalized
+    return " ".join(normalized.split())
 
 
 def _resolve_hostapi_name(dev: dict) -> str:
     hostapis = sd.query_hostapis()
     return str(hostapis[int(dev["hostapi"])]["name"])
+
+
+def _build_resolved_device(idx: int, dev: dict) -> ResolvedDevice:
+    return ResolvedDevice(
+        index=int(idx),
+        name=str(dev["name"]),
+        max_input_channels=int(dev["max_input_channels"]),
+        max_output_channels=int(dev["max_output_channels"]),
+        default_samplerate=float(dev["default_samplerate"]),
+        hostapi_name=_resolve_hostapi_name(dev),
+    )
 
 
 def _resolve_input_device(device: int | str | None) -> ResolvedDevice:
@@ -135,14 +146,7 @@ def _resolve_input_device(device: int | str | None) -> ResolvedDevice:
         dev = sd.query_devices(device)
         if int(dev["max_input_channels"]) <= 0:
             raise RuntimeError(f"Resolved input device is not an input device: idx={device}, name={dev['name']}")
-        return ResolvedDevice(
-            index=int(device),
-            name=str(dev["name"]),
-            max_input_channels=int(dev["max_input_channels"]),
-            max_output_channels=int(dev["max_output_channels"]),
-            default_samplerate=float(dev["default_samplerate"]),
-            hostapi_name=_resolve_hostapi_name(dev),
-        )
+        return _build_resolved_device(int(device), dev)
 
     if device is None:
         default_in, _ = sd.default.device
@@ -151,28 +155,14 @@ def _resolve_input_device(device: int | str | None) -> ResolvedDevice:
         dev = sd.query_devices(int(default_in))
         if int(dev["max_input_channels"]) <= 0:
             raise RuntimeError(f"Default input device is invalid: idx={default_in}, name={dev['name']}")
-        return ResolvedDevice(
-            index=int(default_in),
-            name=str(dev["name"]),
-            max_input_channels=int(dev["max_input_channels"]),
-            max_output_channels=int(dev["max_output_channels"]),
-            default_samplerate=float(dev["default_samplerate"]),
-            hostapi_name=_resolve_hostapi_name(dev),
-        )
+        return _build_resolved_device(int(default_in), dev)
 
     target = str(device).strip().lower()
     for idx, dev in enumerate(devices):
         if int(dev["max_input_channels"]) <= 0:
             continue
         if target in str(dev["name"]).lower():
-            return ResolvedDevice(
-                index=int(idx),
-                name=str(dev["name"]),
-                max_input_channels=int(dev["max_input_channels"]),
-                max_output_channels=int(dev["max_output_channels"]),
-                default_samplerate=float(dev["default_samplerate"]),
-                hostapi_name=_resolve_hostapi_name(dev),
-            )
+            return _build_resolved_device(int(idx), dev)
 
     raise RuntimeError(f"No matching input device found for bluetooth preflight: {device!r}")
 
@@ -184,14 +174,7 @@ def _resolve_output_device(device: int | str | None) -> ResolvedDevice:
         dev = sd.query_devices(device)
         if int(dev["max_output_channels"]) <= 0:
             raise RuntimeError(f"Resolved output device is not an output device: idx={device}, name={dev['name']}")
-        return ResolvedDevice(
-            index=int(device),
-            name=str(dev["name"]),
-            max_input_channels=int(dev["max_input_channels"]),
-            max_output_channels=int(dev["max_output_channels"]),
-            default_samplerate=float(dev["default_samplerate"]),
-            hostapi_name=_resolve_hostapi_name(dev),
-        )
+        return _build_resolved_device(int(device), dev)
 
     if device is None:
         _, default_out = sd.default.device
@@ -200,28 +183,14 @@ def _resolve_output_device(device: int | str | None) -> ResolvedDevice:
         dev = sd.query_devices(int(default_out))
         if int(dev["max_output_channels"]) <= 0:
             raise RuntimeError(f"Default output device is invalid: idx={default_out}, name={dev['name']}")
-        return ResolvedDevice(
-            index=int(default_out),
-            name=str(dev["name"]),
-            max_input_channels=int(dev["max_input_channels"]),
-            max_output_channels=int(dev["max_output_channels"]),
-            default_samplerate=float(dev["default_samplerate"]),
-            hostapi_name=_resolve_hostapi_name(dev),
-        )
+        return _build_resolved_device(int(default_out), dev)
 
     target = str(device).strip().lower()
     for idx, dev in enumerate(devices):
         if int(dev["max_output_channels"]) <= 0:
             continue
         if target in str(dev["name"]).lower():
-            return ResolvedDevice(
-                index=int(idx),
-                name=str(dev["name"]),
-                max_input_channels=int(dev["max_input_channels"]),
-                max_output_channels=int(dev["max_output_channels"]),
-                default_samplerate=float(dev["default_samplerate"]),
-                hostapi_name=_resolve_hostapi_name(dev),
-            )
+            return _build_resolved_device(int(idx), dev)
 
     raise RuntimeError(f"No matching output device found for bluetooth preflight: {device!r}")
 
@@ -235,7 +204,15 @@ def should_run_bluetooth_preflight(input_device: int | str | None, output_device
 
     input_is_bt = _looks_like_bluetooth(input_resolved.name)
     output_is_bt = _looks_like_bluetooth(output_resolved.name)
-    return bool(input_is_bt and output_is_bt)
+    if not (input_is_bt and output_is_bt):
+        return False
+
+    input_family = _device_family_key(input_resolved.name)
+    output_family = _device_family_key(output_resolved.name)
+    if input_family and output_family and input_family != output_family:
+        return False
+
+    return True
 
 
 def _pick_duplex_samplerate(
@@ -295,6 +272,13 @@ def _safe_max(values: list[float]) -> float:
 
 
 def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> BluetoothPreflightResult:
+    if not should_run_bluetooth_preflight(config.input_device, config.output_device):
+        return BluetoothPreflightResult(
+            should_run=False,
+            passed=True,
+            notes=["当前不是同一蓝牙耳机的双工会话，跳过蓝牙双工预检。"],
+        )
+
     input_dev = _resolve_input_device(config.input_device)
     output_dev = _resolve_output_device(config.output_device)
 
@@ -338,7 +322,8 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
         elapsed = now - started_at
 
         if status:
-            status_events += 1
+            with lock:
+                status_events += 1
 
         audio = np.asarray(indata, dtype=np.float32).reshape(-1)
         rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
@@ -361,6 +346,8 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
         t = (np.arange(frames, dtype=np.float32) + tone_phase) / float(samplerate)
         tone = config.probe_tone_amp * np.sin(2.0 * np.pi * config.probe_tone_hz * t).astype(np.float32, copy=False)
         tone_phase += frames
+
+        outdata.fill(0.0)
         outdata[:, 0] = tone
 
         if elapsed >= config.duration_sec:
@@ -381,7 +368,11 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
                 "[BT-PREFLIGHT] 已进入蓝牙耳机双工预检。"
                 "请在接下来 4 秒内持续说话，同时确认耳机中能听到轻微提示音。"
             )
-            done.wait(timeout=max(1.0, config.duration_sec + 1.5))
+            finished = done.wait(timeout=max(1.0, float(config.duration_sec) + 1.5))
+            if not finished:
+                result.failure_reason = "bluetooth_duplex_preflight_timeout"
+                result.notes.append("蓝牙双工预检超时，音频回调可能未按预期工作。")
+                return result
     except Exception as e:
         result.failure_reason = (
             "bluetooth_duplex_open_failed: "
@@ -389,23 +380,23 @@ def run_bluetooth_duplex_preflight(config: BluetoothPreflightConfig) -> Bluetoot
         )
         return result
 
-    result.mean_rms = _safe_mean(rms_values)
-    result.max_peak = _safe_max(peak_values)
-    result.nonzero_ratio = _safe_mean(nonzero_ratios)
-    result.voiced_frame_ratio = _safe_mean(voiced_flags)
+    with lock:
+        result.mean_rms = _safe_mean(rms_values)
+        result.max_peak = _safe_max(peak_values)
+        result.nonzero_ratio = _safe_mean(nonzero_ratios)
+        result.voiced_frame_ratio = _safe_mean(voiced_flags)
 
-    result.tail_mean_rms = _safe_mean(tail_rms_values)
-    result.tail_max_peak = _safe_max(tail_peak_values)
-    result.tail_nonzero_ratio = _safe_mean(tail_nonzero_ratios)
-    result.tail_voiced_frame_ratio = _safe_mean(tail_voiced_flags)
-
-    result.status_events = int(status_events)
+        result.tail_mean_rms = _safe_mean(tail_rms_values)
+        result.tail_max_peak = _safe_max(tail_peak_values)
+        result.tail_nonzero_ratio = _safe_mean(tail_nonzero_ratios)
+        result.tail_voiced_frame_ratio = _safe_mean(tail_voiced_flags)
+        result.status_events = int(status_events)
 
     failure_reasons: list[str] = []
 
-    if status_events > config.max_status_events:
+    if result.status_events > config.max_status_events:
         failure_reasons.append(
-            f"status_events_too_many({status_events}>{config.max_status_events})"
+            f"status_events_too_many({result.status_events}>{config.max_status_events})"
         )
 
     strong_pass = (

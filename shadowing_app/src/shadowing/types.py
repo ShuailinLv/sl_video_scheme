@@ -1,11 +1,11 @@
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
-
+import re
 import numpy as np
 from numpy.typing import NDArray
+from pypinyin import Style, lazy_pinyin
 
 
 class PlaybackState(str, Enum):
@@ -237,6 +237,10 @@ class ProgressEstimate:
     active_speaking: bool
     recently_progressed: bool
     user_state: UserReadState
+    audio_confidence: float = 0.0
+    joint_confidence: float = 0.0
+    position_source: str = "text"
+    audio_support_strength: float = 0.0
 
 
 @dataclass(slots=True)
@@ -272,3 +276,78 @@ class LatencyCalibrationSnapshot:
     estimated_output_latency_ms: float
     confidence: float
     calibrated: bool
+
+
+@dataclass(slots=True)
+class AudioMatchSnapshot:
+    estimated_ref_time_sec: float
+    estimated_ref_idx_hint: int
+    confidence: float
+    local_similarity: float
+    envelope_alignment_score: float
+    onset_alignment_score: float
+    band_alignment_score: float
+    rhythm_consistency_score: float
+    repeated_pattern_score: float
+    drift_sec: float
+    mode: str
+    emitted_at_sec: float
+    dtw_cost: float = 0.0
+    dtw_path_score: float = 0.0
+    dtw_coverage: float = 0.0
+    coarse_candidate_rank: int = 0
+    time_offset_sec: float = 0.0
+
+
+@dataclass(slots=True)
+class AudioBehaviorSnapshot:
+    still_following_likelihood: float
+    repeated_likelihood: float
+    reentry_likelihood: float
+    paused_likelihood: float
+    confidence: float
+    emitted_at_sec: float
+
+
+@dataclass(slots=True)
+class FusionEvidence:
+    estimated_ref_time_sec: float
+    estimated_ref_idx_hint: int
+    text_confidence: float
+    audio_confidence: float
+    fused_confidence: float
+    still_following_likelihood: float
+    repeated_likelihood: float
+    reentry_likelihood: float
+    should_prevent_hold: bool
+    should_prevent_seek: bool
+    should_widen_reacquire_window: bool
+    should_recenter_aligner_window: bool
+    emitted_at_sec: float
+
+
+def _normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.strip().lower()
+    text = re.sub(r"[，。！？；：、“”‘’\"'（）()\[\]【】<>\-—…,.!?;:/\\|`~@#$%^&*_+=\s]+", "", text)
+    return text
+
+
+@dataclass(slots=True)
+class Wording:
+    raw_text: str = ""
+    normalized_text: str = ""
+    pinyins: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_text(cls, text: str) -> "Wording":
+        normalized_text = _normalize_text(text)
+        pinyins = lazy_pinyin(normalized_text, style=Style.TONE3)
+        return cls(raw_text=text, normalized_text=normalized_text, pinyins=pinyins)
+
+    def __len__(self) -> int:
+        return len(self.pinyins)
+
+    def __getitem__(self, key: int | slice) -> list[str]:
+        return self.pinyins[key]
