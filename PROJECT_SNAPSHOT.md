@@ -80,6 +80,12 @@ class ProfileStore:
         playback = dict(entry.get("recommended_playback", {}))
         signal = dict(entry.get("recommended_signal", {}))
         latency = dict(entry.get("recommended_latency", {}))
+        stable_target_lead_sec = float(entry.get("stable_target_lead_sec", 0.0) or 0.0)
+        startup_target_lead_sec = float(entry.get("startup_target_lead_sec", 0.0) or 0.0)
+        if stable_target_lead_sec > 0.0:
+            latency["stable_target_lead_sec"] = stable_target_lead_sec
+        if startup_target_lead_sec > 0.0:
+            latency["startup_target_lead_sec"] = startup_target_lead_sec
         return {
             "control": control,
             "playback": playback,
@@ -179,6 +185,18 @@ class ProfileStore:
         )
         runtime_output_drift_ms = float(lc.get("runtime_output_drift_ms", prev.get("runtime_output_drift_ms", 0.0)))
         runtime_input_drift_ms = float(lc.get("runtime_input_drift_ms", prev.get("runtime_input_drift_ms", 0.0)))
+        stable_target_lead_sec = float(
+            lc.get(
+                "stable_target_lead_sec",
+                prev.get("stable_target_lead_sec", 0.35 if bluetooth_mode else 0.15),
+            )
+        )
+        startup_target_lead_sec = float(
+            lc.get(
+                "startup_target_lead_sec",
+                prev.get("startup_target_lead_sec", 0.28 if bluetooth_mode else 0.15),
+            )
+        )
         recommended_control = self._derive_recommended_control(
             avg_first_reliable_progress_time_sec=avg_first_reliable,
             avg_startup_false_hold_count=avg_startup_false_hold,
@@ -192,7 +210,10 @@ class ProfileStore:
             bluetooth_mode=bool(bluetooth_mode),
         )
         recommended_playback = {
-            "bluetooth_output_offset_sec": max(0.0, (estimated_output_latency_ms + runtime_output_drift_ms) / 1000.0)
+            "bluetooth_output_offset_sec": max(
+                0.0,
+                (estimated_output_latency_ms + runtime_output_drift_ms) / 1000.0,
+            )
         }
         recommended_signal = self._derive_recommended_signal(
             reliability_tier=str(device_profile.get("reliability_tier", "medium")),
@@ -205,6 +226,8 @@ class ProfileStore:
             "estimated_input_latency_ms": round(estimated_input_latency_ms, 3),
             "runtime_output_drift_ms": round(runtime_output_drift_ms, 3),
             "runtime_input_drift_ms": round(runtime_input_drift_ms, 3),
+            "stable_target_lead_sec": round(stable_target_lead_sec, 3),
+            "startup_target_lead_sec": round(startup_target_lead_sec, 3),
         }
         devices[key] = {
             "sessions": new_sessions,
@@ -226,6 +249,8 @@ class ProfileStore:
             "estimated_input_latency_ms": estimated_input_latency_ms,
             "runtime_output_drift_ms": runtime_output_drift_ms,
             "runtime_input_drift_ms": runtime_input_drift_ms,
+            "stable_target_lead_sec": stable_target_lead_sec,
+            "startup_target_lead_sec": startup_target_lead_sec,
             "recommended_control": recommended_control,
             "recommended_playback": recommended_playback,
             "recommended_signal": recommended_signal,
@@ -292,6 +317,7 @@ class ProfileStore:
             progress_stale_sec += 0.08
             tracking_quality_seek_min += 0.05
             seek_cooldown_sec += 0.40
+            resume_from_hold_speaking_lead_slack_sec += 0.06
         if input_gain_hint == "high":
             tracking_quality_hold_min -= 0.02
         elif input_gain_hint == "low":
@@ -637,7 +663,17 @@ class ElevenLabsScribeProvider(AnalyticsProvider):
 
 ```python
 from __future__ import annotations
+from dataclasses import dataclass
 from shadowing.types import AudioBehaviorSnapshot
+@dataclass(slots=True)
+class _BehaviorState:
+    mode: str = "unknown"
+    mode_run: int = 0
+    last_emitted_at_sec: float = 0.0
+    last_active_follow_at_sec: float = 0.0
+    last_pause_like_at_sec: float = 0.0
+    last_reentry_like_at_sec: float = 0.0
+    last_repeat_like_at_sec: float = 0.0
 class AudioBehaviorClassifier:
     def __init__(
         self,
@@ -645,13 +681,21 @@ class AudioBehaviorClassifier:
         repeat_backtrack_sec: float = 1.5,
         reentry_silence_min_sec: float = 0.45,
         smooth_alpha: float = 0.30,
+        repeat_trigger_conf: float = 0.62,
+        reentry_trigger_conf: float = 0.60,
+        pause_trigger_silence_sec: float = 0.70,
     ) -> None:
         self.repeat_backtrack_sec = float(repeat_backtrack_sec)
         self.reentry_silence_min_sec = float(reentry_silence_min_sec)
         self.smooth_alpha = float(smooth_alpha)
+        self.repeat_trigger_conf = float(repeat_trigger_conf)
+        self.reentry_trigger_conf = float(reentry_trigger_conf)
+        self.pause_trigger_silence_sec = float(pause_trigger_silence_sec)
         self._last_snapshot: AudioBehaviorSnapshot | None = None
+        self._state = _BehaviorState()
     def reset(self) -> None:
         self._last_snapshot = None
+        self._state = _BehaviorState()
     def update(
         self,
         *,
@@ -664,17 +708,34 @@ class AudioBehaviorClassifier:
             return self._last_snapshot
         signal_conf = 0.0
         silence_run_sec = 0.0
+        quality_score = 0.0
         if signal_quality is not None:
             signal_conf = float(
                 max(
                     signal_quality.speaking_likelihood,
-                    0.45 if signal_quality.vad_active else 0.0,
+                    0.48 if signal_quality.vad_active else 0.0,
                 )
             )
             silence_run_sec = float(signal_quality.silence_run_sec)
-        still_following = max(0.0, min(1.0, 0.58 * audio_match.confidence + 0.42 * signal_conf))
-        repeated = float(audio_match.repeated_pattern_score)
+            quality_score = float(signal_quality.quality_score)
+        match_conf = float(audio_match.confidence)
+        local_similarity = float(getattr(audio_match, "local_similarity", 0.0))
+        repeated_score = float(audio_match.repeated_pattern_score)
+        mode = str(getattr(audio_match, "mode", "tracking"))
+        still_following = max(
+            0.0,
+            min(
+                1.0,
+                0.48 * match_conf + 0.22 * local_similarity + 0.30 * signal_conf,
+            ),
+        )
+        repeated = repeated_score
         reentry = 0.0
+        paused = 0.0
+        if signal_quality is not None:
+            paused = min(1.0, max(0.0, silence_run_sec / 1.6))
+            if silence_run_sec >= self.pause_trigger_silence_sec and signal_conf < 0.42:
+                paused = max(paused, 0.62)
         if (
             playback_status is not None
             and silence_run_sec >= self.reentry_silence_min_sec
@@ -682,19 +743,51 @@ class AudioBehaviorClassifier:
                 float(audio_match.estimated_ref_time_sec)
                 - float(playback_status.t_ref_heard_content_sec)
             )
-            <= 0.55
-            and audio_match.confidence >= 0.58
+            <= 0.60
+            and match_conf >= 0.56
         ):
-            reentry = min(1.0, 0.55 + 0.35 * audio_match.confidence)
-        paused = 0.0
-        if signal_quality is not None:
-            paused = min(1.0, max(0.0, silence_run_sec / 1.5))
-        if progress is not None and getattr(progress, "tracking_quality", 0.0) >= 0.72:
+            reentry = min(1.0, 0.52 + 0.36 * match_conf)
+        if progress is not None:
+            tracking_q = float(getattr(progress, "tracking_quality", 0.0))
+            joint_conf = float(getattr(progress, "joint_confidence", 0.0))
+            position_source = str(getattr(progress, "position_source", "text"))
+            if tracking_q >= 0.72:
+                still_following = max(still_following, 0.68)
+            if joint_conf >= 0.74 and position_source in {"joint", "audio"}:
+                still_following = max(still_following, 0.72)
+            if getattr(progress, "recently_progressed", False):
+                paused *= 0.70
+            if getattr(progress, "active_speaking", False):
+                still_following = max(still_following, 0.70)
+                paused *= 0.78
+        if mode == "repeat":
+            repeated = max(repeated, min(1.0, 0.60 + 0.24 * match_conf))
+        if mode == "reentry":
+            reentry = max(reentry, min(1.0, 0.60 + 0.24 * match_conf))
+        if mode == "recovery":
+            still_following = max(still_following, min(1.0, 0.58 + 0.22 * match_conf))
+        if quality_score < 0.40 and signal_conf < 0.36:
+            still_following *= 0.88
+        state_mode = self._infer_mode(
+            still_following=still_following,
+            repeated=repeated,
+            reentry=reentry,
+            paused=paused,
+            emitted_at_sec=float(audio_match.emitted_at_sec),
+        )
+        if state_mode == "repeat":
+            repeated = max(repeated, 0.72)
+            paused *= 0.82
+        elif state_mode == "reentry":
+            reentry = max(reentry, 0.72)
+            paused *= 0.72
             still_following = max(still_following, 0.70)
-        if audio_match.mode == "repeat":
-            repeated = max(repeated, min(1.0, 0.58 + 0.25 * audio_match.confidence))
-        if audio_match.mode == "reentry":
-            reentry = max(reentry, min(1.0, 0.58 + 0.25 * audio_match.confidence))
+        elif state_mode == "pause":
+            paused = max(paused, 0.72)
+            repeated *= 0.86
+        elif state_mode == "following":
+            still_following = max(still_following, 0.72)
+            paused *= 0.68
         snap = AudioBehaviorSnapshot(
             still_following_likelihood=float(still_following),
             repeated_likelihood=float(repeated),
@@ -705,7 +798,12 @@ class AudioBehaviorClassifier:
                     0.0,
                     min(
                         1.0,
-                        max(still_following, repeated, reentry, 1.0 - paused if paused > 0 else 0.0),
+                        max(
+                            still_following,
+                            repeated,
+                            reentry,
+                            1.0 - paused if paused > 0 else 0.0,
+                        ),
                     ),
                 )
             ),
@@ -714,6 +812,54 @@ class AudioBehaviorClassifier:
         snap = self._smooth(snap)
         self._last_snapshot = snap
         return snap
+    def _infer_mode(
+        self,
+        *,
+        still_following: float,
+        repeated: float,
+        reentry: float,
+        paused: float,
+        emitted_at_sec: float,
+    ) -> str:
+        prev = self._state.mode
+        candidate = "unknown"
+        if repeated >= self.repeat_trigger_conf and repeated >= reentry and repeated >= still_following:
+            candidate = "repeat"
+        elif reentry >= self.reentry_trigger_conf and reentry >= repeated:
+            candidate = "reentry"
+        elif paused >= 0.66 and still_following < 0.58:
+            candidate = "pause"
+        elif still_following >= 0.64:
+            candidate = "following"
+        if candidate == prev:
+            self._state.mode_run += 1
+        else:
+            self._state.mode = candidate
+            self._state.mode_run = 1
+        if candidate == "following":
+            self._state.last_active_follow_at_sec = emitted_at_sec
+        elif candidate == "pause":
+            self._state.last_pause_like_at_sec = emitted_at_sec
+        elif candidate == "reentry":
+            self._state.last_reentry_like_at_sec = emitted_at_sec
+        elif candidate == "repeat":
+            self._state.last_repeat_like_at_sec = emitted_at_sec
+        self._state.last_emitted_at_sec = emitted_at_sec
+        if candidate in {"repeat", "reentry"}:
+            if self._state.mode_run >= 1:
+                return candidate
+        if candidate in {"pause", "following"}:
+            if self._state.mode_run >= 2:
+                return candidate
+        if prev == "repeat" and (emitted_at_sec - self._state.last_repeat_like_at_sec) <= 0.35:
+            return "repeat"
+        if prev == "reentry" and (emitted_at_sec - self._state.last_reentry_like_at_sec) <= 0.45:
+            return "reentry"
+        if prev == "pause" and (emitted_at_sec - self._state.last_pause_like_at_sec) <= 0.40:
+            return "pause"
+        if prev == "following" and (emitted_at_sec - self._state.last_active_follow_at_sec) <= 0.35:
+            return "following"
+        return candidate
     def _smooth(self, current: AudioBehaviorSnapshot) -> AudioBehaviorSnapshot:
         prev = self._last_snapshot
         if prev is None:
@@ -1487,7 +1633,8 @@ class FrameFeatureExtractor:
 
 ```python
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from statistics import median
 from shadowing.audio.device_profile import DeviceProfile
 from shadowing.types import SignalQuality
 @dataclass(slots=True)
@@ -1498,6 +1645,27 @@ class LatencyCalibrationState:
     runtime_output_drift_ms: float
     confidence: float
     calibrated: bool
+    baseline_target_lead_sec: float = 0.15
+@dataclass(slots=True)
+class _RobustBuffer:
+    values: list[float] = field(default_factory=list)
+    def add(self, value: float, maxlen: int = 40) -> None:
+        self.values.append(float(value))
+        if len(self.values) > maxlen:
+            self.values = self.values[-maxlen:]
+    def clear(self) -> None:
+        self.values.clear()
+    def robust_center(self) -> float | None:
+        if not self.values:
+            return None
+        vals = sorted(float(v) for v in self.values)
+        if len(vals) >= 5:
+            lo = max(0, int(len(vals) * 0.15))
+            hi = min(len(vals), max(lo + 1, int(len(vals) * 0.85)))
+            vals = vals[lo:hi]
+        if not vals:
+            return None
+        return float(median(vals))
 class LatencyCalibrator:
     def __init__(
         self,
@@ -1520,6 +1688,10 @@ class LatencyCalibrator:
         self._bluetooth_mode = False
         self._bluetooth_long_session_mode = False
         self._startup_fast_calibration_until_sec = 0.0
+        self._stable_lead_buffer = _RobustBuffer()
+        self._stable_output_error_buffer = _RobustBuffer()
+        self._stable_input_error_buffer = _RobustBuffer()
+        self._last_baseline_refresh_at_sec = 0.0
     def reset(
         self,
         device_profile: DeviceProfile,
@@ -1546,11 +1718,16 @@ class LatencyCalibrator:
             runtime_output_drift_ms=0.0,
             confidence=0.20,
             calibrated=False,
+            baseline_target_lead_sec=float(base_target_lead_sec),
         )
         self._last_active_at_sec = 0.0
         self._last_update_at_sec = 0.0
         self._obs_error_ema_ms = 0.0
         self._obs_consistency_run = 0
+        self._stable_lead_buffer.clear()
+        self._stable_output_error_buffer.clear()
+        self._stable_input_error_buffer.clear()
+        self._last_baseline_refresh_at_sec = float(now_sec)
     def observe_signal(self, signal_quality: SignalQuality) -> None:
         if self._state is None:
             return
@@ -1598,12 +1775,12 @@ class LatencyCalibrator:
         if mode not in {"text", "joint", "audio"}:
             mode = "text"
         if mode == "audio":
-            source_weight = 0.40
+            source_weight = 0.40 if self._bluetooth_mode else 0.0
         elif mode == "joint":
-            source_weight = 0.70
+            source_weight = 0.74
         else:
             source_weight = 1.00
-        if mode == "audio" and not self._bluetooth_mode:
+        if source_weight <= 0.0:
             self._reset_observation_run(decay_only=True)
             return
         if audio_text_disagreement_sec is not None:
@@ -1611,9 +1788,6 @@ class LatencyCalibrator:
             if abs(float(audio_text_disagreement_sec)) > max_allowed:
                 self._reset_observation_run(decay_only=True)
                 return
-        if self._last_update_at_sec > 0.0 and (now_sec - self._last_update_at_sec) < self.min_update_interval_sec:
-            self._increase_confidence(0.006, max_conf=0.86)
-            return
         corrected_playback_ref = self.corrected_playback_ref_time_sec(playback_ref_time_sec)
         lead_sec = float(corrected_playback_ref) - float(user_ref_time_sec)
         error_ms = (lead_sec - self.target_shadow_lead_sec) * 1000.0
@@ -1621,18 +1795,29 @@ class LatencyCalibrator:
         if abs(error_ms) > self._max_observation_error_ms:
             self._reset_observation_run(decay_only=True)
             return
+        if stable and tracking_quality >= max(self.min_tracking_quality, 0.82 if not self._bluetooth_mode else 0.76):
+            self._stable_lead_buffer.add(float(lead_sec), maxlen=48)
+            self._stable_output_error_buffer.add(float(error_ms) * 0.80, maxlen=48)
+            self._stable_input_error_buffer.add(float(error_ms) * 0.20, maxlen=48)
+        if self._last_update_at_sec > 0.0 and (now_sec - self._last_update_at_sec) < self.min_update_interval_sec:
+            self._increase_confidence(0.006, max_conf=0.86)
+            self._maybe_refresh_baseline(now_sec=now_sec)
+            return
         self._accumulate_observation(error_ms)
         self._increase_confidence(0.012, max_conf=0.80 if self._bluetooth_mode else 0.78)
         required_consistency = 2 if (self._bluetooth_mode and now_sec <= self._startup_fast_calibration_until_sec) else 3
         if self._obs_consistency_run < required_consistency:
+            self._maybe_refresh_baseline(now_sec=now_sec)
             return
         if abs(self._obs_error_ema_ms) < self._min_error_ms_to_adjust:
             self._increase_confidence(0.020, max_conf=0.94 if self._bluetooth_mode else 0.92)
             self._last_update_at_sec = now_sec
+            self._maybe_refresh_baseline(now_sec=now_sec)
             return
-        self._apply_correction(self._obs_error_ema_ms, now_sec=now_sec)
+        self._apply_runtime_correction(self._obs_error_ema_ms, now_sec=now_sec)
         self._last_update_at_sec = now_sec
         self._increase_confidence(0.030, max_conf=0.97 if self._bluetooth_mode else 0.96)
+        self._maybe_refresh_baseline(now_sec=now_sec)
     def _accumulate_observation(self, error_ms: float) -> None:
         error_ms = float(max(-320.0, min(320.0, error_ms)))
         if self._obs_consistency_run <= 0:
@@ -1646,7 +1831,7 @@ class LatencyCalibrator:
             self._obs_consistency_run = max(1, self._obs_consistency_run - 1)
         alpha = 0.28 if self._bluetooth_mode else 0.22
         self._obs_error_ema_ms = (1.0 - alpha) * self._obs_error_ema_ms + alpha * error_ms
-    def _apply_correction(self, error_ms: float, now_sec: float) -> None:
+    def _apply_runtime_correction(self, error_ms: float, now_sec: float) -> None:
         assert self._state is not None
         bounded = float(max(-260.0, min(260.0, error_ms)))
         magnitude = abs(bounded)
@@ -1673,6 +1858,44 @@ class LatencyCalibrator:
             min(self._max_runtime_input_drift_ms, self._state.runtime_input_drift_ms),
         )
         self._obs_consistency_run = max(1, self._obs_consistency_run - 1)
+    def _maybe_refresh_baseline(self, *, now_sec: float) -> None:
+        assert self._state is not None
+        min_refresh_gap = 14.0 if self._bluetooth_mode else 20.0
+        if (now_sec - self._last_baseline_refresh_at_sec) < min_refresh_gap:
+            return
+        robust_lead = self._stable_lead_buffer.robust_center()
+        robust_output_err = self._stable_output_error_buffer.robust_center()
+        robust_input_err = self._stable_input_error_buffer.robust_center()
+        updated = False
+        if robust_lead is not None:
+            target = 0.35 if self._bluetooth_long_session_mode else (0.28 if self._bluetooth_mode else 0.15)
+            lead_bias_ms = (float(robust_lead) - target) * 1000.0
+            if abs(lead_bias_ms) >= (26.0 if self._bluetooth_mode else 34.0):
+                nudge = max(-8.0, min(8.0, lead_bias_ms * 0.18))
+                self._state.estimated_output_latency_ms = max(
+                    0.0,
+                    self._state.estimated_output_latency_ms - nudge,
+                )
+                updated = True
+        if robust_output_err is not None:
+            nudge = max(-10.0, min(10.0, float(robust_output_err) * 0.10))
+            if abs(nudge) >= 0.6:
+                self._state.estimated_output_latency_ms = max(
+                    0.0,
+                    self._state.estimated_output_latency_ms - nudge,
+                )
+                updated = True
+        if robust_input_err is not None:
+            nudge = max(-4.0, min(4.0, float(robust_input_err) * 0.06))
+            if abs(nudge) >= 0.4:
+                self._state.estimated_input_latency_ms = max(
+                    0.0,
+                    self._state.estimated_input_latency_ms - nudge,
+                )
+                updated = True
+        if updated:
+            self._increase_confidence(0.012, max_conf=0.98 if self._bluetooth_mode else 0.96)
+        self._last_baseline_refresh_at_sec = float(now_sec)
     def _increase_confidence(self, delta: float, *, max_conf: float) -> None:
         assert self._state is not None
         self._state.confidence = min(float(max_conf), self._state.confidence + float(delta))
@@ -2765,9 +2988,13 @@ class EvidenceFuser:
         *,
         text_priority_threshold: float = 0.72,
         audio_takeover_threshold: float = 0.62,
+        disagreement_soft_sec: float = 0.42,
+        disagreement_hard_sec: float = 1.20,
     ) -> None:
         self.text_priority_threshold = float(text_priority_threshold)
         self.audio_takeover_threshold = float(audio_takeover_threshold)
+        self.disagreement_soft_sec = float(disagreement_soft_sec)
+        self.disagreement_hard_sec = float(disagreement_hard_sec)
     def reset(self) -> None:
         return
     def fuse(
@@ -2786,90 +3013,177 @@ class EvidenceFuser:
         text_conf = 0.0
         text_ref_time_sec = None
         text_ref_idx = 0
+        tracking_quality = 0.0
+        recently_progressed = False
+        active_speaking = False
+        position_source = "text"
         if progress is not None:
+            tracking_quality = float(getattr(progress, "tracking_quality", 0.0))
+            progress_conf = float(getattr(progress, "confidence", 0.0))
+            joint_conf = float(getattr(progress, "joint_confidence", 0.0))
+            stable = 1.0 if bool(getattr(progress, "stable", False)) else 0.0
+            recently_progressed = bool(getattr(progress, "recently_progressed", False))
+            active_speaking = bool(getattr(progress, "active_speaking", False))
+            position_source = str(getattr(progress, "position_source", "text"))
             text_conf = max(
                 0.0,
                 min(
                     1.0,
-                    0.56 * float(getattr(progress, "tracking_quality", 0.0))
-                    + 0.30 * float(getattr(progress, "confidence", 0.0))
-                    + 0.14 * (1.0 if getattr(progress, "stable", False) else 0.0),
+                    0.42 * tracking_quality
+                    + 0.22 * progress_conf
+                    + 0.16 * joint_conf
+                    + 0.10 * stable
+                    + 0.10 * (1.0 if recently_progressed else 0.0),
                 ),
             )
             text_ref_time_sec = float(getattr(progress, "estimated_ref_time_sec", 0.0))
             text_ref_idx = int(getattr(progress, "estimated_ref_idx", 0))
-        audio_conf = 0.0 if audio_match is None else float(audio_match.confidence)
-        if audio_behavior is not None:
-            audio_conf = max(audio_conf, float(audio_behavior.confidence) * 0.94)
-        if text_ref_time_sec is None and audio_match is not None:
-            est_ref_time_sec = float(audio_match.estimated_ref_time_sec)
-            est_ref_idx = int(audio_match.estimated_ref_idx_hint)
-        elif audio_match is None or text_conf >= self.text_priority_threshold:
-            est_ref_time_sec = float(text_ref_time_sec or 0.0)
-            est_ref_idx = int(text_ref_idx)
-        elif audio_conf >= self.audio_takeover_threshold and text_conf < 0.52:
-            est_ref_time_sec = float(audio_match.estimated_ref_time_sec)
-            est_ref_idx = int(audio_match.estimated_ref_idx_hint)
-        else:
-            w_text = max(0.18, text_conf)
-            w_audio = max(0.22, audio_conf)
-            denom = w_text + w_audio
-            est_ref_time_sec = (
-                w_text * float(text_ref_time_sec or 0.0)
-                + w_audio * float(audio_match.estimated_ref_time_sec)
-            ) / denom
-            est_ref_idx = int(
-                round(
-                    (w_text * text_ref_idx + w_audio * float(audio_match.estimated_ref_idx_hint)) / denom
-                )
-            )
-        still_following = 0.0
+            if position_source == "audio":
+                text_conf *= 0.84
+            elif position_source == "joint":
+                text_conf *= 0.92
+        audio_conf = 0.0
+        audio_ref_time_sec = None
+        audio_ref_idx = 0
         repeated = 0.0
         reentry = 0.0
-        if audio_behavior is not None:
-            still_following = float(audio_behavior.still_following_likelihood)
-            repeated = float(audio_behavior.repeated_likelihood)
-            reentry = float(audio_behavior.reentry_likelihood)
-        elif audio_match is not None:
-            still_following = float(audio_match.confidence) * 0.84
+        still_following = 0.0
+        paused = 0.0
+        audio_mode = "tracking"
+        if audio_match is not None:
+            audio_ref_time_sec = float(audio_match.estimated_ref_time_sec)
+            audio_ref_idx = int(audio_match.estimated_ref_idx_hint)
+            audio_conf = float(audio_match.confidence)
             repeated = float(audio_match.repeated_pattern_score)
-            reentry = 0.55 if audio_match.mode == "reentry" else 0.0
-        if progress is not None and getattr(progress, "recently_progressed", False):
-            still_following = max(still_following, 0.64)
-        fused_conf = max(text_conf, audio_conf)
+            still_following = max(still_following, audio_conf * 0.80)
+            audio_mode = str(getattr(audio_match, "mode", "tracking"))
+        if audio_behavior is not None:
+            audio_conf = max(audio_conf, float(getattr(audio_behavior, "confidence", 0.0)) * 0.96)
+            still_following = max(still_following, float(getattr(audio_behavior, "still_following_likelihood", 0.0)))
+            repeated = max(repeated, float(getattr(audio_behavior, "repeated_likelihood", 0.0)))
+            reentry = float(getattr(audio_behavior, "reentry_likelihood", 0.0))
+            paused = float(getattr(audio_behavior, "paused_likelihood", 0.0))
+        if signal_quality is not None:
+            speaking_like = float(
+                max(
+                    signal_quality.speaking_likelihood,
+                    0.45 if signal_quality.vad_active else 0.0,
+                )
+            )
+            if speaking_like >= 0.56:
+                still_following = max(still_following, min(1.0, 0.55 + 0.30 * speaking_like))
+            if signal_quality.dropout_detected:
+                audio_conf *= 0.90
+                still_following *= 0.92
+            if float(signal_quality.quality_score) < 0.40:
+                audio_conf *= 0.94
+        if text_ref_time_sec is None and audio_ref_time_sec is not None:
+            est_ref_time_sec = float(audio_ref_time_sec)
+            est_ref_idx = int(audio_ref_idx)
+            fused_conf = max(audio_conf, still_following * 0.92)
+            return FusionEvidence(
+                estimated_ref_time_sec=float(est_ref_time_sec),
+                estimated_ref_idx_hint=int(max(0, est_ref_idx)),
+                text_confidence=0.0,
+                audio_confidence=float(audio_conf),
+                fused_confidence=float(max(0.0, min(1.0, fused_conf))),
+                still_following_likelihood=float(still_following),
+                repeated_likelihood=float(repeated),
+                reentry_likelihood=float(reentry),
+                should_prevent_hold=bool(still_following >= 0.66 and repeated < 0.78),
+                should_prevent_seek=bool(repeated >= 0.60 or reentry >= 0.58),
+                should_widen_reacquire_window=bool(audio_conf >= 0.56 or reentry >= 0.56),
+                should_recenter_aligner_window=bool(audio_conf >= 0.66),
+                emitted_at_sec=float(now_sec),
+            )
+        if text_ref_time_sec is None:
+            return None
         disagreement = 0.0
-        if text_conf > 0.0 and audio_conf > 0.0 and audio_match is not None:
-            disagreement = abs(float(text_ref_time_sec or 0.0) - float(audio_match.estimated_ref_time_sec))
-            if disagreement <= 0.42:
-                fused_conf = min(1.0, max(text_conf, audio_conf) + 0.08)
-            elif disagreement >= 1.20:
-                fused_conf = max(0.0, fused_conf - 0.10)
+        if audio_ref_time_sec is not None:
+            disagreement = abs(float(text_ref_time_sec) - float(audio_ref_time_sec))
+        if audio_ref_time_sec is None or text_conf >= self.text_priority_threshold:
+            est_ref_time_sec = float(text_ref_time_sec)
+            est_ref_idx = int(text_ref_idx)
+            fused_conf = text_conf
+            if audio_ref_time_sec is not None:
+                if disagreement <= self.disagreement_soft_sec:
+                    fused_conf = min(1.0, fused_conf + 0.06)
+                elif disagreement >= self.disagreement_hard_sec:
+                    fused_conf = max(0.0, fused_conf - 0.06)
+        else:
+            audio_can_takeover = bool(
+                audio_conf >= self.audio_takeover_threshold
+                and still_following >= 0.66
+                and repeated < 0.72
+                and (
+                    reentry >= 0.56
+                    or audio_mode in {"reentry", "recovery"}
+                    or text_conf < 0.52
+                )
+            )
+            if audio_can_takeover and disagreement <= 1.40:
+                est_ref_time_sec = float(audio_ref_time_sec)
+                est_ref_idx = int(audio_ref_idx)
+                fused_conf = max(audio_conf * 0.94, still_following * 0.90, text_conf * 0.84)
+            else:
+                w_text = max(0.16, text_conf)
+                w_audio = max(0.18, audio_conf)
+                if repeated >= 0.68:
+                    w_audio *= 0.22
+                elif paused >= 0.72:
+                    w_audio *= 0.38
+                elif disagreement >= self.disagreement_hard_sec:
+                    if reentry < 0.62:
+                        w_audio *= 0.46
+                denom = max(1e-6, w_text + w_audio)
+                est_ref_time_sec = (
+                    w_text * float(text_ref_time_sec)
+                    + w_audio * float(audio_ref_time_sec)
+                ) / denom
+                est_ref_idx = int(
+                    round(
+                        (w_text * float(text_ref_idx) + w_audio * float(audio_ref_idx)) / denom
+                    )
+                )
+                fused_conf = max(
+                    text_conf,
+                    audio_conf * 0.90,
+                    0.55 * text_conf + 0.45 * audio_conf,
+                )
+                if disagreement <= self.disagreement_soft_sec:
+                    fused_conf = min(1.0, fused_conf + 0.06)
+                elif disagreement >= self.disagreement_hard_sec:
+                    fused_conf = max(0.0, fused_conf - 0.08)
         should_prevent_hold = bool(
             (
                 (text_conf < 0.60 and still_following >= 0.66)
                 or (text_conf < 0.54 and audio_conf >= 0.64)
                 or (reentry >= 0.62)
+                or (active_speaking and still_following >= 0.62)
             )
             and repeated < 0.78
+            and paused < 0.78
         )
         should_prevent_seek = bool(
             repeated >= 0.60
-            or (audio_conf >= 0.64 and text_conf < 0.52)
-            or (reentry >= 0.58)
+            or reentry >= 0.58
+            or (audio_conf >= 0.64 and text_conf < 0.52 and disagreement <= 1.20)
         )
         should_recenter_aligner_window = bool(
-            audio_match is not None
+            audio_ref_time_sec is not None
             and (
                 (audio_conf >= 0.66 and text_conf < 0.56)
                 or (disagreement >= 0.95 and audio_conf >= 0.62 and text_conf < 0.64)
+                or (reentry >= 0.62)
             )
         )
         should_widen_reacquire_window = bool(
-            audio_match is not None
+            audio_ref_time_sec is not None
             and (
                 (audio_conf >= 0.56 and text_conf < 0.48)
                 or (reentry >= 0.56)
                 or (repeated >= 0.56)
+                or (paused >= 0.72 and still_following < 0.58)
             )
         )
         return FusionEvidence(
@@ -3845,33 +4159,44 @@ class AudioAwareProgressEstimator:
     ) -> None:
         self.recent_progress_sec = float(recent_progress_sec)
         self.active_speaking_signal_min = float(active_speaking_signal_min)
-        self._audio_takeover_conf = 0.68
+        self._audio_takeover_conf = 0.70
         self._audio_assist_conf = 0.58
-        self._max_audio_jump_tokens = 4
-        self._max_disagreement_for_joint = 1.0
+        self._max_audio_jump_sec = 1.20
+        self._max_disagreement_for_joint_sec = 1.0
         self.behavior_interpreter = BehaviorInterpreter(recent_progress_sec=recent_progress_sec)
         self._ref_map: ReferenceMap | None = None
-        self._estimated_idx_f = 0.0
+        self._ref_times: list[float] = []
+        self._estimated_ref_time_sec_f = 0.0
+        self._estimated_velocity_ref_sec_per_sec = 0.0
+        self._last_update_now_sec = 0.0
         self._last_progress_at_sec = 0.0
         self._last_event_at_sec = 0.0
-        self._last_velocity = 0.0
-        self._last_estimated_idx_at_progress = 0.0
         self._last_tracking: TrackingSnapshot | None = None
         self._last_snapshot: ProgressEstimate | None = None
         self._force_reacquire_until_sec = 0.0
         self._last_audio_progress_at_sec = 0.0
+        self._text_stability_run = 0
+        self._audio_stability_run = 0
+        self._last_text_obs_time_sec: float | None = None
+        self._last_audio_obs_time_sec: float | None = None
     def reset(self, reference_map: ReferenceMap, start_idx: int = 0) -> None:
         self._ref_map = reference_map
         start_idx = max(0, min(int(start_idx), max(0, len(reference_map.tokens) - 1)))
-        self._estimated_idx_f = float(start_idx)
+        self._ref_times = [float(t.t_start) for t in reference_map.tokens]
+        start_time = self._ref_times[start_idx] if self._ref_times else 0.0
+        self._estimated_ref_time_sec_f = float(start_time)
+        self._estimated_velocity_ref_sec_per_sec = 0.0
+        self._last_update_now_sec = 0.0
         self._last_progress_at_sec = 0.0
         self._last_event_at_sec = 0.0
-        self._last_velocity = 0.0
-        self._last_estimated_idx_at_progress = float(start_idx)
         self._last_tracking = None
         self._last_snapshot = None
         self._force_reacquire_until_sec = 0.0
         self._last_audio_progress_at_sec = 0.0
+        self._text_stability_run = 0
+        self._audio_stability_run = 0
+        self._last_text_obs_time_sec = None
+        self._last_audio_obs_time_sec = None
     def on_playback_generation_changed(self, now_sec: float) -> None:
         self._force_reacquire_until_sec = float(now_sec) + 0.80
     def update(
@@ -3885,89 +4210,132 @@ class AudioAwareProgressEstimator:
     ) -> ProgressEstimate | None:
         if self._ref_map is None or not self._ref_map.tokens:
             return None
+        if self._last_update_now_sec <= 0.0:
+            dt = 0.0
+        else:
+            dt = max(0.0, min(0.35, float(now_sec) - self._last_update_now_sec))
+        self._last_update_now_sec = float(now_sec)
         if tracking is not None:
             self._last_tracking = tracking
             self._last_event_at_sec = float(tracking.emitted_at_sec)
-        current_idx = int(round(self._estimated_idx_f))
-        text_candidate_idx = current_idx
-        text_committed_idx = current_idx
+        self._predict_forward(dt=dt, signal_quality=signal_quality)
+        text_obs_time_sec = None
+        text_obs_weight = 0.0
+        text_candidate_idx = self._time_to_ref_idx(self._estimated_ref_time_sec_f)
+        text_committed_idx = text_candidate_idx
+        tracking_mode = TrackingMode.BOOTSTRAP
         text_quality = 0.0
         text_conf = 0.0
-        tracking_mode = TrackingMode.BOOTSTRAP
+        stable = False
         if tracking is not None:
             text_candidate_idx = int(tracking.candidate_ref_idx)
             text_committed_idx = int(tracking.committed_ref_idx)
+            tracking_mode = tracking.tracking_mode
             text_quality = float(tracking.tracking_quality.overall_score)
             text_conf = float(tracking.confidence)
-            tracking_mode = tracking.tracking_mode
-        audio_idx = current_idx
+            stable = bool(tracking.stable)
+            base_idx = max(text_candidate_idx, text_committed_idx)
+            text_obs_time_sec = self._idx_to_ref_time(base_idx)
+            text_obs_weight = self._text_observation_weight(tracking)
+            if tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED):
+                if self._last_text_obs_time_sec is None or abs(text_obs_time_sec - self._last_text_obs_time_sec) <= 0.45:
+                    self._text_stability_run += 1
+                else:
+                    self._text_stability_run = 1
+                self._last_text_obs_time_sec = text_obs_time_sec
+            else:
+                self._text_stability_run = 0
+        audio_obs_time_sec = None
+        audio_obs_weight = 0.0
         audio_conf = 0.0
         repeated = 0.0
         reentry = 0.0
         still_following = 0.0
+        paused = 0.0
         audio_mode = "tracking"
         if audio_match is not None:
-            audio_idx = max(0, min(int(getattr(audio_match, "estimated_ref_idx_hint", current_idx)), len(self._ref_map.tokens) - 1))
+            audio_obs_time_sec = float(getattr(audio_match, "estimated_ref_time_sec", self._estimated_ref_time_sec_f))
             audio_conf = float(getattr(audio_match, "confidence", 0.0))
             repeated = float(getattr(audio_match, "repeated_pattern_score", 0.0))
-            still_following = max(still_following, audio_conf * 0.80)
             audio_mode = str(getattr(audio_match, "mode", "tracking"))
         if audio_behavior is not None:
             audio_conf = max(audio_conf, float(getattr(audio_behavior, "confidence", 0.0)) * 0.96)
-            still_following = max(still_following, float(getattr(audio_behavior, "still_following_likelihood", 0.0)))
+            still_following = float(getattr(audio_behavior, "still_following_likelihood", 0.0))
             repeated = max(repeated, float(getattr(audio_behavior, "repeated_likelihood", 0.0)))
             reentry = float(getattr(audio_behavior, "reentry_likelihood", 0.0))
-        target_idx = float(max(current_idx, text_committed_idx))
-        position_source = "text"
-        if tracking is not None:
-            weight = self._weight_for_tracking(tracking)
-            target_idx = max(
-                target_idx,
-                (1.0 - weight) * self._estimated_idx_f + weight * float(max(text_candidate_idx, text_committed_idx)),
+            paused = float(getattr(audio_behavior, "paused_likelihood", 0.0))
+        if audio_obs_time_sec is not None:
+            audio_obs_weight = self._audio_observation_weight(
+                audio_conf=audio_conf,
+                text_quality=text_quality,
+                repeated=repeated,
+                reentry=reentry,
+                still_following=still_following,
+                paused=paused,
+                audio_mode=audio_mode,
             )
-            if (
-                tracking.tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED)
-                and tracking.local_match_ratio >= 0.68
-                and text_candidate_idx > current_idx
-            ):
-                target_idx = max(target_idx, float(current_idx) + 0.60)
-        audio_push = max(0, audio_idx - current_idx)
-        text_audio_disagreement = abs(audio_idx - max(text_candidate_idx, text_committed_idx))
-        text_weak = tracking is None or text_quality < 0.56 or tracking_mode in (TrackingMode.REACQUIRING, TrackingMode.LOST)
-        audio_can_assist = bool(
-            audio_conf >= self._audio_assist_conf
-            and still_following >= 0.58
-            and repeated < 0.80
-            and text_audio_disagreement <= 8
+            if self._last_audio_obs_time_sec is None or abs(audio_obs_time_sec - self._last_audio_obs_time_sec) <= 0.55:
+                self._audio_stability_run += 1
+            else:
+                self._audio_stability_run = 1
+            self._last_audio_obs_time_sec = audio_obs_time_sec
+        position_source = "text"
+        est_before = float(self._estimated_ref_time_sec_f)
+        if repeated >= 0.68:
+            audio_obs_weight *= 0.18
+            text_obs_weight *= 0.90
+        elif paused >= 0.72 and still_following < 0.58:
+            audio_obs_weight *= 0.35
+            text_obs_weight *= 0.70
+        elif reentry >= 0.64:
+            audio_obs_weight = max(audio_obs_weight, 0.72)
+        elif still_following >= 0.72 and text_quality < 0.56:
+            audio_obs_weight = max(audio_obs_weight, 0.58)
+        if text_obs_time_sec is not None and audio_obs_time_sec is not None:
+            disagreement = abs(audio_obs_time_sec - text_obs_time_sec)
+            if disagreement <= self._max_disagreement_for_joint_sec:
+                fused_obs = (
+                    text_obs_weight * text_obs_time_sec + audio_obs_weight * audio_obs_time_sec
+                ) / max(1e-6, text_obs_weight + audio_obs_weight)
+                fused_weight = max(text_obs_weight, audio_obs_weight, 0.18)
+                self._pull_toward_observation(fused_obs, fused_weight)
+                position_source = "joint"
+            elif audio_obs_weight >= 0.76 and text_obs_weight < 0.42 and reentry >= 0.56:
+                self._pull_toward_observation(audio_obs_time_sec, audio_obs_weight)
+                position_source = "audio"
+            else:
+                self._pull_toward_observation(text_obs_time_sec, text_obs_weight)
+                position_source = "text"
+        elif text_obs_time_sec is not None:
+            self._pull_toward_observation(text_obs_time_sec, text_obs_weight)
+            position_source = "text"
+        elif audio_obs_time_sec is not None:
+            if audio_obs_weight >= self._audio_assist_conf:
+                self._pull_toward_observation(audio_obs_time_sec, audio_obs_weight)
+                position_source = "audio" if audio_obs_weight >= self._audio_takeover_conf else "joint"
+        self._apply_monotonic_constraints(
+            prev_est_ref_time_sec=est_before,
+            text_obs_time_sec=text_obs_time_sec,
+            audio_obs_time_sec=audio_obs_time_sec,
+            repeated=repeated,
+            reentry=reentry,
+            paused=paused,
+            now_sec=now_sec,
         )
-        audio_can_takeover = bool(
-            audio_conf >= self._audio_takeover_conf
-            and still_following >= 0.66
-            and repeated < 0.72
-            and (reentry >= 0.56 or audio_mode in {"reentry", "recovery"} or text_weak)
-            and text_audio_disagreement <= 14
-        )
-        if audio_can_assist and audio_push > 0:
-            push = min(self._max_audio_jump_tokens, audio_push)
-            target_idx = max(target_idx, float(current_idx) + 0.40 + 0.45 * push)
-            self._last_audio_progress_at_sec = float(now_sec)
-            position_source = "joint"
-        if audio_can_takeover and audio_idx >= current_idx:
-            target_idx = max(target_idx, float(audio_idx))
-            self._last_audio_progress_at_sec = float(now_sec)
-            position_source = "audio"
-        estimated_idx = max(0, min(int(round(target_idx)), len(self._ref_map.tokens) - 1))
-        progressed = estimated_idx > current_idx
+        progressed = self._estimated_ref_time_sec_f > est_before + 1e-4
         if progressed:
-            if self._last_progress_at_sec > 0.0 and now_sec > self._last_progress_at_sec:
-                dt = max(1e-6, now_sec - self._last_progress_at_sec)
-                self._last_velocity = (estimated_idx - self._last_estimated_idx_at_progress) / dt
             self._last_progress_at_sec = float(now_sec)
-            self._last_estimated_idx_at_progress = float(estimated_idx)
-        self._estimated_idx_f = float(estimated_idx)
+            if audio_obs_weight >= self._audio_assist_conf:
+                self._last_audio_progress_at_sec = float(now_sec)
         self._last_snapshot = self._render_snapshot(
             now_sec=now_sec,
             signal_quality=signal_quality,
+            tracking_mode=tracking_mode,
+            tracking_quality=text_quality,
+            confidence=text_conf,
+            stable=stable,
+            source_candidate_ref_idx=text_candidate_idx,
+            source_committed_ref_idx=text_committed_idx,
             audio_conf=audio_conf,
             still_following=still_following,
             reentry=reentry,
@@ -3997,37 +4365,151 @@ class AudioAwareProgressEstimator:
             reentry = float(getattr(audio_behavior, "reentry_likelihood", 0.0))
             if audio_conf >= self._audio_assist_conf:
                 position_source = "joint"
+        tracking = self._last_tracking
+        tracking_mode = TrackingMode.BOOTSTRAP
+        tracking_quality = 0.0
+        confidence = 0.0
+        stable = False
+        source_candidate_ref_idx = self._time_to_ref_idx(self._estimated_ref_time_sec_f)
+        source_committed_ref_idx = source_candidate_ref_idx
+        if tracking is not None:
+            tracking_mode = tracking.tracking_mode
+            tracking_quality = tracking.tracking_quality.overall_score
+            confidence = tracking.confidence
+            stable = tracking.stable
+            source_candidate_ref_idx = tracking.candidate_ref_idx
+            source_committed_ref_idx = tracking.committed_ref_idx
         self._last_snapshot = self._render_snapshot(
             now_sec=now_sec,
             signal_quality=signal_quality,
+            tracking_mode=tracking_mode,
+            tracking_quality=tracking_quality,
+            confidence=confidence,
+            stable=stable,
+            source_candidate_ref_idx=source_candidate_ref_idx,
+            source_committed_ref_idx=source_committed_ref_idx,
             audio_conf=audio_conf,
             still_following=still_following,
             reentry=reentry,
             position_source=position_source,
         )
         return self._last_snapshot
-    def _weight_for_tracking(self, tracking: TrackingSnapshot) -> float:
+    def _predict_forward(self, *, dt: float, signal_quality: SignalQuality | None) -> None:
+        if dt <= 0.0:
+            return
+        speaking = False
+        if signal_quality is not None:
+            speaking = bool(
+                signal_quality.vad_active
+                or signal_quality.speaking_likelihood >= self.active_speaking_signal_min
+            )
+        vel = float(self._estimated_velocity_ref_sec_per_sec)
+        if not speaking:
+            vel *= 0.84
+        else:
+            vel = min(1.55, max(0.0, vel))
+        advance = max(0.0, vel) * dt
+        self._estimated_ref_time_sec_f += advance
+        self._estimated_ref_time_sec_f = self._clamp_ref_time(self._estimated_ref_time_sec_f)
+        self._estimated_velocity_ref_sec_per_sec = vel
+    def _text_observation_weight(self, tracking: TrackingSnapshot) -> float:
+        weight = 0.0
+        weight += 0.46 * float(tracking.tracking_quality.overall_score)
+        weight += 0.34 * float(tracking.confidence)
+        weight += 0.12 * float(tracking.local_match_ratio)
+        if tracking.stable:
+            weight += 0.10
         if tracking.tracking_mode == TrackingMode.LOCKED:
-            return 0.82 if tracking.stable else 0.68
-        if tracking.tracking_mode == TrackingMode.WEAK_LOCKED:
-            return 0.40
-        if tracking.tracking_mode == TrackingMode.REACQUIRING:
-            return 0.16
-        return 0.05
+            weight += 0.10
+        elif tracking.tracking_mode == TrackingMode.WEAK_LOCKED:
+            weight += 0.02
+        elif tracking.tracking_mode in (TrackingMode.REACQUIRING, TrackingMode.LOST):
+            weight -= 0.16
+        if self._text_stability_run >= 2:
+            weight += 0.08
+        return max(0.0, min(1.0, weight))
+    def _audio_observation_weight(
+        self,
+        *,
+        audio_conf: float,
+        text_quality: float,
+        repeated: float,
+        reentry: float,
+        still_following: float,
+        paused: float,
+        audio_mode: str,
+    ) -> float:
+        weight = 0.0
+        weight += 0.52 * float(audio_conf)
+        weight += 0.22 * float(still_following)
+        weight += 0.08 * float(reentry)
+        if self._audio_stability_run >= 2:
+            weight += 0.10
+        if text_quality < 0.54:
+            weight += 0.10
+        if audio_mode in {"reentry", "recovery"}:
+            weight += 0.08
+        if paused >= 0.70:
+            weight -= 0.16
+        if repeated >= 0.68:
+            weight -= 0.28
+        return max(0.0, min(1.0, weight))
+    def _pull_toward_observation(self, obs_ref_time_sec: float, obs_weight: float) -> None:
+        cur = float(self._estimated_ref_time_sec_f)
+        obs = self._clamp_ref_time(float(obs_ref_time_sec))
+        err = obs - cur
+        if err <= 0.0:
+            beta = 0.10 * max(0.0, min(1.0, obs_weight))
+        else:
+            beta = 0.16 + 0.44 * max(0.0, min(1.0, obs_weight))
+        beta = max(0.04, min(0.78, beta))
+        new_val = cur + beta * err
+        delta = new_val - cur
+        self._estimated_velocity_ref_sec_per_sec = 0.78 * self._estimated_velocity_ref_sec_per_sec + 0.22 * max(0.0, delta / 0.03)
+        self._estimated_ref_time_sec_f = self._clamp_ref_time(new_val)
+    def _apply_monotonic_constraints(
+        self,
+        *,
+        prev_est_ref_time_sec: float,
+        text_obs_time_sec: float | None,
+        audio_obs_time_sec: float | None,
+        repeated: float,
+        reentry: float,
+        paused: float,
+        now_sec: float,
+    ) -> None:
+        cur = float(self._estimated_ref_time_sec_f)
+        cur = max(cur, prev_est_ref_time_sec)
+        if repeated >= 0.68:
+            cur = min(cur, prev_est_ref_time_sec + 0.06)
+        if paused >= 0.72:
+            cur = min(cur, prev_est_ref_time_sec + 0.04)
+        if reentry >= 0.64 and audio_obs_time_sec is not None:
+            target = max(prev_est_ref_time_sec, min(audio_obs_time_sec, prev_est_ref_time_sec + self._max_audio_jump_sec))
+            cur = max(cur, target * 0.65 + cur * 0.35)
+        if now_sec <= self._force_reacquire_until_sec:
+            if text_obs_time_sec is not None:
+                cur = max(cur, min(text_obs_time_sec, prev_est_ref_time_sec + 0.35))
+        self._estimated_ref_time_sec_f = self._clamp_ref_time(cur)
     def _render_snapshot(
         self,
         *,
         now_sec: float,
         signal_quality: SignalQuality | None,
+        tracking_mode: TrackingMode,
+        tracking_quality: float,
+        confidence: float,
+        stable: bool,
+        source_candidate_ref_idx: int,
+        source_committed_ref_idx: int,
         audio_conf: float,
         still_following: float,
         reentry: float,
         position_source: str,
     ) -> ProgressEstimate:
         assert self._ref_map is not None
-        tracking = self._last_tracking
-        estimated_idx = max(0, min(int(round(self._estimated_idx_f)), len(self._ref_map.tokens) - 1))
-        estimated_ref_time_sec = float(self._ref_map.tokens[estimated_idx].t_start)
+        estimated_idx = self._time_to_ref_idx(self._estimated_ref_time_sec_f)
+        estimated_ref_time_sec = self._idx_to_ref_time(estimated_idx)
         progress_age = 9999.0
         if self._last_progress_at_sec > 0.0:
             progress_age = max(0.0, now_sec - self._last_progress_at_sec)
@@ -4036,62 +4518,60 @@ class AudioAwareProgressEstimator:
         recently_progressed = progress_age <= self.recent_progress_sec
         signal_speaking = False
         if signal_quality is not None:
-            signal_speaking = bool(signal_quality.vad_active or signal_quality.speaking_likelihood >= self.active_speaking_signal_min)
-        tracking_mode = TrackingMode.BOOTSTRAP
-        tracking_quality = 0.0
-        confidence = 0.0
-        stable = False
-        source_candidate_ref_idx = estimated_idx
-        source_committed_ref_idx = estimated_idx
-        event_emitted_at_sec = self._last_event_at_sec
-        if tracking is not None:
-            tracking_mode = tracking.tracking_mode
-            tracking_quality = tracking.tracking_quality.overall_score
-            confidence = tracking.confidence
-            stable = tracking.stable
-            source_candidate_ref_idx = tracking.candidate_ref_idx
-            source_committed_ref_idx = tracking.committed_ref_idx
+            signal_speaking = bool(
+                signal_quality.vad_active
+                or signal_quality.speaking_likelihood >= self.active_speaking_signal_min
+            )
+        effective_tracking_mode = tracking_mode
+        effective_tracking_quality = float(tracking_quality)
         if now_sec <= self._force_reacquire_until_sec:
-            tracking_mode = TrackingMode.REACQUIRING
-            tracking_quality = min(tracking_quality, 0.55)
+            effective_tracking_mode = TrackingMode.REACQUIRING
+            effective_tracking_quality = min(effective_tracking_quality, 0.55)
         active_speaking = False
         if recently_progressed:
             active_speaking = True
-        elif signal_speaking and tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED):
+        elif signal_speaking and effective_tracking_mode in (TrackingMode.LOCKED, TrackingMode.WEAK_LOCKED):
             active_speaking = True
-        elif signal_speaking and tracking_quality >= 0.70:
+        elif signal_speaking and effective_tracking_quality >= 0.70:
             active_speaking = True
         elif audio_conf >= self._audio_assist_conf and (still_following >= 0.62 or reentry >= 0.58):
             active_speaking = True
         joint_conf = max(
             confidence,
-            0.58 * confidence + 0.42 * audio_conf,
-            0.54 * tracking_quality + 0.46 * audio_conf,
+            0.56 * confidence + 0.44 * audio_conf,
+            0.52 * effective_tracking_quality + 0.48 * audio_conf,
         )
         if position_source == "audio":
-            joint_conf = max(joint_conf, audio_conf * 0.90)
+            joint_conf = max(joint_conf, audio_conf * 0.92)
+        elif position_source == "joint":
+            joint_conf = max(joint_conf, 0.58 * joint_conf + 0.42 * max(audio_conf, still_following))
         user_state = self.behavior_interpreter.infer(
             progress_age=progress_age,
             signal_quality=signal_quality,
-            tracking=tracking,
-            tracking_mode=tracking_mode,
-            tracking_quality=max(tracking_quality, audio_conf * 0.82),
+            tracking=self._last_tracking,
+            tracking_mode=effective_tracking_mode,
+            tracking_quality=max(effective_tracking_quality, audio_conf * 0.82),
             candidate_idx=max(source_candidate_ref_idx, estimated_idx),
             estimated_idx=estimated_idx,
         )
-        if audio_conf >= self._audio_takeover_conf and still_following >= 0.64 and user_state in (UserReadState.NOT_STARTED, UserReadState.PAUSED):
+        if audio_conf >= self._audio_takeover_conf and still_following >= 0.64 and user_state in (
+            UserReadState.NOT_STARTED,
+            UserReadState.PAUSED,
+        ):
             user_state = UserReadState.FOLLOWING
+        if reentry >= 0.62:
+            user_state = UserReadState.REJOINING
         return ProgressEstimate(
             estimated_ref_idx=estimated_idx,
-            estimated_ref_time_sec=estimated_ref_time_sec,
-            progress_velocity_idx_per_sec=float(self._last_velocity),
-            event_emitted_at_sec=float(event_emitted_at_sec),
+            estimated_ref_time_sec=float(estimated_ref_time_sec),
+            progress_velocity_idx_per_sec=float(self._estimated_velocity_ref_sec_per_sec),
+            event_emitted_at_sec=float(self._last_event_at_sec),
             last_progress_at_sec=float(self._last_progress_at_sec),
             progress_age_sec=float(progress_age),
             source_candidate_ref_idx=int(source_candidate_ref_idx),
             source_committed_ref_idx=int(source_committed_ref_idx),
-            tracking_mode=tracking_mode,
-            tracking_quality=float(max(tracking_quality, audio_conf * 0.72 if position_source != "text" else tracking_quality)),
+            tracking_mode=effective_tracking_mode,
+            tracking_quality=float(max(effective_tracking_quality, audio_conf * 0.72 if position_source != "text" else effective_tracking_quality)),
             stable=bool(stable),
             confidence=float(max(confidence, audio_conf * 0.82 if position_source == "audio" else confidence)),
             active_speaking=bool(active_speaking),
@@ -4102,6 +4582,28 @@ class AudioAwareProgressEstimator:
             position_source=str(position_source),
             audio_support_strength=float(max(still_following, reentry, audio_conf)),
         )
+    def _time_to_ref_idx(self, ref_time_sec: float) -> int:
+        if not self._ref_times:
+            return 0
+        t = float(ref_time_sec)
+        lo = 0
+        hi = len(self._ref_times) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._ref_times[mid] <= t:
+                lo = mid
+            else:
+                hi = mid - 1
+        return max(0, min(lo, len(self._ref_times) - 1))
+    def _idx_to_ref_time(self, idx: int) -> float:
+        if not self._ref_times:
+            return 0.0
+        i = max(0, min(int(idx), len(self._ref_times) - 1))
+        return float(self._ref_times[i])
+    def _clamp_ref_time(self, value: float) -> float:
+        if not self._ref_times:
+            return max(0.0, float(value))
+        return max(0.0, min(float(value), float(self._ref_times[-1])))
 ```
 
 ---
@@ -4113,17 +4615,22 @@ from shadowing.types import SignalQuality, TrackingMode, TrackingSnapshot, UserR
 class BehaviorInterpreter:
     def __init__(
         self,
+        *,
         recent_progress_sec: float = 0.90,
         strong_signal_threshold: float = 0.58,
         weak_signal_threshold: float = 0.42,
         repeat_penalty_threshold: float = 0.34,
         skip_forward_tokens: int = 8,
+        pause_silence_sec: float = 1.10,
+        rejoin_signal_sec: float = 0.55,
     ) -> None:
         self.recent_progress_sec = float(recent_progress_sec)
         self.strong_signal_threshold = float(strong_signal_threshold)
         self.weak_signal_threshold = float(weak_signal_threshold)
         self.repeat_penalty_threshold = float(repeat_penalty_threshold)
         self.skip_forward_tokens = int(skip_forward_tokens)
+        self.pause_silence_sec = float(pause_silence_sec)
+        self.rejoin_signal_sec = float(rejoin_signal_sec)
     def infer(
         self,
         *,
@@ -4134,36 +4641,55 @@ class BehaviorInterpreter:
         tracking_quality: float,
         candidate_idx: int,
         estimated_idx: int,
+        audio_confidence: float = 0.0,
+        audio_support_strength: float = 0.0,
+        position_source: str = "text",
     ) -> UserReadState:
         signal_speaking = self._is_signal_speaking(signal_quality)
         signal_weak_speaking = self._is_signal_weak_speaking(signal_quality)
+        silence_run = 9999.0 if signal_quality is None else float(signal_quality.silence_run_sec)
+        repeat_penalty = tracking.repeat_penalty if tracking is not None else 0.0
+        forward_delta = int(candidate_idx) - int(estimated_idx)
+        if (
+            silence_run >= self.pause_silence_sec
+            and progress_age > min(1.15, self.recent_progress_sec + 0.15)
+            and audio_support_strength < 0.52
+        ):
+            return UserReadState.PAUSED
         if tracking_mode == TrackingMode.LOST:
-            if signal_speaking:
+            if signal_speaking or audio_support_strength >= 0.60:
                 return UserReadState.REJOINING
             return UserReadState.LOST
         if tracking_mode == TrackingMode.REACQUIRING:
-            if signal_speaking:
+            if signal_speaking or audio_support_strength >= 0.58:
                 return UserReadState.REJOINING
             return UserReadState.HESITATING
-        repeat_penalty = tracking.repeat_penalty if tracking is not None else 0.0
-        if repeat_penalty >= self.repeat_penalty_threshold and signal_speaking:
+        if (
+            repeat_penalty >= self.repeat_penalty_threshold
+            and (signal_speaking or audio_support_strength >= 0.58)
+        ):
             return UserReadState.REPEATING
-        if candidate_idx - estimated_idx >= self.skip_forward_tokens and tracking_quality >= 0.72:
+        if forward_delta >= self.skip_forward_tokens and tracking_quality >= 0.72:
             return UserReadState.SKIPPING
         if progress_age <= self.recent_progress_sec:
-            if tracking_quality >= 0.60:
+            if tracking_quality >= 0.60 or audio_support_strength >= 0.64:
                 return UserReadState.FOLLOWING
             if signal_speaking:
                 return UserReadState.HESITATING
             return UserReadState.WARMING_UP
-        if progress_age <= 1.80:
-            if signal_speaking and tracking_quality >= 0.36:
-                return UserReadState.HESITATING
-            if signal_weak_speaking:
-                return UserReadState.WARMING_UP
-        if not signal_speaking and progress_age > 1.20:
-            return UserReadState.PAUSED
-        if signal_speaking:
+        if (
+            silence_run <= self.rejoin_signal_sec
+            and (signal_speaking or audio_support_strength >= 0.60)
+            and tracking_quality >= 0.36
+        ):
+            return UserReadState.REJOINING
+        if (
+            (signal_speaking and tracking_quality >= 0.42)
+            or audio_support_strength >= 0.64
+            or (position_source != "text" and audio_confidence >= 0.58)
+        ):
+            return UserReadState.HESITATING
+        if signal_weak_speaking or audio_support_strength >= 0.46:
             return UserReadState.WARMING_UP
         return UserReadState.NOT_STARTED
     def _is_signal_speaking(self, signal_quality: SignalQuality | None) -> bool:
@@ -6017,11 +6543,13 @@ class _PressureState:
     resume_pressure: float = 0.0
     seek_pressure: float = 0.0
     soft_duck_pressure: float = 0.0
-    lead_ema: float = 0.0
+    lead_error_ema: float = 0.0
+    lead_error_derivative_ema: float = 0.0
     tracking_quality_ema: float = 0.0
     confidence_ema: float = 0.0
     speech_confidence_ema: float = 0.0
     last_tick_at: float = 0.0
+    last_lead_error: float = 0.0
 class StateMachineController:
     def __init__(
         self,
@@ -6081,6 +6609,7 @@ class StateMachineController:
             progress_age_sec = 9999.0
             estimated_ref_time_sec = float(fusion_evidence.estimated_ref_time_sec)
             stable = bool(fusion_fused_conf >= 0.72)
+            position_source = "audio"
         else:
             effective_idx = int(getattr(progress, "estimated_ref_idx", 0))
             tracking_quality = float(getattr(progress, "tracking_quality", 0.0))
@@ -6090,6 +6619,7 @@ class StateMachineController:
             progress_age_sec = float(getattr(progress, "progress_age_sec", 9999.0))
             estimated_ref_time_sec = float(getattr(progress, "estimated_ref_time_sec", 0.0))
             stable = bool(getattr(progress, "stable", False))
+            position_source = str(getattr(progress, "position_source", "text"))
         if active_speaking or recently_progressed or fusion_still_following >= 0.66 or fusion_reentry >= 0.58:
             self._last_voice_like_at = now
         if effective_idx > self._last_effective_idx:
@@ -6164,24 +6694,15 @@ class StateMachineController:
         else:
             user_ref = float(estimated_ref_time_sec)
         lead_sec = playback_ref - user_ref
+        lead_error_sec = float(lead_sec - target_lead_sec)
         dt = max(0.01, now - self._pressure.last_tick_at)
         self._pressure.last_tick_at = now
         self._update_emas(
-            lead_sec=lead_sec,
+            dt=dt,
+            lead_error_sec=lead_error_sec,
             tracking_quality=tracking_quality,
             confidence=confidence,
             speech_confidence=speech_conf,
-        )
-        weak_resume_ok = bool(
-            (
-                active_speaking
-                or fusion_reentry >= 0.60
-                or fusion_still_following >= 0.72
-            )
-            and tracking_quality >= tracking_quality_hold_min - 0.06
-            and confidence >= max(0.54, self.policy.min_confidence - 0.18)
-            and speaking_recent
-            and lead_sec >= -resume_from_hold_speaking_lead_slack_sec
         )
         strong_resume_ok = bool(
             (
@@ -6192,7 +6713,18 @@ class StateMachineController:
             )
             and tracking_quality >= tracking_quality_hold_min
             and confidence >= self.policy.min_confidence - (0.10 if fusion_still_following >= 0.72 else 0.0)
-            and lead_sec >= -resume_from_hold_speaking_lead_slack_sec
+            and lead_error_sec >= -resume_from_hold_speaking_lead_slack_sec
+        )
+        weak_resume_ok = bool(
+            (
+                active_speaking
+                or fusion_reentry >= 0.60
+                or fusion_still_following >= 0.72
+            )
+            and tracking_quality >= tracking_quality_hold_min - 0.06
+            and confidence >= max(0.54, self.policy.min_confidence - 0.18)
+            and speaking_recent
+            and lead_error_sec >= -resume_from_hold_speaking_lead_slack_sec
         )
         following = (
             strong_resume_ok
@@ -6204,6 +6736,7 @@ class StateMachineController:
             dt=dt,
             playback_state=playback.state,
             lead_sec=lead_sec,
+            lead_error_sec=lead_error_sec,
             progress_stale=progress_stale,
             tracking_quality=tracking_quality,
             confidence=confidence,
@@ -6220,10 +6753,12 @@ class StateMachineController:
             bluetooth_mode=bluetooth_mode,
             bluetooth_long_session_mode=bluetooth_long_session_mode,
             hold_if_lead_sec=hold_if_lead_sec,
+            resume_if_lead_sec=resume_if_lead_sec,
             seek_if_lag_sec=seek_if_lag_sec,
             tracking_quality_hold_min=tracking_quality_hold_min,
             tracking_quality_seek_min=tracking_quality_seek_min,
             fusion_evidence=fusion_evidence,
+            position_source=position_source,
         )
         if fusion_evidence is not None:
             if fusion_evidence.should_prevent_hold:
@@ -6244,7 +6779,7 @@ class StateMachineController:
             self._pressure.resume_pressure = 0.0
             return ControlDecision(
                 action=ControlAction.RESUME,
-                reason="resume_pressure",
+                reason="resume_to_target_lead",
                 lead_sec=lead_sec,
                 target_gain=self._gain_for_state(
                     PlaybackState.PLAYING,
@@ -6258,7 +6793,7 @@ class StateMachineController:
             self._last_hold_at = now
             return ControlDecision(
                 action=ControlAction.HOLD,
-                reason="hold_pressure",
+                reason="hold_for_lead_convergence",
                 lead_sec=lead_sec,
                 target_gain=self._gain_for_state(
                     PlaybackState.HOLDING,
@@ -6282,7 +6817,7 @@ class StateMachineController:
             target_time_sec = max(0.0, user_ref - target_lead_sec)
             return ControlDecision(
                 action=ControlAction.SEEK,
-                reason="seek_pressure",
+                reason="seek_to_target_lead",
                 target_time_sec=target_time_sec,
                 lead_sec=lead_sec,
                 target_gain=self._gain_for_state(
@@ -6301,7 +6836,7 @@ class StateMachineController:
             self._last_soft_duck_at = now
             return ControlDecision(
                 action=ControlAction.SOFT_DUCK,
-                reason="soft_duck_pressure",
+                reason="soft_duck_for_lead_convergence",
                 lead_sec=lead_sec,
                 target_gain=self._gain_for_state(
                     PlaybackState.HOLDING,
@@ -6313,7 +6848,7 @@ class StateMachineController:
             )
         return ControlDecision(
             action=ControlAction.NOOP,
-            reason="no_state_change",
+            reason="track_target_lead",
             lead_sec=lead_sec,
             target_gain=self._gain_for_state(
                 playback.state,
@@ -6326,13 +6861,21 @@ class StateMachineController:
     def _update_emas(
         self,
         *,
-        lead_sec: float,
+        dt: float,
+        lead_error_sec: float,
         tracking_quality: float,
         confidence: float,
         speech_confidence: float,
     ) -> None:
         alpha = 0.22
-        self._pressure.lead_ema = (1.0 - alpha) * self._pressure.lead_ema + alpha * float(lead_sec)
+        deriv = (float(lead_error_sec) - float(self._pressure.last_lead_error)) / max(0.01, float(dt))
+        self._pressure.last_lead_error = float(lead_error_sec)
+        self._pressure.lead_error_ema = (
+            (1.0 - alpha) * self._pressure.lead_error_ema + alpha * float(lead_error_sec)
+        )
+        self._pressure.lead_error_derivative_ema = (
+            (1.0 - alpha) * self._pressure.lead_error_derivative_ema + alpha * float(deriv)
+        )
         self._pressure.tracking_quality_ema = (
             (1.0 - alpha) * self._pressure.tracking_quality_ema + alpha * float(tracking_quality)
         )
@@ -6348,6 +6891,7 @@ class StateMachineController:
         dt: float,
         playback_state,
         lead_sec: float,
+        lead_error_sec: float,
         progress_stale: bool,
         tracking_quality: float,
         confidence: float,
@@ -6364,10 +6908,12 @@ class StateMachineController:
         bluetooth_mode: bool,
         bluetooth_long_session_mode: bool,
         hold_if_lead_sec: float,
+        resume_if_lead_sec: float,
         seek_if_lag_sec: float,
         tracking_quality_hold_min: float,
         tracking_quality_seek_min: float,
         fusion_evidence: FusionEvidence | None,
+        position_source: str,
     ) -> None:
         decay = (0.86 if bluetooth_long_session_mode else 0.82) ** max(1.0, dt * 15.0)
         self._pressure.hold_pressure *= decay
@@ -6377,44 +6923,59 @@ class StateMachineController:
         fusion_still_following = 0.0 if fusion_evidence is None else float(fusion_evidence.still_following_likelihood)
         fusion_repeated = 0.0 if fusion_evidence is None else float(fusion_evidence.repeated_likelihood)
         fusion_reentry = 0.0 if fusion_evidence is None else float(fusion_evidence.reentry_likelihood)
+        lead_err = float(self._pressure.lead_error_ema)
+        lead_err_d = float(self._pressure.lead_error_derivative_ema)
+        large_positive_error = lead_err >= max(0.18, hold_if_lead_sec - (0.35 if bluetooth_long_session_mode else 0.28))
+        large_negative_error = lead_sec <= seek_if_lag_sec
+        near_target = abs(lead_err) <= resume_if_lead_sec
         if playback_state == PlaybackState.PLAYING:
+            if large_positive_error:
+                self._pressure.soft_duck_pressure += 0.18 if bluetooth_long_session_mode else 0.24
+                if lead_err >= (0.34 if bluetooth_long_session_mode else 0.28):
+                    self._pressure.hold_pressure += 0.20 if bluetooth_long_session_mode else 0.28
+            if lead_err > 0.10 and lead_err_d > 0.04:
+                self._pressure.hold_pressure += 0.08
             hold_scale = 0.40 if (fusion_still_following >= 0.65 or fusion_reentry >= 0.58) else 1.0
             if not in_startup_grace and progress_stale and not speaking_recent:
-                self._pressure.hold_pressure += (0.28 if bluetooth_long_session_mode else 0.42) * hold_scale
+                self._pressure.hold_pressure += (0.24 if bluetooth_long_session_mode else 0.34) * hold_scale
             if (
                 not in_startup_grace
                 and progress_stale
                 and tracking_quality < tracking_quality_hold_min
             ):
-                self._pressure.hold_pressure += (0.22 if bluetooth_long_session_mode else 0.36) * hold_scale
-            if lead_sec >= hold_if_lead_sec:
-                self._pressure.hold_pressure += 0.22 if bluetooth_long_session_mode else 0.30
+                self._pressure.hold_pressure += (0.18 if bluetooth_long_session_mode else 0.28) * hold_scale
             if tracking_state == TrackingState.WEAK or sync_state == SyncState.DEGRADED:
-                self._pressure.soft_duck_pressure += 0.22 if not bluetooth_long_session_mode else 0.28
+                self._pressure.soft_duck_pressure += 0.20 if not bluetooth_long_session_mode else 0.26
             if confidence < max(0.55, self.policy.min_confidence - 0.15):
-                self._pressure.soft_duck_pressure += 0.10
-            if stable and tracking_quality >= 0.76:
-                self._pressure.hold_pressure *= 0.94
+                self._pressure.soft_duck_pressure += 0.08
+            if stable and tracking_quality >= 0.76 and near_target:
+                self._pressure.hold_pressure *= 0.92
+                self._pressure.soft_duck_pressure *= 0.90
         if playback_state == PlaybackState.HOLDING and not in_resume_cooldown:
-            if strong_resume_ok:
-                self._pressure.resume_pressure += 0.42 if bluetooth_long_session_mode else 0.48
-            elif weak_resume_ok:
-                self._pressure.resume_pressure += 0.24 if bluetooth_long_session_mode else 0.28
+            if strong_resume_ok and near_target:
+                self._pressure.resume_pressure += 0.40 if bluetooth_long_session_mode else 0.48
+            elif strong_resume_ok:
+                self._pressure.resume_pressure += 0.28
+            elif weak_resume_ok and lead_err >= -0.12:
+                self._pressure.resume_pressure += 0.22 if bluetooth_long_session_mode else 0.28
             if fusion_reentry >= 0.62:
-                self._pressure.resume_pressure += 0.24
+                self._pressure.resume_pressure += 0.26
             elif fusion_still_following >= 0.74:
                 self._pressure.resume_pressure += 0.18
+            if near_target and speaking_recent:
+                self._pressure.resume_pressure += 0.14
         seek_trigger = bool(
             allow_seek
             and not in_seek_cooldown
             and playback_state == PlaybackState.PLAYING
-            and lead_sec <= seek_if_lag_sec
+            and large_negative_error
             and tracking_quality >= tracking_quality_seek_min
             and confidence >= max(0.70, self.policy.min_confidence)
             and tracking_state == TrackingState.LOCKED
             and sync_state == SyncState.STABLE
             and fusion_repeated < 0.60
             and (fusion_evidence is None or not fusion_evidence.should_prevent_seek)
+            and position_source != "audio"
         )
         if seek_trigger:
             self._pressure.seek_pressure += 0.18 if (bluetooth_mode or bluetooth_long_session_mode) else 0.34
@@ -6637,6 +7198,7 @@ class ShadowingOrchestrator:
                 signal_monitor=self.signal_monitor,
                 warm_start=self._warm_start,
             )
+            self._apply_latency_warm_start(self._warm_start)
         if self.reference_audio_store is not None and self.live_audio_matcher is not None:
             try:
                 self._reference_audio_features = self.reference_audio_store.load(lesson_id)
@@ -6856,31 +7418,69 @@ class ShadowingOrchestrator:
             audio_behavior=audio_behavior,
             fusion_evidence=fusion_evidence,
         )
+    def _apply_latency_warm_start(self, warm_start: dict[str, Any]) -> None:
+        latency = dict(warm_start.get("latency", {}))
+        if not latency:
+            return
+        snap = self.latency_calibrator.snapshot()
+        if snap is None:
+            return
+        stable_target_lead_sec = latency.get("stable_target_lead_sec")
+        startup_target_lead_sec = latency.get("startup_target_lead_sec")
+        if stable_target_lead_sec is not None:
+            try:
+                snap.baseline_target_lead_sec = float(stable_target_lead_sec)
+            except Exception:
+                pass
+        if "estimated_output_latency_ms" in latency:
+            try:
+                snap.estimated_output_latency_ms = float(latency["estimated_output_latency_ms"])
+            except Exception:
+                pass
+        if "estimated_input_latency_ms" in latency:
+            try:
+                snap.estimated_input_latency_ms = float(latency["estimated_input_latency_ms"])
+            except Exception:
+                pass
+        if startup_target_lead_sec is not None and self._is_bluetooth_mode():
+            try:
+                self.latency_calibrator.target_shadow_lead_sec = float(startup_target_lead_sec)
+            except Exception:
+                pass
     def _collect_stable_lead_samples(self, *, now_sec: float, playback_status, progress, sync_evidence) -> None:
-        if not self._bluetooth_long_session_mode or progress is None:
+        if progress is None:
             return
         if not sync_evidence.allow_latency_observation:
             return
         if not progress.active_speaking:
             return
-        if progress.tracking_quality < 0.72:
+        if progress.tracking_quality < (0.72 if self._is_bluetooth_mode() else 0.78):
             return
         lead_sec = float(playback_status.t_ref_heard_content_sec) - float(progress.estimated_ref_time_sec)
         if abs(lead_sec) > 2.2:
             return
         self._stable_lead_samples.append(float(lead_sec))
-        if len(self._stable_lead_samples) > 180:
-            self._stable_lead_samples = self._stable_lead_samples[-180:]
+        if len(self._stable_lead_samples) > 240:
+            self._stable_lead_samples = self._stable_lead_samples[-240:]
     def _maybe_rebaseline_output_offset(self, *, now_sec: float) -> None:
-        if not self._bluetooth_long_session_mode:
+        if self._is_bluetooth_long_session_mode():
+            refresh_gap = 180.0
+            need_n = 24
+            desired = 0.35
+        elif self._is_bluetooth_mode():
+            refresh_gap = 120.0
+            need_n = 20
+            desired = 0.28
+        else:
+            refresh_gap = 240.0
+            need_n = 28
+            desired = 0.15
+        if (now_sec - self._last_stable_lead_rebaseline_at_sec) < refresh_gap:
             return
-        if (now_sec - self._last_stable_lead_rebaseline_at_sec) < 180.0:
-            return
-        if len(self._stable_lead_samples) < 24:
+        if len(self._stable_lead_samples) < need_n:
             return
         vals = sorted(self._stable_lead_samples)
         mid = vals[len(vals) // 2]
-        desired = 0.35
         error_sec = float(mid - desired)
         if abs(error_sec) < 0.040:
             self._last_stable_lead_rebaseline_at_sec = now_sec
@@ -6891,7 +7491,12 @@ class ShadowingOrchestrator:
             return
         new_output_offset_sec = max(
             0.0,
-            (snap.estimated_output_latency_ms + snap.runtime_output_drift_ms - error_sec * 1000.0) / 1000.0,
+            (
+                snap.estimated_output_latency_ms
+                + snap.runtime_output_drift_ms
+                - error_sec * 1000.0
+            )
+            / 1000.0,
         )
         if hasattr(self.player, "set_output_offset_sec"):
             self.player.set_output_offset_sec(new_output_offset_sec)
@@ -7152,6 +7757,13 @@ class ShadowingOrchestrator:
                     "runtime_output_drift_ms": latency_snapshot.runtime_output_drift_ms,
                     "confidence": latency_snapshot.confidence,
                     "calibrated": latency_snapshot.calibrated,
+                    "stable_target_lead_sec": (
+                        0.35 if self._bluetooth_long_session_mode
+                        else (0.28 if self._is_bluetooth_mode() else 0.15)
+                    ),
+                    "startup_target_lead_sec": (
+                        0.28 if self._is_bluetooth_mode() else 0.15
+                    ),
                 }
             ),
         )
@@ -7177,6 +7789,7 @@ class ShadowingOrchestrator:
                     "runtime_output_drift_ms": latency_snapshot.runtime_output_drift_ms,
                     "confidence": latency_snapshot.confidence,
                     "calibrated": latency_snapshot.calibrated,
+                    "baseline_target_lead_sec": latency_snapshot.baseline_target_lead_sec,
                 }
             ),
             "controller_policy": asdict(self.controller.policy),
@@ -7184,6 +7797,7 @@ class ShadowingOrchestrator:
             "latest_audio_behavior": None if self._latest_audio_behavior is None else asdict(self._latest_audio_behavior),
             "latest_fusion_evidence": None if self._latest_fusion_evidence is None else asdict(self._latest_fusion_evidence),
             "bluetooth_long_session_mode": self._bluetooth_long_session_mode,
+            "stable_lead_samples_count": len(self._stable_lead_samples),
         }
         (session_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2),
